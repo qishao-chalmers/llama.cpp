@@ -228,58 +228,71 @@ def quant_int3_tok(arr: np.ndarray) -> np.ndarray:
     return _uniform_quant(arr, bits=3, axis=1)
 
 
-# ── Group-within-token variants ───────────────────────────────────────────────
-# dim_group_size splits head_dim into G-element groups, each with its own scale.
-# Finer granularity than per-token (one scale per token) but coarser than
-# per-channel (one scale per dim).  E.g. head_dim=128, G=32 → 4 scales/token.
+# ── Dynamic grouped variants: int{N}_{ch,tok}_g{G} ───────────────────────────
+# Any group size G is supported — no new functions needed for new G values.
+#
+#   int{N}_tok_g{G}: split head_dim into groups of G dims, one scale per group
+#                    per token. E.g. head_dim=128, G=8 → 16 scales/token.
+#   int{N}_ch_g{G}:  group G consecutive tokens together, one scale per
+#                    (group, dim). Hook fires every G tokens.
+#
+# g1 in either family = per-element (one scale per value) → near-lossless.
 
-def quant_int8_tok_g16(arr): return _uniform_quant(arr, bits=8, axis=1, dim_group_size=16)
-def quant_int8_tok_g32(arr): return _uniform_quant(arr, bits=8, axis=1, dim_group_size=32)
-def quant_int8_tok_g64(arr): return _uniform_quant(arr, bits=8, axis=1, dim_group_size=64)
+import re as _re
 
-def quant_int4_tok_g16(arr): return _uniform_quant(arr, bits=4, axis=1, dim_group_size=16)
-def quant_int4_tok_g32(arr): return _uniform_quant(arr, bits=4, axis=1, dim_group_size=32)
-def quant_int4_tok_g64(arr): return _uniform_quant(arr, bits=4, axis=1, dim_group_size=64)
-
-def quant_int3_tok_g16(arr): return _uniform_quant(arr, bits=3, axis=1, dim_group_size=16)
-def quant_int3_tok_g32(arr): return _uniform_quant(arr, bits=3, axis=1, dim_group_size=32)
-def quant_int3_tok_g64(arr): return _uniform_quant(arr, bits=3, axis=1, dim_group_size=64)
+_GROUPED_PAT = _re.compile(r'^int(\d+)_(ch|tok)_g(\d+)$')
+_VALID_BITS   = {2, 3, 4, 8}
 
 
-# ── Group-within-channel variants ─────────────────────────────────────────────
-# token_group_size=G groups G consecutive tokens together, one scale per
-# (group, dim).  The hook fires every G tokens — no --quant-group-size needed.
-# int4_ch_g128 is equivalent to plain int4_ch with --quant-group-size 128.
-
-def quant_int8_ch_g32(arr):  return _uniform_quant(arr, bits=8, axis=0, dim_group_size=32)
-def quant_int8_ch_g64(arr):  return _uniform_quant(arr, bits=8, axis=0, dim_group_size=64)
-def quant_int8_ch_g128(arr): return _uniform_quant(arr, bits=8, axis=0, dim_group_size=128)
-
-def quant_int4_ch_g32(arr):  return _uniform_quant(arr, bits=4, axis=0, dim_group_size=32)
-def quant_int4_ch_g64(arr):  return _uniform_quant(arr, bits=4, axis=0, dim_group_size=64)
-def quant_int4_ch_g128(arr): return _uniform_quant(arr, bits=4, axis=0, dim_group_size=128)
-
-def quant_int3_ch_g32(arr):  return _uniform_quant(arr, bits=3, axis=0, dim_group_size=32)
-def quant_int3_ch_g64(arr):  return _uniform_quant(arr, bits=3, axis=0, dim_group_size=64)
-def quant_int3_ch_g128(arr): return _uniform_quant(arr, bits=3, axis=0, dim_group_size=128)
+def _parse_grouped_name(name):
+    """Parse 'int4_ch_g32' → (bits=4, axis=0, gsize=32).  Returns None if no match."""
+    m = _GROUPED_PAT.match(name)
+    if not m:
+        return None
+    bits  = int(m.group(1))
+    axis  = 0 if m.group(2) == "ch" else 1
+    gsize = int(m.group(3))
+    if bits not in _VALID_BITS or gsize < 1:
+        return None
+    return bits, axis, gsize
 
 
-# Per-token quants work correctly with n_new=1 (each row is independent).
-# Per-channel quants need n_new >= group_size to get meaningful scales.
-PER_TOKEN_QUANTS = {
-    "int8_tok", "int4_tok", "int3_tok", "int2_tok",
-    "int8_tok_g16", "int8_tok_g32", "int8_tok_g64",
-    "int4_tok_g16", "int4_tok_g32", "int4_tok_g64",
-    "int3_tok_g16", "int3_tok_g32", "int3_tok_g64",
-}
+def _make_grouped_fn(bits, axis, gsize):
+    """Return a quantization function for the given (bits, axis, gsize)."""
+    def fn(arr):
+        return _uniform_quant(arr, bits=bits, axis=axis, dim_group_size=gsize)
+    return fn
 
-# Maps _ch_g{N} quant names to their token group size.
-# Used by get_kv_group_sizes() in run_sweep.py to set the hook firing interval.
-CH_QUANT_GROUP_SIZE = {
-    "int8_ch_g32": 32,  "int8_ch_g64": 64,  "int8_ch_g128": 128,
-    "int4_ch_g32": 32,  "int4_ch_g64": 64,  "int4_ch_g128": 128,
-    "int3_ch_g32": 32,  "int3_ch_g64": 64,  "int3_ch_g128": 128,
-}
+
+class _PerTokenSet:
+    """Set-like: contains int{N}_tok and int{N}_tok_g{G} for any valid N, G."""
+    _explicit = {"int8_tok", "int4_tok", "int3_tok", "int2_tok"}
+
+    def __contains__(self, name):
+        if name in self._explicit:
+            return True
+        parsed = _parse_grouped_name(name)
+        return parsed is not None and parsed[1] == 1  # axis=1 → per-token
+
+
+class _ChGroupSizeMap:
+    """Dict-like: returns token group size G for int{N}_ch_g{G} names."""
+
+    def __contains__(self, name):
+        parsed = _parse_grouped_name(name)
+        return parsed is not None and parsed[1] == 0  # axis=0 → per-channel
+
+    def __getitem__(self, name):
+        parsed = _parse_grouped_name(name)
+        if parsed and parsed[1] == 0:
+            return parsed[2]  # gsize
+        raise KeyError(name)
+
+
+# Per-token quants: hook fires every token (group_size=1).
+# Per-channel _g{N} quants: hook fires every N tokens (from CH_QUANT_GROUP_SIZE).
+PER_TOKEN_QUANTS   = _PerTokenSet()
+CH_QUANT_GROUP_SIZE = _ChGroupSizeMap()
 
 
 # ── Manual FP8 fallback (no ml_dtypes) ───────────────────────────────────────
@@ -332,49 +345,48 @@ def _manual_fp8_e5m2(arr: np.ndarray) -> np.ndarray:
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
+# ── Registry (named variants only; int{N}_{ch,tok}_g{G} resolved dynamically) ─
+
 QUANT_FNS = {
-    "fp16":           quant_fp16,
-    "bf16":           quant_bf16,
-    "fp8_e4m3":       quant_fp8_e4m3,
-    "fp8_e5m2":       quant_fp8_e5m2,
-    "int8":           quant_int8,
-    "int8_ch":        quant_int8_ch,
-    "int8_ch_g32":    quant_int8_ch_g32,
-    "int8_ch_g64":    quant_int8_ch_g64,
-    "int8_ch_g128":   quant_int8_ch_g128,
-    "int8_tok":       quant_int8_tok,
-    "int8_tok_g16":   quant_int8_tok_g16,
-    "int8_tok_g32":   quant_int8_tok_g32,
-    "int8_tok_g64":   quant_int8_tok_g64,
-    "int4":           quant_int4,
-    "int4_ch":        quant_int4_ch,
-    "int4_ch_g32":    quant_int4_ch_g32,
-    "int4_ch_g64":    quant_int4_ch_g64,
-    "int4_ch_g128":   quant_int4_ch_g128,
-    "int4_tok":       quant_int4_tok,
-    "int4_tok_g16":   quant_int4_tok_g16,
-    "int4_tok_g32":   quant_int4_tok_g32,
-    "int4_tok_g64":   quant_int4_tok_g64,
-    "int3":           quant_int3,
-    "int3_ch":        quant_int3_ch,
-    "int3_ch_g32":    quant_int3_ch_g32,
-    "int3_ch_g64":    quant_int3_ch_g64,
-    "int3_ch_g128":   quant_int3_ch_g128,
-    "int3_tok":       quant_int3_tok,
-    "int3_tok_g16":   quant_int3_tok_g16,
-    "int3_tok_g32":   quant_int3_tok_g32,
-    "int3_tok_g64":   quant_int3_tok_g64,
-    "nf4":            quant_nf4,
-    "int2":           quant_int2,
-    "int2_ch":        quant_int2_ch,
-    "int2_tok":       quant_int2_tok,
+    "fp16":      quant_fp16,
+    "bf16":      quant_bf16,
+    "fp8_e4m3":  quant_fp8_e4m3,
+    "fp8_e5m2":  quant_fp8_e5m2,
+    "int8":      quant_int8,
+    "int8_ch":   quant_int8_ch,
+    "int8_tok":  quant_int8_tok,
+    "int4":      quant_int4,
+    "int4_ch":   quant_int4_ch,
+    "int4_tok":  quant_int4_tok,
+    "int3":      quant_int3,
+    "int3_ch":   quant_int3_ch,
+    "int3_tok":  quant_int3_tok,
+    "nf4":       quant_nf4,
+    "int2":      quant_int2,
+    "int2_ch":   quant_int2_ch,
+    "int2_tok":  quant_int2_tok,
 }
 
 
+def _is_valid_quant(name: str) -> bool:
+    return name in QUANT_FNS or _parse_grouped_name(name) is not None
+
+
 def get_quant_fn(name: str):
-    if name not in QUANT_FNS:
-        raise ValueError(f"Unknown quantization: '{name}'. Choose from {list(QUANT_FNS)}")
-    return QUANT_FNS[name]
+    """Return the quantization function for the given name.
+    Supports all named variants plus any int{N}_{ch,tok}_g{G} dynamically.
+    """
+    if name in QUANT_FNS:
+        return QUANT_FNS[name]
+    parsed = _parse_grouped_name(name)
+    if parsed:
+        bits, axis, gsize = parsed
+        return _make_grouped_fn(bits, axis, gsize)
+    raise ValueError(
+        f"Unknown quantization: '{name}'. "
+        f"Named variants: {list(QUANT_FNS)}. "
+        f"Dynamic pattern: int{{2,3,4,8}}_{{ch,tok}}_g{{N}} for any N >= 1."
+    )
 
 
 def parse_kv_quant(spec: str):
@@ -388,7 +400,7 @@ def parse_kv_quant(spec: str):
     else:
         k_name = v_name = spec
     for name in (k_name, v_name):
-        if name not in QUANT_FNS:
+        if not _is_valid_quant(name):
             raise ValueError(f"Unknown quantization: '{name}'")
     return k_name, v_name
 
@@ -406,7 +418,7 @@ def parse_layer_spec(spec: str, n_layers: int):
     """
     spec = spec.strip()
     if "/" not in spec and "@" not in spec:
-        if spec not in QUANT_FNS:
+        if not _is_valid_quant(spec):
             raise ValueError(f"Unknown quantization: '{spec}'")
         return [spec] * n_layers
 
@@ -420,13 +432,13 @@ def parse_layer_spec(spec: str, n_layers: int):
             name = name.strip()
             lo_s, hi_s = rng.split("-", 1)
             lo, hi = int(lo_s), int(hi_s)
-            if name not in QUANT_FNS:
+            if not _is_valid_quant(name):
                 raise ValueError(f"Unknown quantization in layer spec: '{name}'")
             for i in range(lo, hi + 1):
                 if 0 <= i < n_layers:
                     result[i] = name
         else:
-            if seg not in QUANT_FNS:
+            if not _is_valid_quant(seg):
                 raise ValueError(f"Unknown quantization in layer spec: '{seg}'")
             for i in range(n_layers):
                 result[i] = seg
@@ -456,12 +468,29 @@ def resolve_quant_layers(spec: str, n_layers: int):
 
 if __name__ == "__main__":
     rng = np.random.default_rng(42)
-    # (128, 128): 128 tokens divisible by g32/g64/g128; head_dim=128 divisible by g16/g32/g64
+    # (128, 128): 128 tokens and head_dim=128, divisible by all tested group sizes
     arr = rng.standard_normal((128, 128)).astype(np.float16)
 
-    for name, fn in QUANT_FNS.items():
-        q = fn(arr)
+    # Named variants
+    for name in QUANT_FNS:
+        fn = get_quant_fn(name)
+        q  = fn(arr)
         mse = float(np.mean((arr.astype(np.float32) - q.astype(np.float32))**2))
-        print(f"  {name:16s}  MSE={mse:.6f}  range=[{float(q.min()):.3f}, {float(q.max()):.3f}]")
+        print(f"  {name:16s}  MSE={mse:.6f}")
+
+    # Dynamic grouped variants (spot-check a range of group sizes)
+    dynamic_names = [
+        "int4_tok_g1", "int4_tok_g8", "int4_tok_g16", "int4_tok_g32", "int4_tok_g64",
+        "int4_ch_g1",  "int4_ch_g8",  "int4_ch_g32",  "int4_ch_g64",  "int4_ch_g128",
+        "int3_tok_g1", "int3_ch_g8",
+    ]
+    for name in dynamic_names:
+        fn  = get_quant_fn(name)
+        q   = fn(arr)
+        mse = float(np.mean((arr.astype(np.float32) - q.astype(np.float32))**2))
+        in_per_tok  = name in PER_TOKEN_QUANTS
+        in_ch_gs    = name in CH_QUANT_GROUP_SIZE
+        gs          = CH_QUANT_GROUP_SIZE[name] if in_ch_gs else "-"
+        print(f"  {name:20s}  MSE={mse:.6f}  per_tok={in_per_tok}  ch_gs={gs}")
 
     print("quant.py self-test PASSED")
