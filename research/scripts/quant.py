@@ -31,6 +31,15 @@ Group-within-token variants (dim_group_size=G splits head_dim into groups):
   Each group of G adjacent dims gets its own scale — finer than per-token,
   coarser than per-channel. E.g. head_dim=128, g32 → 4 scales per token.
 
+Group-within-channel variants (token_group_size=G groups G tokens together):
+  int4_ch_g32 / int4_ch_g64 / int4_ch_g128
+  int3_ch_g32 / int3_ch_g64 / int3_ch_g128
+  int8_ch_g32 / int8_ch_g64 / int8_ch_g128
+  Each group of G consecutive tokens shares one scale per dim.
+  The hook fires every G tokens (not via --quant-group-size flag).
+  E.g. g32 → 32 tokens per scale per dim; g128 is equivalent to plain int4_ch
+  with --quant-group-size 128.
+
 K/V split: pass "int8_ch:int4_tok" to use int8_ch for K and int4_tok for V.
 
 Usage:
@@ -237,6 +246,24 @@ def quant_int3_tok_g32(arr): return _uniform_quant(arr, bits=3, axis=1, dim_grou
 def quant_int3_tok_g64(arr): return _uniform_quant(arr, bits=3, axis=1, dim_group_size=64)
 
 
+# ── Group-within-channel variants ─────────────────────────────────────────────
+# token_group_size=G groups G consecutive tokens together, one scale per
+# (group, dim).  The hook fires every G tokens — no --quant-group-size needed.
+# int4_ch_g128 is equivalent to plain int4_ch with --quant-group-size 128.
+
+def quant_int8_ch_g32(arr):  return _uniform_quant(arr, bits=8, axis=0, dim_group_size=32)
+def quant_int8_ch_g64(arr):  return _uniform_quant(arr, bits=8, axis=0, dim_group_size=64)
+def quant_int8_ch_g128(arr): return _uniform_quant(arr, bits=8, axis=0, dim_group_size=128)
+
+def quant_int4_ch_g32(arr):  return _uniform_quant(arr, bits=4, axis=0, dim_group_size=32)
+def quant_int4_ch_g64(arr):  return _uniform_quant(arr, bits=4, axis=0, dim_group_size=64)
+def quant_int4_ch_g128(arr): return _uniform_quant(arr, bits=4, axis=0, dim_group_size=128)
+
+def quant_int3_ch_g32(arr):  return _uniform_quant(arr, bits=3, axis=0, dim_group_size=32)
+def quant_int3_ch_g64(arr):  return _uniform_quant(arr, bits=3, axis=0, dim_group_size=64)
+def quant_int3_ch_g128(arr): return _uniform_quant(arr, bits=3, axis=0, dim_group_size=128)
+
+
 # Per-token quants work correctly with n_new=1 (each row is independent).
 # Per-channel quants need n_new >= group_size to get meaningful scales.
 PER_TOKEN_QUANTS = {
@@ -244,6 +271,14 @@ PER_TOKEN_QUANTS = {
     "int8_tok_g16", "int8_tok_g32", "int8_tok_g64",
     "int4_tok_g16", "int4_tok_g32", "int4_tok_g64",
     "int3_tok_g16", "int3_tok_g32", "int3_tok_g64",
+}
+
+# Maps _ch_g{N} quant names to their token group size.
+# Used by get_kv_group_sizes() in run_sweep.py to set the hook firing interval.
+CH_QUANT_GROUP_SIZE = {
+    "int8_ch_g32": 32,  "int8_ch_g64": 64,  "int8_ch_g128": 128,
+    "int4_ch_g32": 32,  "int4_ch_g64": 64,  "int4_ch_g128": 128,
+    "int3_ch_g32": 32,  "int3_ch_g64": 64,  "int3_ch_g128": 128,
 }
 
 
@@ -298,32 +333,41 @@ def _manual_fp8_e5m2(arr: np.ndarray) -> np.ndarray:
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 QUANT_FNS = {
-    "fp16":          quant_fp16,
-    "bf16":          quant_bf16,
-    "fp8_e4m3":      quant_fp8_e4m3,
-    "fp8_e5m2":      quant_fp8_e5m2,
-    "int8":          quant_int8,
-    "int8_ch":       quant_int8_ch,
-    "int8_tok":      quant_int8_tok,
-    "int8_tok_g16":  quant_int8_tok_g16,
-    "int8_tok_g32":  quant_int8_tok_g32,
-    "int8_tok_g64":  quant_int8_tok_g64,
-    "int4":          quant_int4,
-    "int4_ch":       quant_int4_ch,
-    "int4_tok":      quant_int4_tok,
-    "int4_tok_g16":  quant_int4_tok_g16,
-    "int4_tok_g32":  quant_int4_tok_g32,
-    "int4_tok_g64":  quant_int4_tok_g64,
-    "int3":          quant_int3,
-    "int3_ch":       quant_int3_ch,
-    "int3_tok":      quant_int3_tok,
-    "int3_tok_g16":  quant_int3_tok_g16,
-    "int3_tok_g32":  quant_int3_tok_g32,
-    "int3_tok_g64":  quant_int3_tok_g64,
-    "nf4":           quant_nf4,
-    "int2":          quant_int2,
-    "int2_ch":       quant_int2_ch,
-    "int2_tok":      quant_int2_tok,
+    "fp16":           quant_fp16,
+    "bf16":           quant_bf16,
+    "fp8_e4m3":       quant_fp8_e4m3,
+    "fp8_e5m2":       quant_fp8_e5m2,
+    "int8":           quant_int8,
+    "int8_ch":        quant_int8_ch,
+    "int8_ch_g32":    quant_int8_ch_g32,
+    "int8_ch_g64":    quant_int8_ch_g64,
+    "int8_ch_g128":   quant_int8_ch_g128,
+    "int8_tok":       quant_int8_tok,
+    "int8_tok_g16":   quant_int8_tok_g16,
+    "int8_tok_g32":   quant_int8_tok_g32,
+    "int8_tok_g64":   quant_int8_tok_g64,
+    "int4":           quant_int4,
+    "int4_ch":        quant_int4_ch,
+    "int4_ch_g32":    quant_int4_ch_g32,
+    "int4_ch_g64":    quant_int4_ch_g64,
+    "int4_ch_g128":   quant_int4_ch_g128,
+    "int4_tok":       quant_int4_tok,
+    "int4_tok_g16":   quant_int4_tok_g16,
+    "int4_tok_g32":   quant_int4_tok_g32,
+    "int4_tok_g64":   quant_int4_tok_g64,
+    "int3":           quant_int3,
+    "int3_ch":        quant_int3_ch,
+    "int3_ch_g32":    quant_int3_ch_g32,
+    "int3_ch_g64":    quant_int3_ch_g64,
+    "int3_ch_g128":   quant_int3_ch_g128,
+    "int3_tok":       quant_int3_tok,
+    "int3_tok_g16":   quant_int3_tok_g16,
+    "int3_tok_g32":   quant_int3_tok_g32,
+    "int3_tok_g64":   quant_int3_tok_g64,
+    "nf4":            quant_nf4,
+    "int2":           quant_int2,
+    "int2_ch":        quant_int2_ch,
+    "int2_tok":       quant_int2_tok,
 }
 
 
@@ -412,8 +456,8 @@ def resolve_quant_layers(spec: str, n_layers: int):
 
 if __name__ == "__main__":
     rng = np.random.default_rng(42)
-    # Use (8, 128) to test g16/g32/g64 group sizes (128 divisible by 16, 32, 64)
-    arr = rng.standard_normal((8, 128)).astype(np.float16)
+    # (128, 128): 128 tokens divisible by g32/g64/g128; head_dim=128 divisible by g16/g32/g64
+    arr = rng.standard_normal((128, 128)).astype(np.float16)
 
     for name, fn in QUANT_FNS.items():
         q = fn(arr)

@@ -113,15 +113,26 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
 
 def get_kv_group_sizes(k_names, v_names, default_group_size):
     """Return (k_group_size, v_group_size) for the given K/V quant name lists.
-    Per-token quants use group_size=1 (quantize immediately each token).
-    Per-channel quants use default_group_size (need multiple tokens for scale).
-    If any layer on a side uses per-token quant, group_size=1 for that side.
+
+    Priority order for each side:
+      1. Per-token quant present → group_size = 1 (fire every token)
+      2. Named _ch_g{N} quant present → group_size = N (from CH_QUANT_GROUP_SIZE)
+      3. Otherwise → default_group_size (from --quant-group-size flag)
+
+    For mixed-layer specs (e.g. int4_ch_g32@0-15/int4_ch_g64@16-31) the
+    minimum group size across layers is used so the hook fires often enough
+    for the tightest group.
     """
-    any_k_per_tok = any(n in quant_mod.PER_TOKEN_QUANTS for n in k_names)
-    any_v_per_tok = any(n in quant_mod.PER_TOKEN_QUANTS for n in v_names)
-    k_group_size = 1 if any_k_per_tok else default_group_size
-    v_group_size = 1 if any_v_per_tok else default_group_size
-    return k_group_size, v_group_size
+    def _resolve(names):
+        if any(n in quant_mod.PER_TOKEN_QUANTS for n in names):
+            return 1
+        named_gs = [quant_mod.CH_QUANT_GROUP_SIZE[n]
+                    for n in names if n in quant_mod.CH_QUANT_GROUP_SIZE]
+        if named_gs:
+            return min(named_gs)
+        return default_group_size
+
+    return _resolve(k_names), _resolve(v_names)
 
 
 def main():
