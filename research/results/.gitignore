@@ -1,0 +1,13 @@
+# Progress logs and verbose run logs (regenerated each run)
+*_progress.txt
+sweep_log.txt
+*.log
+
+# SLURM logs and param files
+slurm_*.out
+slurm_*.err
+sweep_params_*.txt
+
+# Core dumps
+core
+*.core

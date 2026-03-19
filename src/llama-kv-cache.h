@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama.h"
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
@@ -151,6 +152,10 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+
+    // Fill info[0..n_layer-1] with raw device pointers and layout metadata
+    // for GPU-side KV quantization (used by llama_get_kv_layer_info).
+    int32_t get_kv_layer_info(llama_kv_layer_info * info, int32_t n_layer) const;
 
     //
     // graph_build API

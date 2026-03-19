@@ -2277,3 +2277,38 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
 }
+
+//
+// GPU-side KV quantization helper
+//
+
+int32_t llama_kv_cache::get_kv_layer_info(llama_kv_layer_info * info, int32_t n_layer) const {
+    const uint32_t stream  = seq_to_stream[0];
+    const uint32_t n_cells = v_cells[stream].get_used();
+    const int32_t  n_fill  = (int32_t)std::min((size_t)n_layer, layers.size());
+
+    for (int32_t i = 0; i < n_fill; ++i) {
+        ggml_tensor * k = layers[i].k;
+        ggml_tensor * v = layers[i].v;
+
+        info[i].k_data    = (char *)k->data + (size_t)stream * k->nb[2];
+        info[i].v_data    = (char *)v->data + (size_t)stream * v->nb[2];
+        info[i].n_cells   = (int32_t)n_cells;
+        info[i].k_stride  = (int32_t)k->nb[1];
+        info[i].v_stride  = (int32_t)v->nb[1];
+        info[i].n_embd_k  = (int32_t)k->ne[0];
+        info[i].n_embd_v  = (int32_t)v->ne[0];
+        info[i].ggml_type = (int32_t)k->type;
+        info[i].v_trans   = (int32_t)v_trans;
+    }
+
+    return n_fill;
+}
+
+int32_t llama_get_kv_layer_info(llama_context * ctx, llama_kv_layer_info * info, int32_t n_layer) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    if (!kv) {
+        return -1;
+    }
+    return kv->get_kv_layer_info(info, n_layer);
+}

@@ -2984,6 +2984,14 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }
 
+int64_t llama_tensor_ne(const struct ggml_tensor * t, int dim) {
+    return t->ne[dim];
+}
+
+void * llama_tensor_data(const struct ggml_tensor * t) {
+    return t->data;
+}
+
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }

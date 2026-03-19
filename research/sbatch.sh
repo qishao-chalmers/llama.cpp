@@ -1,0 +1,37 @@
+  # 1. Context-length sweep (main experiment)                                                                                                                                                              
+  bash research/scripts/submit_sweep.sh \                                                                                                                                                                  
+      --models "models/Qwen3-8B-Q8_0.gguf" \                                                                                                                                                               
+      --contexts "128 512 4096 16384 32768" \                                                                                                                                                              
+      --quants "fp16 int8_ch int4_ch" \                                                                                                                                                                    
+      --corpus research/data/wikitext2_test.txt \                                                                                                                                                          
+      --time 12:00:00                                                                                                                                                                                      
+                                                                                                                                                                                                           
+  # 2. Multi-model comparison                                                                                                                                                                              
+  bash research/scripts/submit_sweep.sh \                                                                                                                                                                  
+      --models "models/Qwen3-8B-Q8_0.gguf models/Qwen2.5-Coder-7B-Instruct-Q8_0.gguf" \                                                                                                                    
+      --contexts "128 4096" \                                                                                                                                                                              
+      --quants "fp16 int8_ch int4_ch" \                                                                                                                                                                    
+      --corpus research/data/wikitext2_test.txt                                                                                                                                                            
+                                                                                                                                                                                                           
+  # 3. Coding-agent structured sweep                                                                                                                                                                       
+  bash research/scripts/submit_sweep.sh \                                                                                                                                                                  
+      --models "models/Qwen2.5-Coder-7B-Instruct-Q8_0.gguf" \                                                                                                                                              
+      --contexts "5120" \                                                                                                                                                                                  
+      --corpus research/data/code_longcode.jsonl \                                                                                                                                                         
+      --corpus-mode structured \                                                                                                                                                                           
+      --n-chunks 0 \                                                                                                                                                                                       
+      --time 04:00:00                                                                                                                                                                                      
+                                                                                                                                                                                                           
+  # Dry run to preview jobs without submitting                                                                                                                                                             
+  bash research/scripts/submit_sweep.sh \                                                                                                                                                                  
+      --models "models/Qwen3-8B-Q8_0.gguf" \                                                                                                                                                               
+      --contexts "128 512 4096" \                                                                                                                                                                          
+      --dry-run                                                                                                                                                                                            
+                                                                                                                                                                                                           
+  Key design decisions:                                                                                                                                                                                    
+  - One job per (model × context) — all quants run in one job so the model is only loaded once                                                                                                             
+  - Auto-adjust for large contexts — if --n-prompt 0 and ctx >= 4096, automatically sets n_prompt = ctx - 512 with --prefill-batch (otherwise token-by-token at 32K would take days)                       
+  - Results named results_<model>_ctx<N>_<date>.json so multiple runs don't overwrite each other                                                                                                         
+  - --account optional — needed on some clusters, leave blank if not required                                                                                                                              
+                                                                                                                                                                                                           
+  You'll likely need to adjust --partition and --mem to match your cluster's setup. 

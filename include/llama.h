@@ -544,6 +544,27 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
+    // Per-layer KV cache tensor info — for direct GPU-side quantization via CuPy.
+    // Fills info[0..n_layer-1] with raw device pointers and layout metadata.
+    // Requires Flash Attention (--flash-attn) so V is not transposed (v_trans == 0).
+    // Returns the number of layers filled (≤ n_layer), or -1 on error.
+    typedef struct llama_kv_layer_info {
+        void    * k_data;     // device ptr: start of K tensor for stream 0
+        void    * v_data;     // device ptr: start of V tensor for stream 0
+        int32_t   n_cells;    // number of tokens currently in the KV cache
+        int32_t   k_stride;   // bytes between consecutive token rows in K (nb[1])
+        int32_t   v_stride;   // bytes between consecutive token rows in V (nb[1])
+        int32_t   n_embd_k;   // K embedding dimension (ne[0])
+        int32_t   n_embd_v;   // V embedding dimension (ne[0])
+        int32_t   ggml_type;  // ggml_type of K (e.g. GGML_TYPE_F16 = 1)
+        int32_t   v_trans;    // 1 if V is transposed (FA disabled) — not supported
+    } llama_kv_layer_info;
+
+    LLAMA_API int32_t llama_get_kv_layer_info(
+                  struct llama_context * ctx,
+            llama_kv_layer_info      * info,
+                          int32_t      n_layer);
+
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
@@ -969,6 +990,10 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Tensor helpers for use inside cb_eval callbacks (CPU tensors only)
+    LLAMA_API int64_t llama_tensor_ne  (const struct ggml_tensor * t, int dim);
+    LLAMA_API void *  llama_tensor_data(const struct ggml_tensor * t);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

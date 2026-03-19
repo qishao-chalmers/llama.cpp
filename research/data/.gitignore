@@ -1,0 +1,2 @@
+# All corpus files are large and reproducible via fetch_wikitext.py / fetch_code.py
+*.txt
