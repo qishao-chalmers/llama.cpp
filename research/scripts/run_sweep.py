@@ -24,48 +24,166 @@ except ImportError:
     HAS_GPU_QUANT = False
 
 
+def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd):
+    """Build a bare CPU hook (no window logic) for a specific quant type.
+    Used for sink_hook and recent_hook in _apply_window zone quantization.
+    Accepts start_k/start_v for absolute-offset quantization."""
+    k_fns = [quant_mod.get_quant_fn(n) for n in k_names]
+    v_fns = [quant_mod.get_quant_fn(n) for n in v_names]
+    def _zone_hook(ctx, n_new_k=None, n_new_v=None,
+                   start_k=None, start_v=None, **_):
+        parse_state.apply_kv_hook(lib, ctx, llama.ContextPtr,
+                                  k_fn=k_fns, v_fn=v_fns,
+                                  seq_id=0, n_pos_per_embd=n_pos_per_embd,
+                                  n_new_k=n_new_k, n_new_v=n_new_v,
+                                  start_k=start_k, start_v=start_v)
+    return _zone_hook
+
+
+def _apply_window(main_hook, n_sink, n_recent,
+                  sink_hook=None, recent_hook=None):
+    """Wrap main_hook with three-zone KIVI-style quantization.
+
+    Zones (positions in the KV cache at time T):
+      [0,          n_sink)      → sink_hook   (or fp16 if sink_hook is None)
+      [n_sink,     T-n_recent)  → main_hook   (stale tokens, heaviest compression)
+      [T-n_recent, T)           → recent_hook (or fp16 if recent_hook is None)
+
+    Token lifecycle during decode:
+      1. New token added → quantized with recent_hook (if set), else stays fp16
+      2. After n_recent more tokens arrive, token falls out of recent window
+         → re-quantized with main_hook (from its recent_hook state or fp16)
+
+    When group_size > n_recent some new tokens bypass the recent zone entirely
+    (they immediately become stale in the same batch they were added).
+
+    Prefill: all three zones quantized in one shot.
+    Caller must pass n_prompt= on the prefill call so zone boundaries are known.
+    """
+    if (n_sink <= 0 and n_recent <= 0
+            and sink_hook is None and recent_hook is None):
+        return main_hook
+
+    n_done = [0]  # K and V fire together after the group-size equality fix
+
+    def window_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=0, **_):
+        G = n_new_k  # == n_new_v in practice; use a single counter
+
+        if G is None:
+            # ── Prefill ──────────────────────────────────────────────────────
+            n_done[0] = n_prompt
+            sink_end     = min(n_sink, n_prompt)
+            mid_start    = sink_end
+            mid_end      = max(mid_start, n_prompt - n_recent) if n_recent > 0 else n_prompt
+            recent_start = mid_end
+
+            if sink_hook and sink_end > 0:
+                sink_hook(ctx, n_new_k=sink_end, n_new_v=sink_end,
+                          start_k=0, start_v=0)
+            if mid_end > mid_start:
+                main_hook(ctx, n_new_k=mid_end - mid_start, n_new_v=mid_end - mid_start,
+                          start_k=mid_start, start_v=mid_start)
+            if recent_hook and n_prompt > recent_start:
+                count = n_prompt - recent_start
+                recent_hook(ctx, n_new_k=count, n_new_v=count,
+                            start_k=recent_start, start_v=recent_start)
+
+        else:
+            # ── Decode fire: G new tokens ────────────────────────────────────
+            n_before  = n_done[0]
+            n_done[0] += G
+
+            # Stale zone: tokens that fell out of (or bypassed) the recent window.
+            # Old recent window: [n_before - n_recent, n_before)
+            # New recent window: [n_before + G - n_recent, n_before + G)
+            # Fell out (= should be quantized with main_hook now):
+            #   [n_before - n_recent, n_before + G - n_recent) — G tokens
+            # Clip against [n_sink, ∞) and against [0, ∞).
+            stale_raw_start = n_before - n_recent   # may be negative when window not full
+            stale_raw_end   = stale_raw_start + G   # = n_before + G - n_recent
+            stale_start = max(stale_raw_start, n_sink, 0)
+            stale_count = max(0, stale_raw_end - stale_start)
+            if stale_count > 0:
+                main_hook(ctx, n_new_k=stale_count, n_new_v=stale_count,
+                          start_k=stale_start, start_v=stale_start)
+
+            # Recent zone: tokens that land in the NEW recent window.
+            # = last min(G, n_recent) tokens (no start_k needed — default "last N").
+            if recent_hook and n_recent > 0:
+                recent_count = min(G, n_recent)
+                recent_hook(ctx, n_new_k=recent_count, n_new_v=recent_count)
+
+            # No-recent-window fallback: if n_recent==0 stale logic above covers main
+            # but stale_raw_start = n_before, stale_count = G (minus sink clip) ✓
+
+    return window_hook
+
+
 def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                  use_gpu=False, n_layer=0, ctx_ptr=None,
-                 default_group_size=128):
+                 default_group_size=128, n_sink=0, n_recent=0,
+                 k_sink_names=None, v_sink_names=None,
+                 k_recent_names=None, v_recent_names=None):
     """Create a KV hook for the given K/V quant name lists.
 
     k_names / v_names: list[str] of length n_layer.
     Returns None if all layers are fp16 (no-op).
 
     Per-layer group sizes are computed from each layer's quant type:
-    - per-token quants → group_size=1 (fire every token)
-    - per-channel quants → group_size=default_group_size (accumulate first)
-    When layers on the same side have mixed group sizes (e.g. per-channel on
-    layers 0-15 and per-token on layers 16-31), a stateful closure tracks each
-    layer's pending count independently so per-channel layers still batch
-    default_group_size tokens before quantizing.
+    - per-token quants → group_size=default_group_size (same firing cadence as per-channel)
+    - per-channel _ch_g{N} quants → group_size=N (from the named variant)
+    - per-channel quants → group_size=default_group_size
+    When layers on the same side have mixed group sizes (e.g. _ch_g32 on layers
+    0-15 and _ch_g64 on layers 16-31), a stateful closure tracks each layer's
+    pending count independently so the tighter group fires more often.
+
+    Zone quant parameters (k_sink_names etc.): if provided, the sink / recent
+    zones use a separate quant type instead of fp16.  These always use the CPU
+    path (parse_state) regardless of use_gpu.
     """
     if all(n == "fp16" for n in k_names) and all(n == "fp16" for n in v_names):
         return None
 
-    k_layer_gs = [1 if n in quant_mod.PER_TOKEN_QUANTS else default_group_size
-                  for n in k_names]
-    v_layer_gs = [1 if n in quant_mod.PER_TOKEN_QUANTS else default_group_size
-                  for n in v_names]
+    # Build CPU zone hooks for sink / recent zones (if zone quants requested).
+    sink_hook   = (_make_cpu_zone_hook(lib, k_sink_names,   v_sink_names,   n_pos_per_embd)
+                   if k_sink_names   is not None else None)
+    recent_hook = (_make_cpu_zone_hook(lib, k_recent_names, v_recent_names, n_pos_per_embd)
+                   if k_recent_names is not None else None)
+
+    def _layer_gs(names):
+        gs = []
+        for n in names:
+            if n in quant_mod.CH_QUANT_GROUP_SIZE:
+                gs.append(quant_mod.CH_QUANT_GROUP_SIZE[n])
+            else:
+                gs.append(default_group_size)
+        return gs
+
+    k_layer_gs = _layer_gs(k_names)
+    v_layer_gs = _layer_gs(v_names)
     k_uniform  = len(set(k_layer_gs)) == 1
     v_uniform  = len(set(v_layer_gs)) == 1
 
     if k_uniform and v_uniform:
         # Simple path: no per-layer tracking needed; hook fires at the right cadence
         if use_gpu and HAS_GPU_QUANT:
-            return gpu_quant.make_kv_hook_gpu(lib, ctx_ptr, k_names, v_names, n_layer)
+            return _apply_window(
+                gpu_quant.make_kv_hook_gpu(lib, ctx_ptr, k_names, v_names, n_layer),
+                n_sink, n_recent, sink_hook=sink_hook, recent_hook=recent_hook)
         k_fns = [quant_mod.get_quant_fn(n) for n in k_names]
         v_fns = [quant_mod.get_quant_fn(n) for n in v_names]
-        def hook_simple(ctx, n_new_k=None, n_new_v=None, _kf=k_fns, _vf=v_fns):
+        def hook_simple(ctx, n_new_k=None, n_new_v=None,
+                        start_k=None, start_v=None, _kf=k_fns, _vf=v_fns, **_):
             parse_state.apply_kv_hook(lib, ctx, llama.ContextPtr,
                                       k_fn=_kf, v_fn=_vf,
                                       seq_id=0, n_pos_per_embd=n_pos_per_embd,
-                                      n_new_k=n_new_k, n_new_v=n_new_v)
-        return hook_simple
+                                      n_new_k=n_new_k, n_new_v=n_new_v,
+                                      start_k=start_k, start_v=start_v)
+        return _apply_window(hook_simple, n_sink, n_recent,
+                             sink_hook=sink_hook, recent_hook=recent_hook)
 
     # Mixed granularities: stateful per-layer pending counters.
-    # The hook fires every token (global group_size=1 from get_kv_group_sizes);
-    # each layer only quantizes when its own threshold is met.
+    # Each layer fires independently when its own threshold is met.
     k_pending = [0] * n_layer
     v_pending = [0] * n_layer
 
@@ -87,7 +205,7 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
         return result
 
     if use_gpu and HAS_GPU_QUANT:
-        def hook_gpu_mixed(ctx, n_new_k=None, n_new_v=None):
+        def hook_gpu_mixed(ctx, n_new_k=None, n_new_v=None, **_):
             k_per = _per_layer_new(n_new_k, k_pending, k_layer_gs)
             v_per = _per_layer_new(n_new_v, v_pending, v_layer_gs)
             if n_new_k is None or any(k_per) or any(v_per):
@@ -95,11 +213,12 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                     lib, ctx, n_layer, k_names, v_names,
                     n_new_k=None if n_new_k is None else k_per,
                     n_new_v=None if n_new_v is None else v_per)
-        return hook_gpu_mixed
+        return _apply_window(hook_gpu_mixed, n_sink, n_recent,
+                             sink_hook=sink_hook, recent_hook=recent_hook)
 
     k_fns = [quant_mod.get_quant_fn(n) for n in k_names]
     v_fns = [quant_mod.get_quant_fn(n) for n in v_names]
-    def hook_cpu_mixed(ctx, n_new_k=None, n_new_v=None):
+    def hook_cpu_mixed(ctx, n_new_k=None, n_new_v=None, **_):
         k_per = _per_layer_new(n_new_k, k_pending, k_layer_gs)
         v_per = _per_layer_new(n_new_v, v_pending, v_layer_gs)
         if n_new_k is None or any(k_per) or any(v_per):
@@ -108,24 +227,27 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                                       seq_id=0, n_pos_per_embd=n_pos_per_embd,
                                       n_new_k=None if n_new_k is None else k_per,
                                       n_new_v=None if n_new_v is None else v_per)
-    return hook_cpu_mixed
+    return _apply_window(hook_cpu_mixed, n_sink, n_recent,
+                         sink_hook=sink_hook, recent_hook=recent_hook)
 
 
 def get_kv_group_sizes(k_names, v_names, default_group_size):
     """Return (k_group_size, v_group_size) for the given K/V quant name lists.
 
     Priority order for each side:
-      1. Per-token quant present → group_size = 1 (fire every token)
-      2. Named _ch_g{N} quant present → group_size = N (from CH_QUANT_GROUP_SIZE)
-      3. Otherwise → default_group_size (from --quant-group-size flag)
+      1. Named _ch_g{N} quant present → group_size = N (from CH_QUANT_GROUP_SIZE)
+      2. Otherwise (including per-token quants) → default_group_size
+
+    Per-token quants fire at the same cadence as per-channel (every
+    default_group_size tokens) for a fair quality comparison.  The quant
+    function itself still operates per-token (axis=1); only the hook firing
+    frequency changes.
 
     For mixed-layer specs (e.g. int4_ch_g32@0-15/int4_ch_g64@16-31) the
     minimum group size across layers is used so the hook fires often enough
     for the tightest group.
     """
     def _resolve(names):
-        if any(n in quant_mod.PER_TOKEN_QUANTS for n in names):
-            return 1
         named_gs = [quant_mod.CH_QUANT_GROUP_SIZE[n]
                     for n in names if n in quant_mod.CH_QUANT_GROUP_SIZE]
         if named_gs:
@@ -175,14 +297,43 @@ def main():
                         help="Tokens per quantization group during decode (default 128). "
                              "Scales are shared across the group, matching real KV quant systems. "
                              "Larger = more compression error but fewer scales stored.")
+    parser.add_argument("--sink-tokens",        type=int, default=0,
+                        help="Leave the first N tokens unquantized (attention sinks). "
+                             "Papers show initial tokens absorb disproportionate attention mass; "
+                             "keeping them in fp16 often recovers quality at minimal memory cost.")
+    parser.add_argument("--recent-tokens",      type=int, default=0,
+                        help="Keep the most recent N tokens in fp16 at all times (KIVI-style). "
+                             "When new tokens arrive and older ones fall out of this window, "
+                             "they get quantized. Combined with --sink-tokens this gives three "
+                             "zones: sinks (fp16) | stale (quantized) | recent (fp16).")
+    parser.add_argument("--quant-sink",         default=None,
+                        help="Quant type for the sink zone instead of fp16 "
+                             "(e.g. 'int8_ch'). Supports K:V split and layer-range syntax. "
+                             "Has no effect when --sink-tokens is 0.")
+    parser.add_argument("--quant-recent",       default=None,
+                        help="Quant type for the recent-window zone instead of fp16 "
+                             "(e.g. 'int8_ch'). Tokens are quantized immediately when added, "
+                             "then re-quantized with the main quant when they become stale. "
+                             "Has no effect when --recent-tokens is 0.")
     parser.add_argument("--show-text",      action="store_true",
                         help="Print detokenized prompt/completion and fp16 top-1 predictions.")
+    parser.add_argument("--save-diags", default=None, metavar="FILE",
+                        help="Save per-token diagnostics (H, p_max, self_surp, lp) to JSON "
+                             "for later plotting. Enables diagnostic collection without --show-text.")
+    parser.add_argument("--save-per-example", default=None, metavar="FILE",
+                        help="Save per-example accuracy scores and gen lengths to JSON "
+                             "(keyed by quant name). Used with --eval-accuracy for NIAH analysis.")
     parser.add_argument("--show-text-chunk", type=int, default=None,
                         help="Which chunk/example index to show token predictions for. "
                              "Default: show all. Pass a non-negative int to show only that index.")
     parser.add_argument("--eval-accuracy",  action="store_true",
                         help="Structured mode: run greedy generation and compare extracted "
                              "answer against gold. Reports accuracy alongside PPL/KL.")
+    parser.add_argument("--skip-ppl",       action="store_true",
+                        help="Skip teacher-forced PPL and KL computation. Only runs "
+                             "--eval-accuracy generation. Useful when PPL is meaningless "
+                             "(NIAH: passphrase is verbatim in context so ppl≈1.0) or to save "
+                             "time on large example sets. Requires --eval-accuracy.")
     parser.add_argument("--max-gen-tokens", type=int, default=512,
                         help="Max new tokens to generate per example for --eval-accuracy (default 512).")
     parser.add_argument("--answer-regex",   default=r"(?:####|[Tt]he answer is)\s*\$?\s*([\d,]+)",
@@ -253,6 +404,14 @@ def main():
     n_vocab = lib.llama_vocab_n_tokens(vocab)
     n_layer = lib.llama_model_n_layer(model)
 
+    # Resolve zone quant names once (same n_layer for all sweep entries).
+    k_sink_names, v_sink_names = (
+        quant_mod.resolve_quant_layers(args.quant_sink, n_layer)
+        if args.quant_sink else (None, None))
+    k_recent_names, v_recent_names = (
+        quant_mod.resolve_quant_layers(args.quant_recent, n_layer)
+        if args.quant_recent else (None, None))
+
     def show_chunk_text(prompt_tokens, decode_tokens, label=""):
         """Print full detokenized prompt and decode target."""
         prompt_text = llama.detokenize(lib, vocab, prompt_tokens)
@@ -270,12 +429,20 @@ def main():
     #                          "log_probs": {q: [...]}, "diags": {q: {...}}}
     _text_per_chunk = {}
 
+    # Per-example accuracy results for --save-per-example (NIAH / position analysis).
+    # _per_example_results[quant] = [{"label", "score", "gold", "pred", "gen_len"}, ...]
+    _per_example_results = {}
+
     def _show_this(idx, total):
         """Return True if this chunk/example index should have its data collected."""
         if args.show_text_chunk is not None:
             target = args.show_text_chunk % total if args.show_text_chunk < 0 else args.show_text_chunk
             return idx == target
         return True  # default: collect all
+
+    def _want_diags(idx, total):
+        """Return True if diagnostics should be collected for this chunk/example index."""
+        return (args.show_text or bool(args.save_diags)) and _show_this(idx, total)
 
     def show_predictions():
         """Print a table of actual vs predicted tokens for all collected quants.
@@ -410,18 +577,30 @@ def main():
             best      = max(best, f1)
         return best
 
+    _HEDGE_RE = re.compile(
+        r'\b(wait|actually|hold on|let me (?:re)?check|let me recalculate|'
+        r'but (?:wait|actually)|hmm+|i need to (?:re)?check|that\'?s not right|'
+        r'let me redo|i made an error|correction|i(?:\'m| am) not sure|'
+        r'let me (?:try|re-?do|go back|re-?compute|re-?calculate))\b',
+        re.IGNORECASE
+    )
+
     def eval_accuracy_pass(examples, gold_answers, kv_hook, k_group_size, v_group_size):
-        """Run greedy generation on each example, score against gold, return (score_sum, n_total, per_ex).
+        """Run greedy generation on each example, score against gold, return (score_sum, n_total, per_ex, gen_len_stats).
 
         For --eval-metric exact: n_correct / n_total (accuracy).
         For --eval-metric f1:    mean F1 (0–1) over all examples.
         per_ex: list of (gold_display, pred_display, score) tuples.
+        gen_len_stats: dict with mean_gen_tokens / mean_gen_tokens_correct / mean_gen_tokens_wrong.
         """
         use_f1 = (args.eval_metric == "f1")
         ans_re  = re.compile(args.answer_regex) if not use_f1 else None
-        score_sum = 0.0
-        n_total   = 0
-        per_ex    = []
+        score_sum  = 0.0
+        n_total    = 0
+        per_ex     = []
+        gen_lens_correct = []
+        gen_lens_wrong   = []
+        n_truncated      = 0
         for ei, (pt, ct, label) in enumerate(examples):
             gold = gold_answers[ei] if gold_answers else None
             max_ctx_avail = args.n_ctx - len(pt) - 1
@@ -429,14 +608,17 @@ def main():
             if max_gen <= 0:
                 per_ex.append((gold, None, 0.0))
                 continue
-            gen_ids  = strategies.run_generate(
+            gen_ids, gen_diags = strategies.run_generate(
                 lib, ctx, vocab, pt, n_vocab,
                 kv_hook=kv_hook,
                 max_new_tokens=max_gen,
                 stop_strings=args.stop_strings or None,
                 k_group_size=k_group_size,
-                v_group_size=v_group_size)
-            gen_text = llama.detokenize(lib, vocab, gen_ids, remove_special=False).strip()
+                v_group_size=v_group_size,
+                return_diagnostics=bool(args.save_per_example))
+            gen_text  = llama.detokenize(lib, vocab, gen_ids, remove_special=False).strip()
+            gen_len   = len(gen_ids)
+            truncated = (gen_len >= max_gen)
 
             if use_f1:
                 gold_list   = gold if isinstance(gold, list) else ([gold] if gold else [])
@@ -447,23 +629,65 @@ def main():
                 n_total    += 1
                 score_sum  += score
             else:
-                m           = ans_re.search(gen_text)
-                pred        = m.group(1).replace(",", "") if m else None
+                # Use last match: reasoning models often self-correct mid-generation.
+                # The final answer after "Wait, let me recalculate" is more faithful.
+                all_matches  = list(ans_re.finditer(gen_text))
+                all_hedge_ms = list(_HEDGE_RE.finditer(gen_text))
+                m            = all_matches[-1] if all_matches else None
+                pred         = m.group(1).replace(",", "") if m else None
+
+                # Inconclusive: truncated while still doubting (last hedge after last answer).
+                # The model expressed uncertainty and never reached a new conclusion.
+                inconclusive = (
+                    truncated and m is not None and all_hedge_ms and
+                    all_hedge_ms[-1].start() > m.start()
+                )
+
                 gold_disp   = str(gold) if gold is not None else ""
                 pred_disp   = str(pred) if pred is not None else "None"
-                score       = 1.0 if (pred is not None and pred == gold) else 0.0
-                mark        = "✓" if score == 1.0 else "✗"
+                if inconclusive:
+                    score     = 0.0
+                    pred_disp = f"{pred_disp}?"   # flag that answer was doubted
+                    mark      = "✗(inconclusive)"
+                else:
+                    score = 1.0 if (pred is not None and pred == gold) else 0.0
+                    mark  = "✓" if score == 1.0 else "✗"
+                    if truncated:
+                        mark += "(trunc)"
                 if gold is not None:
                     n_total    += 1
                     score_sum  += score
 
-            per_ex.append((gold_disp, pred_disp, score))
+            n_hedges     = len(_HEDGE_RE.findall(gen_text))
+            inconclusive = inconclusive if not use_f1 else False
+            if truncated:
+                n_truncated += 1
+            (gen_lens_correct if score == 1.0 else gen_lens_wrong).append(gen_len)
+            ex_entry = {"label": label, "score": score,
+                        "gold": gold_disp, "pred": pred_disp,
+                        "gen_len": gen_len, "truncated": truncated,
+                        "inconclusive": inconclusive, "n_hedges": n_hedges}
+            if gen_diags is not None:
+                ex_entry["gen_diags"] = gen_diags
+            per_ex.append(ex_entry)
+            hedge_str = f"  hedges={n_hedges}" if n_hedges > 0 else ""
             print(f"  acc ex {ei+1}/{len(examples)}: {label} | "
-                  f"gold={gold_disp}  pred={pred_disp}  {mark}", flush=True)
+                  f"gold={gold_disp}  pred={pred_disp}  {mark}  gen_len={gen_len}{hedge_str}", flush=True)
             if args.show_text and _show_this(ei, len(examples)):
-                print(f"    gen: {gen_text[:300]!r}", flush=True)
+                print(f"    gen: {gen_text!r}", flush=True)
         mean_score = score_sum / n_total if n_total > 0 else 0.0
-        return mean_score, n_total, per_ex
+        all_lens = gen_lens_correct + gen_lens_wrong
+        def _mean(lst): return sum(lst) / len(lst) if lst else None
+        all_hedges = [ex["n_hedges"] for ex in per_ex]
+        gen_len_stats = {
+            "mean_gen_tokens":         _mean(all_lens),
+            "mean_gen_tokens_correct": _mean(gen_lens_correct),
+            "mean_gen_tokens_wrong":   _mean(gen_lens_wrong),
+            "n_truncated":             n_truncated,
+            "n_inconclusive":          sum(1 for ex in per_ex if ex["inconclusive"]),
+            "mean_hedges":             _mean(all_hedges),
+        }
+        return mean_score, n_total, per_ex, gen_len_stats
 
     use_gpu = args.n_gpu_layers > 0 and HAS_GPU_QUANT and args.flash_attn
     if args.n_gpu_layers > 0 and not args.flash_attn:
@@ -541,11 +765,18 @@ def main():
                 n_gold = sum(a is not None for a in gold_answers)
                 print(f"  Gold answers found: {n_gold}/{len(examples)}", flush=True)
 
+        if args.skip_ppl and not args.eval_accuracy:
+            raise ValueError("--skip-ppl requires --eval-accuracy (nothing left to compute otherwise)")
+
         # n_ctx: cover teacher-forced PPL pass and, if needed, generation pass
-        actual_n_ctx = max(len(pt) + len(ct) for pt, ct, _ in examples) + 1
-        if args.eval_accuracy:
-            gen_n_ctx    = max(len(pt) for pt, _, _ in examples) + args.max_gen_tokens + 1
-            actual_n_ctx = max(actual_n_ctx, gen_n_ctx)
+        if args.skip_ppl:
+            # PPL pass skipped — only need room for prompt + generation
+            actual_n_ctx = max(len(pt) for pt, _, _ in examples) + args.max_gen_tokens + 1
+        else:
+            actual_n_ctx = max(len(pt) + len(ct) for pt, ct, _ in examples) + 1
+            if args.eval_accuracy:
+                gen_n_ctx    = max(len(pt) for pt, _, _ in examples) + args.max_gen_tokens + 1
+                actual_n_ctx = max(actual_n_ctx, gen_n_ctx)
         actual_n_ctx = min(actual_n_ctx, args.n_ctx)
         max_prompt   = max(len(pt) for pt, _, _ in examples)
 
@@ -560,49 +791,81 @@ def main():
             cparams.flash_attn_type = 1
         ctx = lib.llama_init_from_model(model, cparams)
 
-        # ── fp16 baseline: collect full log distributions for KL reference ──
-        print("\n[fp16 baseline]", flush=True)
-        t0 = time.time()
-        base_lps_per_ex   = []   # list of log_probs per example
-        base_dists_per_ex = []   # list of [n_completion, n_vocab] float16
-        for ei, (pt, ct, label) in enumerate(examples):
-            if args.show_text and _show_this(ei, len(examples)):
-                show_chunk_text(pt, ct, label=label)
-            r = strategies.run_structured(lib, ctx, pt, ct, n_vocab,
-                                          kv_hook=None,
-                                          quantize_prompt_only=False,
-                                          return_log_dists=True,
-                                          return_top1=(args.show_text and _show_this(ei, len(examples))),
-                                          return_diagnostics=(args.show_text and _show_this(ei, len(examples))))
-            base_lps_per_ex.append(r.log_probs)
-            base_dists_per_ex.append(r.log_dists)
-            if args.show_text and _show_this(ei, len(examples)) and r.top1s:
-                c = _text_per_chunk.setdefault(ei, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
-                c["actual_ids"]    = ct[1:len(r.top1s) + 1]
-                c["top1s"]["fp16"]     = r.top1s
-                c["log_probs"]["fp16"] = r.log_probs
-                c["diags"]["fp16"]     = r.diags
-            ppl_so_far = math.exp(-np.mean([-lp for ex in base_lps_per_ex for lp in ex]))
-            print(f"  ex {ei+1}/{len(examples)}: {label} | ppl={ppl_so_far:.4f}", flush=True)
-        fp16_ppl = math.exp(-np.mean([-lp for ex in base_lps_per_ex for lp in ex]))
-        elapsed = time.time() - t0
-        print(f"  => PPL={fp16_ppl:.4f}  kl=0.000  ({elapsed:.1f}s)", flush=True)
-
         results = {}
-        if "fp16" in args.quants:
-            n_tok = sum(len(lps) for lps in base_lps_per_ex)
-            entry = {"ppl": fp16_ppl, "mean_kl": 0.0, "n_tokens": n_tok}
-            if args.eval_accuracy:
-                mean_score, nt, _ = eval_accuracy_pass(examples, gold_answers,
-                                                       kv_hook=None,
-                                                       k_group_size=args.quant_group_size,
-                                                       v_group_size=args.quant_group_size)
+        if args.skip_ppl:
+            # ── Skip PPL baseline: no teacher-forced pass, no KL reference ────
+            # KL will be reported as None for all quants.
+            print("\n[fp16 baseline] SKIPPED (--skip-ppl)", flush=True)
+            base_lps_per_ex   = None
+            base_dists_per_ex = [None] * len(examples)
+            fp16_ppl          = float("nan")
+            if "fp16" in args.quants:
+                t0 = time.time()
+                print("\n[fp16]", flush=True)
+                mean_score, nt, per_ex_fp16, gl = eval_accuracy_pass(
+                    examples, gold_answers,
+                    kv_hook=None,
+                    k_group_size=args.quant_group_size,
+                    v_group_size=args.quant_group_size)
                 metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
-                entry[metric_label] = mean_score
-                entry["n_total"]    = nt
-                print(f"  => PPL={fp16_ppl:.4f}  kl=0.000  {metric_label}={mean_score:.4f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
-            results["fp16"] = entry
-            save_results(results)
+                elapsed = time.time() - t0
+                entry = {"ppl": None, "mean_kl": None, "n_tokens": None,
+                         metric_label: mean_score, "n_total": nt}
+                entry.update(gl)
+                if args.save_per_example:
+                    _per_example_results["fp16"] = per_ex_fp16
+                print(f"  => {metric_label}={mean_score:.4f}  "
+                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                results["fp16"] = entry
+                save_results(results)
+        else:
+            # ── fp16 baseline: collect full log distributions for KL reference ──
+            print("\n[fp16 baseline]", flush=True)
+            t0 = time.time()
+            base_lps_per_ex   = []   # list of log_probs per example
+            base_dists_per_ex = []   # list of [n_completion, n_vocab] float16
+            for ei, (pt, ct, label) in enumerate(examples):
+                if args.show_text and _show_this(ei, len(examples)):
+                    show_chunk_text(pt, ct, label=label)
+                r = strategies.run_structured(lib, ctx, pt, ct, n_vocab,
+                                              kv_hook=None,
+                                              quantize_prompt_only=False,
+                                              return_log_dists=True,
+                                              return_top1=_want_diags(ei, len(examples)),
+                                              return_diagnostics=_want_diags(ei, len(examples)))
+                base_lps_per_ex.append(r.log_probs)
+                base_dists_per_ex.append(r.log_dists)
+                if _want_diags(ei, len(examples)) and r.top1s:
+                    c = _text_per_chunk.setdefault(ei, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
+                    c["actual_ids"]    = ct[1:len(r.top1s) + 1]
+                    c["top1s"]["fp16"]     = r.top1s
+                    c["log_probs"]["fp16"] = r.log_probs
+                    c["diags"]["fp16"]     = r.diags
+                ppl_so_far = math.exp(-np.mean([-lp for ex in base_lps_per_ex for lp in ex]))
+                print(f"  ex {ei+1}/{len(examples)}: {label} | ppl={ppl_so_far:.4f}", flush=True)
+            fp16_ppl = math.exp(-np.mean([-lp for ex in base_lps_per_ex for lp in ex]))
+            elapsed = time.time() - t0
+            print(f"  => PPL={fp16_ppl:.4f}  kl=0.000  ({elapsed:.1f}s)", flush=True)
+
+            if "fp16" in args.quants:
+                n_tok = sum(len(lps) for lps in base_lps_per_ex)
+                entry = {"ppl": fp16_ppl, "mean_kl": 0.0, "n_tokens": n_tok}
+                if args.eval_accuracy:
+                    mean_score, nt, per_ex_fp16, gl = eval_accuracy_pass(
+                        examples, gold_answers,
+                        kv_hook=None,
+                        k_group_size=args.quant_group_size,
+                        v_group_size=args.quant_group_size)
+                    metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
+                    entry[metric_label] = mean_score
+                    entry["n_total"]    = nt
+                    entry.update(gl)
+                    if args.save_per_example:
+                        _per_example_results["fp16"] = per_ex_fp16
+                    print(f"  => PPL={fp16_ppl:.4f}  kl=0.000  {metric_label}={mean_score:.4f}  "
+                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                results["fp16"] = entry
+                save_results(results)
 
         for quant_name in args.quants:
             if quant_name == "fp16":
@@ -614,46 +877,74 @@ def main():
             k_group_size, v_group_size = get_kv_group_sizes(k_names, v_names, args.quant_group_size)
             kv_hook = make_kv_hook(lib, k_names, v_names, args.n_pos_per_embd,
                                    use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
-                                   default_group_size=args.quant_group_size)
+                                   default_group_size=args.quant_group_size,
+                                   n_sink=args.sink_tokens,
+                                   n_recent=args.recent_tokens,
+                                   k_sink_names=k_sink_names,
+                                   v_sink_names=v_sink_names,
+                                   k_recent_names=k_recent_names,
+                                   v_recent_names=v_recent_names)
 
-            all_lp = []
-            all_kl = []
-            for ei, (pt, ct, label) in enumerate(examples):
-                r = strategies.run_structured(lib, ctx, pt, ct, n_vocab,
-                                              kv_hook=kv_hook,
-                                              quantize_prompt_only=args.quantize_prompt_only,
-                                              k_group_size=k_group_size,
-                                              v_group_size=v_group_size,
-                                              base_log_dists=base_dists_per_ex[ei],
-                                              return_top1=(args.show_text and _show_this(ei, len(examples))),
-                                              return_diagnostics=(args.show_text and _show_this(ei, len(examples))))
-                all_lp.extend(r.log_probs)
-                all_kl.extend(r.kl_divs)
-                if args.show_text and _show_this(ei, len(examples)) and r.top1s:
-                    c = _text_per_chunk.setdefault(ei, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
-                    c["top1s"][quant_name]     = r.top1s
-                    c["log_probs"][quant_name] = r.log_probs
-                    c["diags"][quant_name]     = r.diags
-                ppl_so_far = math.exp(-sum(all_lp) / len(all_lp))
-                kl_so_far  = sum(all_kl) / len(all_kl)
-                print(f"  ex {ei+1}/{len(examples)}: {label} | "
-                      f"ppl={ppl_so_far:.4f}  kl={kl_so_far:.4f}", flush=True)
-
-            ppl     = math.exp(-sum(all_lp) / len(all_lp))
-            mean_kl = sum(all_kl) / len(all_kl)
-            elapsed = time.time() - t0
-            entry = {"ppl": ppl, "mean_kl": mean_kl, "n_tokens": len(all_lp)}
-            if args.eval_accuracy:
-                mean_score, nt, _ = eval_accuracy_pass(examples, gold_answers,
-                                                       kv_hook=kv_hook,
-                                                       k_group_size=k_group_size,
-                                                       v_group_size=v_group_size)
+            if args.skip_ppl:
+                # ── Skip PPL pass: accuracy only ──────────────────────────────
+                mean_score, nt, per_ex_q, gl = eval_accuracy_pass(
+                    examples, gold_answers,
+                    kv_hook=kv_hook,
+                    k_group_size=k_group_size,
+                    v_group_size=v_group_size)
                 metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
-                entry[metric_label] = mean_score
-                entry["n_total"]    = nt
-                print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  {metric_label}={mean_score:.4f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                elapsed = time.time() - t0
+                entry = {"ppl": None, "mean_kl": None, "n_tokens": None,
+                         metric_label: mean_score, "n_total": nt}
+                entry.update(gl)
+                if args.save_per_example:
+                    _per_example_results[quant_name] = per_ex_q
+                print(f"  => {metric_label}={mean_score:.4f}  "
+                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
             else:
-                print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  ({elapsed:.1f}s)", flush=True)
+                all_lp = []
+                all_kl = []
+                for ei, (pt, ct, label) in enumerate(examples):
+                    r = strategies.run_structured(lib, ctx, pt, ct, n_vocab,
+                                                  kv_hook=kv_hook,
+                                                  quantize_prompt_only=args.quantize_prompt_only,
+                                                  k_group_size=k_group_size,
+                                                  v_group_size=v_group_size,
+                                                  base_log_dists=base_dists_per_ex[ei],
+                                                  return_top1=_want_diags(ei, len(examples)),
+                                                  return_diagnostics=_want_diags(ei, len(examples)))
+                    all_lp.extend(r.log_probs)
+                    all_kl.extend(r.kl_divs)
+                    if _want_diags(ei, len(examples)) and r.top1s:
+                        c = _text_per_chunk.setdefault(ei, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
+                        c["top1s"][quant_name]     = r.top1s
+                        c["log_probs"][quant_name] = r.log_probs
+                        c["diags"][quant_name]     = r.diags
+                    ppl_so_far = math.exp(-sum(all_lp) / len(all_lp))
+                    kl_so_far  = sum(all_kl) / len(all_kl)
+                    print(f"  ex {ei+1}/{len(examples)}: {label} | "
+                          f"ppl={ppl_so_far:.4f}  kl={kl_so_far:.4f}", flush=True)
+
+                ppl     = math.exp(-sum(all_lp) / len(all_lp))
+                mean_kl = sum(all_kl) / len(all_kl)
+                elapsed = time.time() - t0
+                entry = {"ppl": ppl, "mean_kl": mean_kl, "n_tokens": len(all_lp)}
+                if args.eval_accuracy:
+                    mean_score, nt, per_ex_q, gl = eval_accuracy_pass(
+                        examples, gold_answers,
+                        kv_hook=kv_hook,
+                        k_group_size=k_group_size,
+                        v_group_size=v_group_size)
+                    metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
+                    entry[metric_label] = mean_score
+                    entry["n_total"]    = nt
+                    entry.update(gl)
+                    if args.save_per_example:
+                        _per_example_results[quant_name] = per_ex_q
+                    print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  {metric_label}={mean_score:.4f}  "
+                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                else:
+                    print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  ({elapsed:.1f}s)", flush=True)
             results[quant_name] = entry
             save_results(results)
 
@@ -717,11 +1008,11 @@ def main():
                 lib, ctx, chunk, n_vocab, None,
                 n_prompt=n_prefill,
                 return_log_dists=True,
-                return_top1=(args.show_text and _show_this(ci, len(chunks))),
-                return_diagnostics=(args.show_text and _show_this(ci, len(chunks))))
+                return_top1=_want_diags(ci, len(chunks)),
+                return_diagnostics=_want_diags(ci, len(chunks)))
             base_lps_per_chunk.append(r.log_probs)
             base_dists_per_chunk.append(r.log_dists)
-            if args.show_text and _show_this(ci, len(chunks)) and r.top1s:
+            if _want_diags(ci, len(chunks)) and r.top1s:
                 c = _text_per_chunk.setdefault(ci, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
                 c["actual_ids"]        = [chunk[n_prefill + t + 1] for t in range(len(r.top1s))]
                 c["top1s"]["fp16"]     = r.top1s
@@ -753,7 +1044,13 @@ def main():
             k_group_size, v_group_size = get_kv_group_sizes(k_names, v_names, args.quant_group_size)
             kv_hook = make_kv_hook(lib, k_names, v_names, args.n_pos_per_embd,
                                    use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
-                                   default_group_size=args.quant_group_size)
+                                   default_group_size=args.quant_group_size,
+                                   n_sink=args.sink_tokens,
+                                   n_recent=args.recent_tokens,
+                                   k_sink_names=k_sink_names,
+                                   v_sink_names=v_sink_names,
+                                   k_recent_names=k_recent_names,
+                                   v_recent_names=v_recent_names)
 
             all_lps = []
             all_kls = []
@@ -765,11 +1062,11 @@ def main():
                     k_group_size=k_group_size,
                     v_group_size=v_group_size,
                     base_log_dists=base_dists_per_chunk[ci],
-                    return_top1=(args.show_text and _show_this(ci, len(chunks))),
-                    return_diagnostics=(args.show_text and _show_this(ci, len(chunks))))
+                    return_top1=_want_diags(ci, len(chunks)),
+                    return_diagnostics=_want_diags(ci, len(chunks)))
                 all_lps.append(r.log_probs)
                 all_kls.extend(r.kl_divs)
-                if args.show_text and _show_this(ci, len(chunks)) and r.top1s:
+                if _want_diags(ci, len(chunks)) and r.top1s:
                     c = _text_per_chunk.setdefault(ci, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
                     c["top1s"][quant_name]     = r.top1s
                     c["log_probs"][quant_name] = r.log_probs
@@ -864,8 +1161,8 @@ def main():
             show_chunk_text(chunk[:args.n_prompt], chunk[args.n_prompt:])
         r = _run_one_flat(chunk, None, args.quant_group_size, args.quant_group_size,
                           base_dists=None, ret_dists=True,
-                          ret_top1=(args.show_text and _show_this(ci, len(chunks))),
-                          ret_diags=(args.show_text and _show_this(ci, len(chunks))))
+                          ret_top1=_want_diags(ci, len(chunks)),
+                          ret_diags=_want_diags(ci, len(chunks)))
         base_lps_per_chunk.append(r.log_probs)
         base_dists_per_chunk.append(r.log_dists)
         if args.show_text and _show_this(ci, len(chunks)) and r.top1s:
@@ -896,18 +1193,24 @@ def main():
         k_group_size, v_group_size = get_kv_group_sizes(k_names, v_names, args.quant_group_size)
         kv_hook = make_kv_hook(lib, k_names, v_names, args.n_pos_per_embd,
                                use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
-                               default_group_size=args.quant_group_size)
+                               default_group_size=args.quant_group_size,
+                               n_sink=args.sink_tokens,
+                               n_recent=args.recent_tokens,
+                               k_sink_names=k_sink_names,
+                               v_sink_names=v_sink_names,
+                               k_recent_names=k_recent_names,
+                               v_recent_names=v_recent_names)
 
         all_lp = []
         all_kl = []
         for ci, chunk in enumerate(chunks):
             r = _run_one_flat(chunk, kv_hook, k_group_size, v_group_size,
                               base_dists=base_dists_per_chunk[ci], ret_dists=False,
-                              ret_top1=(args.show_text and _show_this(ci, len(chunks))),
-                              ret_diags=(args.show_text and _show_this(ci, len(chunks))))
+                              ret_top1=_want_diags(ci, len(chunks)),
+                              ret_diags=_want_diags(ci, len(chunks)))
             all_lp.extend(r.log_probs)
             all_kl.extend(r.kl_divs)
-            if args.show_text and _show_this(ci, len(chunks)) and r.top1s:
+            if _want_diags(ci, len(chunks)) and r.top1s:
                 c = _text_per_chunk.setdefault(ci, {"actual_ids": [], "top1s": {}, "log_probs": {}, "diags": {}})
                 c["top1s"][quant_name]     = r.top1s
                 c["log_probs"][quant_name] = r.log_probs
@@ -925,6 +1228,20 @@ def main():
 
     if args.show_text:
         show_predictions()
+    if args.save_per_example and _per_example_results:
+        with open(args.save_per_example, "w") as f:
+            json.dump(_per_example_results, f, indent=2)
+        print(f"Per-example results saved to {args.save_per_example}")
+    if args.save_diags and _text_per_chunk:
+        out = {}
+        for idx, cdata in _text_per_chunk.items():
+            out[str(idx)] = {
+                "log_probs": cdata["log_probs"],
+                "diags":     cdata["diags"],
+            }
+        with open(args.save_diags, "w") as f:
+            json.dump(out, f)
+        print(f"Diagnostics saved to {args.save_diags}")
     print(f"\nDone. Results in {args.out}")
 
     lib.llama_free(ctx)

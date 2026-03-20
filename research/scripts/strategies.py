@@ -235,9 +235,10 @@ def run_chunk_batch_prefill(lib, ctx, tokens, n_vocab, kv_hook=None, n_prompt=0,
     if ret != 0:
         raise RuntimeError(f"prefill decode failed: {ret}")
 
-    # Quantize all prompt KV cells in one shot (n_new_k/v=None → all cells)
+    # Quantize all prompt KV cells in one shot (n_new_k/v=None → all cells).
+    # Pass n_prompt so sink-aware wrappers can protect the first N tokens.
     if kv_hook:
-        kv_hook(ctx, n_new_k=None, n_new_v=None)
+        kv_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=n_prompt)
 
     # 2. Continuation: token-by-token decode, collect log-probs
     log_probs      = []
@@ -307,20 +308,41 @@ def run_structured(lib, ctx, prompt_tokens, completion_tokens, n_vocab, kv_hook=
                                    return_diagnostics=return_diagnostics)
 
 
+def _rep_rate(token_ids, window=20, ngram=3):
+    """Fraction of n-grams in the last `window` tokens that are duplicates.
+
+    Returns 0.0 when there is not enough history.  A value > 0.5 is a strong
+    signal the model has entered a repetition loop.
+    """
+    if len(token_ids) < ngram + 1:
+        return 0.0
+    recent = token_ids[-window:]
+    grams  = [tuple(recent[i:i + ngram]) for i in range(len(recent) - ngram + 1)]
+    if not grams:
+        return 0.0
+    return 1.0 - len(set(grams)) / len(grams)
+
+
 def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                  max_new_tokens=512, eos_token_id=None,
                  stop_strings=None,
-                 k_group_size=128, v_group_size=128):
+                 k_group_size=128, v_group_size=128,
+                 return_diagnostics=False):
     """Greedy autoregressive generation after batch-prefilling the prompt.
 
     Applies the same KV hook as the PPL pass so the quantization conditions
-    match exactly.  Returns a list of generated token ids (prompt not included).
+    match exactly.  Returns (generated, diags) where generated is a list of
+    token ids and diags is a dict{"H", "p_max", "self_surp", "rep_rate"} of
+    per-step lists (or None when return_diagnostics=False).
     Stops at max_new_tokens, when eos_token_id is produced, or when any
     string in stop_strings appears in the decoded suffix of the output.
     """
     n_prompt = len(prompt_tokens)
     mem = lib.llama_get_memory(ctx)
     lib.llama_memory_clear(mem, True)
+
+    diag_lists = ({"H": [], "p_max": [], "self_surp": [], "rep_rate": []}
+                  if return_diagnostics else None)
 
     # Batch prefill — request logits only for the last prompt token
     batch = lib.llama_batch_init(n_prompt, 0, 1)
@@ -338,19 +360,29 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
         raise RuntimeError(f"prefill failed: {ret}")
 
     if kv_hook:
-        kv_hook(ctx, n_new_k=None, n_new_v=None)
+        kv_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=len(prompt_tokens))
 
     # First generated token comes from the last prompt token's logits (index n_prompt-1).
     # Subsequent tokens come from single-token decode batches where index 0 is correct.
     ptr    = lib.llama_get_logits_ith(ctx, n_prompt - 1)
     logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-    token  = int(np.argmax(logits))
+    log_q  = llama.log_softmax(logits.astype(np.float32))
+    token  = int(np.argmax(log_q))
     generated   = [token]
+    prev_top1   = token
     n_pending_k = 0
     n_pending_v = 0
     pos = n_prompt
     # For stop-string detection: keep a small rolling decode buffer
     _stop_check_len = max((len(s) for s in stop_strings), default=0) * 3 + 32 if stop_strings else 0
+
+    if diag_lists is not None:
+        p     = np.exp(log_q)
+        H     = -float(np.sum(p * log_q))
+        diag_lists["H"].append(H)
+        diag_lists["p_max"].append(float(p[token]))
+        diag_lists["self_surp"].append(float("nan"))   # no previous step
+        diag_lists["rep_rate"].append(0.0)
 
     for _ in range(max_new_tokens - 1):
         if eos_token_id is not None and token == eos_token_id:
@@ -378,8 +410,19 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
 
         ptr    = lib.llama_get_logits_ith(ctx, 0)
         logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-        token  = int(np.argmax(logits))
+        log_q  = llama.log_softmax(logits.astype(np.float32))
+        token  = int(np.argmax(log_q))
         generated.append(token)
+
+        if diag_lists is not None:
+            p     = np.exp(log_q)
+            H     = -float(np.sum(p * log_q))
+            ss    = float(log_q[prev_top1])
+            diag_lists["H"].append(H)
+            diag_lists["p_max"].append(float(p[token]))
+            diag_lists["self_surp"].append(ss)
+            diag_lists["rep_rate"].append(_rep_rate(generated))
+        prev_top1 = token
 
         if stop_strings and len(generated) >= 4:
             tail = generated[-_stop_check_len:] if _stop_check_len else generated
@@ -390,4 +433,4 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     if kv_hook:
         _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v)
 
-    return generated
+    return generated, diag_lists

@@ -48,9 +48,11 @@ K:V split with layer ranges: `int8_ch@0-15/int4_ch@16-31:int4_tok`
 
 ## parse_state.py
 CPU-side KV quantization via state blob (slow for large contexts).
-- `apply_kv_hook(lib, ctx, CP, k_fn, v_fn, seq_id, n_pos_per_embd, n_new_k, n_new_v)`
-  - `n_new_k`: quantize last N K cells (None = all)
-  - `n_new_v`: quantize last N V cells (None = all) — can differ from n_new_k
+- `apply_kv_hook(lib, ctx, CP, k_fn, v_fn, seq_id, n_pos_per_embd, n_new_k, n_new_v, start_k=None, start_v=None)`
+  - `n_new_k`: quantize N K cells (None = all)
+  - `n_new_v`: quantize N V cells (None = all) — can differ from n_new_k
+  - `start_k`: if set, quantize cells `[start_k : start_k + n_new_k]` (absolute offset for recent-window stale zone)
+  - `start_v`: same for V; default None = last N cells
 
 ## strategies.py
 Returns `RunResult(log_probs, log_dists, kl_divs, top1s, diags)` namedtuple (last four default to None).
@@ -86,8 +88,13 @@ python3 research/scripts/run_sweep.py model.gguf corpus.txt \
     --quants fp16 int8_ch int4_ch:int4_tok int3_ch int3_ch:int3_tok \
     --quant-k int8_ch@0-15/int4_ch@16-31 \  # optional: per-layer K spec (merged into --quants)
     --quant-v int4_tok               \  # optional: per-layer V spec (merged into --quants)
-    --quant-group-size 128   \  # K group size (V per-token uses 1 automatically)
+    --quant-group-size 128   \  # group size for both K and V (fairness fix: same for all types)
+    --sink-tokens 32         \  # optional: protect first 32 tokens from quantization
+    --recent-tokens 128      \  # optional: KIVI-style recent window (last 128 stay in recent zone)
+    --quant-sink int8_ch     \  # optional: use int8_ch in sink zone instead of fp16
+    --quant-recent int8_ch   \  # optional: use int8_ch in recent zone instead of fp16
     --show-text              \  # print prompt+completion + post-run token prediction table
+    --save-diags diags.json  \  # save per-token H/lp/p_max/self_surp for plot_entropy.py
     --out results.json
 
 # Structured mode (prompt/completion JSONL):
@@ -160,6 +167,26 @@ python3 research/scripts/run_sweep.py model.gguf data/gsm8k_test.jsonl \
 - Results JSON includes `accuracy`, `n_correct`, `n_total` fields
 - n_ctx auto-widened to cover `max(prompt) + max_gen_tokens`
 - Default regex `####\s*([\d,]+)` matches GSM8K format `#### 42`
+- **Display note**: `--show-text` prints only first 300 chars of generation, but regex runs on full text.
+  If the match is beyond 300 chars, display shows `'head...' ... 'context_around_match'` — pred is still correct.
+
+## plot_entropy.py
+Reads the JSON from `--save-diags` and plots per-token diagnostics vs decode position.
+```bash
+# Entropy per quant (smoothed):
+python3 research/scripts/plot_entropy.py diags.json \
+    --quants fp16 int3_ch int2_ch --metric H --smooth 50 --out entropy.png
+
+# Delta (quant − fp16) to see where divergence concentrates:
+python3 research/scripts/plot_entropy.py diags.json \
+    --metric H --diff --smooth 30 --out entropy_diff.png
+
+# Multiple panels:
+python3 research/scripts/plot_entropy.py diags.json \
+    --metrics H lp ppl_curve --smooth 50 --out multi.png
+```
+Metrics: `H` (entropy, nats), `lp` (log-prob correct token), `p_max` (top-1 prob), `self_surp`, `kl` (vs fp16), `ppl_curve` (cumulative PPL).
+`--diff`: plots quant−fp16. `--annotate`: marks top-10 highest-divergence positions. `--chunk N` or `--chunk all` (averages).
 
 ### Incremental JSON saving + log file
 `save_results()` is called after each quant finishes — partial results are readable mid-sweep.

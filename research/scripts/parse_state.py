@@ -294,7 +294,8 @@ def pack_kv_state(state: KVState, n_pos_per_embd: int = 1) -> bytearray:
 
 
 def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
-                  n_pos_per_embd: int = 1, n_new_k=None, n_new_v=None):
+                  n_pos_per_embd: int = 1, n_new_k=None, n_new_v=None,
+                  start_k=None, start_v=None):
     """
     Get KV state for seq_id, apply k_fn/v_fn to each layer's K/V arrays,
     write modified state back.
@@ -303,10 +304,15 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
     v_fn: callable, list[callable] (one per layer), or None (skip V entirely).
 
     n_new_k: None  = quantize all K cells (initial prefill).
-             int   = quantize last N K cells for all layers.
-             list  = per-layer: list[int] where 0 means skip that layer,
-                     positive int means quantize last N cells for that layer.
+             int   = quantize N K cells (position determined by start_k, see below).
+             list  = per-layer: list[int] where 0 means skip that layer.
     n_new_v: same semantics as n_new_k, applied to V.
+
+    start_k: None  = quantize the LAST n_new_k cells (default, "just-added" tokens).
+             int   = quantize cells [start_k : start_k + n_new_k] (absolute offset).
+             Used for recent-window mode where tokens that fell out of the window
+             are at a specific position, not the tail.
+    start_v: same as start_k, applied to V.
 
     Returns: KVState (with modified arrays)
     """
@@ -326,33 +332,36 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
     if callable(v_fn):
         v_fn = [v_fn] * state.n_layer
 
+    def _apply_fn(arr, fn, n_new, start):
+        if fn is None or n_new == 0:
+            return arr
+        if n_new is None:                          # quantize all (prefill)
+            return fn(arr)
+        if start is not None:                      # absolute offset (recent-window mode)
+            end = start + n_new
+            return np.concatenate([arr[:start], fn(arr[start:end]), arr[end:]], axis=0)
+        if n_new < state.cell_count:               # last-N mode (default)
+            s = state.cell_count - n_new
+            return np.concatenate([arr[:s], fn(arr[s:])], axis=0)
+        return fn(arr)                             # n_new >= cell_count: quantize all
+
     if k_fn is not None:
-        new_k = []
-        for il, arr in enumerate(state.k):
-            fn    = k_fn[il] if il < len(k_fn) else None
-            n_new = n_new_k[il] if isinstance(n_new_k, list) else n_new_k
-            if fn is None or n_new == 0:
-                new_k.append(arr)
-            elif n_new is not None and n_new < state.cell_count:
-                start = state.cell_count - n_new
-                new_k.append(np.concatenate([arr[:start], fn(arr[start:])], axis=0))
-            else:
-                new_k.append(fn(arr))
-        state.k = new_k
+        state.k = [
+            _apply_fn(arr,
+                      k_fn[il] if il < len(k_fn) else None,
+                      n_new_k[il] if isinstance(n_new_k, list) else n_new_k,
+                      start_k[il] if isinstance(start_k, list) else start_k)
+            for il, arr in enumerate(state.k)
+        ]
 
     if v_fn is not None:
-        new_v = []
-        for il, arr in enumerate(state.v):
-            fn    = v_fn[il] if il < len(v_fn) else None
-            n_new = n_new_v[il] if isinstance(n_new_v, list) else n_new_v
-            if fn is None or n_new == 0:
-                new_v.append(arr)
-            elif n_new is not None and n_new < state.cell_count:
-                start = state.cell_count - n_new
-                new_v.append(np.concatenate([arr[:start], fn(arr[start:])], axis=0))
-            else:
-                new_v.append(fn(arr))
-        state.v = new_v
+        state.v = [
+            _apply_fn(arr,
+                      v_fn[il] if il < len(v_fn) else None,
+                      n_new_v[il] if isinstance(n_new_v, list) else n_new_v,
+                      start_v[il] if isinstance(start_v, list) else start_v)
+            for il, arr in enumerate(state.v)
+        ]
 
     modified_blob = pack_kv_state(state, n_pos_per_embd)
 

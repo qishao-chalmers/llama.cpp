@@ -14,20 +14,20 @@ KV cache shape: [n_tokens, head_dim] (e.g. [n_tokens, 128] for Qwen3-8B)
 **K cache**: 64/1024 dims are outliers across all 36 layers → per-channel critical for K.
 **V cache**: more uniform per-dim → per-token works well for V.
 
-## Group Size Semantics
+## Group Size Semantics (Fairness Fix)
 
 `group_size` = number of decode tokens to accumulate before calling the quantization hook.
 
+Both per-channel and per-token quants now use `--quant-group-size` (default 128) for fair comparison.
+Previously per-token forced group_size=1 (unfair: int4_tok saw a fresh hook every token while int4_ch saw only 1 call per 128 tokens).
+
 - **Per-channel (axis=0)**: needs group_size >= 128 for meaningful scale estimation.
-  With group_size=1: each column has 1 value → scale = |val|/7 → exact (not real compression).
-- **Per-token (axis=1)**: each row is independent → group_size=1 is correct.
-  group_size=1 means quantize immediately after each token — correct for autoregressive:
-  token N+1 is generated using quantized KV of token N, as a real system would do.
+  With group_size=1: each column has 1 value → scale = |val|/7 → not real compression.
+- **Per-token (axis=1)**: each row is independent. group_size=128 means 128 new tokens are accumulated, then all 128 get quantized together — same cadence as per-channel.
 
 **Mixed K:V** (e.g. `int4_ch:int4_tok`):
-- k_group_size = 128 (per-channel K needs group context)
-- v_group_size = 1  (per-token V quantized immediately each token)
-- Hook fires every 1 token (due to V); K is only quantized when k_pending >= 128
+- Both K and V now use `default_group_size` (e.g. 128)
+- Hook fires every 128 tokens; K and V each quantize 128 cells at that point
 
 ## Always-On Quantization (current default)
 
@@ -65,22 +65,31 @@ prefill → quantize prompt KV once → decode WITHOUT quantizing new tokens
 Shows impact of prompt KV compression alone, vs full always-on.
 Flag: `--prefill-batch --quantize-prompt-only`
 
-## Why Per-Token V Needs group_size=1
+## Three-Zone Quantization (KIVI-style)
 
-In autoregressive decoding, quantizing token N's KV immediately (group_size=1) means
-token N+1 is generated using quantized token N's KV — exactly what a real system does.
+Divides the KV cache into three zones with different quant aggressiveness:
+```
+[0, n_sink)          → sink zone   : fp16 or --quant-sink   (attention sinks)
+[n_sink, T-n_recent) → stale zone  : main quant (--quants)  (heaviest compression)
+[T-n_recent, T)      → recent zone : fp16 or --quant-recent (freshest tokens)
+```
+Flags: `--sink-tokens N`, `--recent-tokens R`, `--quant-sink`, `--quant-recent`.
 
-With group_size=128, tokens 1-127 are generated using UNQUANTIZED KV of each other,
-then all 127 get quantized at once. This underestimates the error because 127 tokens
-see better-than-real-system precision. Results would be optimistic.
+The `_apply_window` wrapper in run_sweep.py implements this. During decode:
+- Stale zone = tokens that just fell out of the recent window; quantized with `start_k` absolute offset.
+- Recent zone tokens are quantized immediately with recent_hook (can be re-quantized to stale later).
+- When `group_size > n_recent`, some new tokens bypass the recent zone directly to stale.
 
-group_size=1 is slow on CPU (2048 PCIe round-trips) but correct.
-GPU-side quantization solves this — see context/gpu_quantization.md.
+**Motivation**: "Lost in the middle" problem — aggressive middle compression may hurt RAG retrieval.
+Protecting sinks (attention drain) and recent tokens (working memory) at higher precision recovers quality.
 
 ## Performance Notes
 
 | Quant type | group_size | Hook calls (2048 decode) | Approx time |
 |---|---|---|---|
 | int4_ch | 128 | 16 | ~85s |
-| int4_ch:int4_tok | K=128, V=1 | 2048 | ~3800s (CPU) / ~2s (GPU) |
-| int4_tok | 1 | 2048 | ~3800s (CPU) / ~2s (GPU) |
+| int4_tok (fairness fix) | 128 | 16 | ~85s |
+| int4_ch:int4_tok | 128 | 16 | ~85s |
+| int4_tok (group_size=1, old behavior) | 1 | 2048 | ~3800s (CPU) / ~2s (GPU) |
+
+With the fairness fix all per-channel and per-token quants use the same hook cadence — old per-token timing numbers are no longer relevant for the default configuration.
