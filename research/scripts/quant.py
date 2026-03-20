@@ -24,6 +24,14 @@ Supported formats:
   int2_tok — uniform per-token   (axis=1)
   nf4      — NormalFloat-4 lookup table
 
+Arbitrary bin-count variants (fill gap between any two power-of-2 levels):
+  q5 / q5_ch / q5_tok  — exactly 5 bins (between int2's 4 and int3's 8)
+  q6 / q6_ch / q6_tok  — exactly 6 bins
+  q7 / q7_ch / q7_tok  — exactly 7 bins
+  Any q{N} / q{N}_ch / q{N}_tok for any N >= 2 works dynamically.
+  Levels placed at linspace(-1, 1, N) * per-channel/token scale.
+  Use --quants q4_ch q5_ch q6_ch q7_ch q8_ch to sweep bin counts.
+
 Group-within-token variants (dim_group_size=G splits head_dim into groups):
   int4_tok_g16 / int4_tok_g32 / int4_tok_g64
   int3_tok_g16 / int3_tok_g32 / int3_tok_g64
@@ -150,6 +158,43 @@ def _uniform_quant(arr: np.ndarray, bits: int, axis=None, dim_group_size=None) -
     return (q * scale).astype(np.float16)
 
 
+def _nbin_quant(arr: np.ndarray, n_bins: int, axis=None) -> np.ndarray:
+    """Symmetric quantization with exactly n_bins evenly-spaced levels.
+
+    Levels are placed at linspace(-1, 1, n_bins) * scale, where scale is
+    the per-tensor / per-channel / per-token abs-max.
+
+    Examples:
+      n_bins=4 : levels at {-1, -0.333, 0.333, 1}   (≈ int2 quality)
+      n_bins=5 : levels at {-1, -0.5, 0, 0.5, 1}
+      n_bins=6 : levels at {-1, -0.6, -0.2, 0.2, 0.6, 1}
+      n_bins=7 : levels at {-1, -0.667, -0.333, 0, 0.333, 0.667, 1}
+      n_bins=8 : levels at {-1, -0.714, ..., 1}      (≈ int3 quality)
+    """
+    levels = np.linspace(-1.0, 1.0, n_bins, dtype=np.float32)
+    f32 = arr.astype(np.float32)
+
+    if axis is None:
+        amax = np.abs(f32).max()
+        if amax == 0:
+            return arr.astype(np.float16)
+        norm = f32 / amax
+    elif axis == 0:
+        amax = np.abs(f32).max(axis=0, keepdims=True)
+        amax = np.where(amax == 0, 1.0, amax)
+        norm = f32 / amax
+    else:  # axis == 1
+        amax = np.abs(f32).max(axis=1, keepdims=True)
+        amax = np.where(amax == 0, 1.0, amax)
+        norm = f32 / amax
+
+    norm = norm.clip(-1.0, 1.0)
+    # Find nearest level for each element: shape [..., n_bins]
+    idx = np.abs(norm[..., np.newaxis] - levels).argmin(axis=-1)
+    q_norm = levels[idx]
+    return (q_norm * amax).astype(np.float16)
+
+
 def quant_int8(arr: np.ndarray) -> np.ndarray:
     """INT8 per-tensor symmetric quantization."""
     return _uniform_quant(arr, bits=8, axis=None)
@@ -241,7 +286,8 @@ def quant_int3_tok(arr: np.ndarray) -> np.ndarray:
 import re as _re
 
 _GROUPED_PAT = _re.compile(r'^int(\d+)_(ch|tok)_g(\d+)$')
-_VALID_BITS   = {2, 3, 4, 8}
+_NBIN_PAT    = _re.compile(r'^q(\d+)(?:_(ch|tok))?$')
+_VALID_BITS  = {2, 3, 4, 8}
 
 
 def _parse_grouped_name(name):
@@ -257,6 +303,20 @@ def _parse_grouped_name(name):
     return bits, axis, gsize
 
 
+def _parse_nbin_name(name):
+    """Parse 'q5' → (n_bins=5, axis=None), 'q6_ch' → (6, 0), 'q7_tok' → (7, 1).
+    Returns None if no match or n_bins < 2."""
+    m = _NBIN_PAT.match(name)
+    if not m:
+        return None
+    n_bins = int(m.group(1))
+    if n_bins < 2:
+        return None
+    granularity = m.group(2)   # 'ch', 'tok', or None
+    axis = {"ch": 0, "tok": 1, None: None}[granularity]
+    return n_bins, axis
+
+
 def _make_grouped_fn(bits, axis, gsize):
     """Return a quantization function for the given (bits, axis, gsize)."""
     def fn(arr):
@@ -265,14 +325,17 @@ def _make_grouped_fn(bits, axis, gsize):
 
 
 class _PerTokenSet:
-    """Set-like: contains int{N}_tok and int{N}_tok_g{G} for any valid N, G."""
+    """Set-like: contains int{N}_tok, int{N}_tok_g{G}, and q{N}_tok for any valid N, G."""
     _explicit = {"int8_tok", "int4_tok", "int3_tok", "int2_tok"}
 
     def __contains__(self, name):
         if name in self._explicit:
             return True
         parsed = _parse_grouped_name(name)
-        return parsed is not None and parsed[1] == 1  # axis=1 → per-token
+        if parsed is not None and parsed[1] == 1:
+            return True
+        parsed2 = _parse_nbin_name(name)
+        return parsed2 is not None and parsed2[1] == 1  # axis=1 → per-token
 
 
 class _ChGroupSizeMap:
@@ -369,12 +432,20 @@ QUANT_FNS = {
 
 
 def _is_valid_quant(name: str) -> bool:
-    return name in QUANT_FNS or _parse_grouped_name(name) is not None
+    return (name in QUANT_FNS
+            or _parse_grouped_name(name) is not None
+            or _parse_nbin_name(name) is not None)
 
 
 def get_quant_fn(name: str):
     """Return the quantization function for the given name.
-    Supports all named variants plus any int{N}_{ch,tok}_g{G} dynamically.
+
+    Supports:
+    - All named variants in QUANT_FNS (fp16, int2_ch, int4_tok, nf4, ...)
+    - Any int{N}_{ch,tok}_g{G} for N in {2,3,4,8} and any G >= 1
+    - Any q{N} / q{N}_ch / q{N}_tok for N >= 2
+      (e.g. q5_ch, q6_tok, q7 — arbitrary bin counts between int2 and int3,
+       or between int3 and int4, etc.)
     """
     if name in QUANT_FNS:
         return QUANT_FNS[name]
@@ -382,10 +453,17 @@ def get_quant_fn(name: str):
     if parsed:
         bits, axis, gsize = parsed
         return _make_grouped_fn(bits, axis, gsize)
+    parsed2 = _parse_nbin_name(name)
+    if parsed2:
+        n_bins, axis = parsed2
+        def fn(arr, nb=n_bins, ax=axis):
+            return _nbin_quant(arr, n_bins=nb, axis=ax)
+        return fn
     raise ValueError(
         f"Unknown quantization: '{name}'. "
         f"Named variants: {list(QUANT_FNS)}. "
-        f"Dynamic pattern: int{{2,3,4,8}}_{{ch,tok}}_g{{N}} for any N >= 1."
+        f"Dynamic grouped: int{{2,3,4,8}}_{{ch,tok}}_g{{N}}. "
+        f"Arbitrary bins: q{{N}} / q{{N}}_ch / q{{N}}_tok for any N >= 2."
     )
 
 
