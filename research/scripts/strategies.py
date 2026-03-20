@@ -128,7 +128,7 @@ def _collect_logits(lib, ctx, n_vocab, next_token,
 
 
 def run_chunk_token_by_token(lib, ctx, tokens, n_vocab, kv_hook=None, n_prompt=0,
-                             k_group_size=128, v_group_size=128,
+                             k_group_size=64, v_group_size=64,
                              base_log_dists=None, return_log_dists=False,
                              return_top1=False, return_diagnostics=False):
     """
@@ -194,7 +194,7 @@ def run_chunk_token_by_token(lib, ctx, tokens, n_vocab, kv_hook=None, n_prompt=0
 
 def run_chunk_batch_prefill(lib, ctx, tokens, n_vocab, kv_hook=None, n_prompt=0,
                             _quantize_prompt_only=False,
-                            k_group_size=128, v_group_size=128,
+                            k_group_size=64, v_group_size=64,
                             base_log_dists=None, return_log_dists=False,
                             return_top1=False, return_diagnostics=False):
     """
@@ -286,7 +286,7 @@ def run_chunk_batch_prefill(lib, ctx, tokens, n_vocab, kv_hook=None, n_prompt=0,
 
 
 def run_structured(lib, ctx, prompt_tokens, completion_tokens, n_vocab, kv_hook=None,
-                   quantize_prompt_only=False, k_group_size=128, v_group_size=128,
+                   quantize_prompt_only=False, k_group_size=64, v_group_size=64,
                    base_log_dists=None, return_log_dists=False,
                    return_top1=False, return_diagnostics=False):
     """
@@ -326,7 +326,7 @@ def _rep_rate(token_ids, window=20, ngram=3):
 def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                  max_new_tokens=512, eos_token_id=None,
                  stop_strings=None,
-                 k_group_size=128, v_group_size=128,
+                 k_group_size=64, v_group_size=64,
                  return_diagnostics=False):
     """Greedy autoregressive generation after batch-prefilling the prompt.
 

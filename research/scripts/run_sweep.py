@@ -121,7 +121,7 @@ def _apply_window(main_hook, n_sink, n_recent,
 
 def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                  use_gpu=False, n_layer=0, ctx_ptr=None,
-                 default_group_size=128, n_sink=0, n_recent=0,
+                 default_group_size=64, n_sink=0, n_recent=0,
                  k_sink_names=None, v_sink_names=None,
                  k_recent_names=None, v_recent_names=None):
     """Create a KV hook for the given K/V quant name lists.
@@ -293,7 +293,7 @@ def main():
                              "Structured mode always uses batch-prefill.")
     parser.add_argument("--quantize-prompt-only", action="store_true",
                         help="Strategy D: quantize prompt KV only, decode stays FP16.")
-    parser.add_argument("--quant-group-size",   type=int, default=128,
+    parser.add_argument("--quant-group-size",   type=int, default=64,
                         help="Tokens per quantization group during decode (default 128). "
                              "Scales are shared across the group, matching real KV quant systems. "
                              "Larger = more compression error but fewer scales stored.")
