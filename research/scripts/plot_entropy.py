@@ -11,6 +11,9 @@ Usage:
         --chunk 0 \
         --out entropy_plot.png
 
+    # Correlation analysis: do self-contained signals predict KL degradation?
+    python3 plot_entropy.py diags.json --corr --out corr_plot.png
+
 Metrics:
     H         : output entropy in nats (high = confused)
     lp        : log-prob of the correct token (low = wrong)
@@ -24,6 +27,10 @@ Options:
     --smooth N  : rolling-window half-width for smoothing (default: 0 = no smoothing)
     --annotate  : mark positions where int3_ch (or first non-fp16 quant) diverges most
     --diff      : plot quant - fp16 instead of raw values (useful for H and lp)
+    --corr      : correlation mode — scatter signal vs KL, print Pearson/Spearman,
+                  sweep alarm thresholds (TPR/FPR where positive = KL > --kl-threshold)
+    --kl-threshold : KL value above which a token counts as "degraded" (default 0.1 nats)
+    --signals   : which signals to correlate against KL (default: H p_max self_surp)
 """
 
 import argparse
@@ -32,6 +39,7 @@ import math
 import sys
 
 import numpy as np
+from scipy import stats as scipy_stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -99,6 +107,169 @@ METRIC_LABELS = {
 COLORS = ["#1f77b4", "#d62728", "#ff7f0e", "#2ca02c", "#9467bd",
           "#8c564b", "#e377c2", "#7f7f7f"]
 
+# Direction for each signal: which end is "alarm"
+SIGNAL_ALARM_DIR = {
+    "H":         "high",   # alarm when H > threshold
+    "p_max":     "low",    # alarm when p_max < threshold
+    "self_surp": "low",    # alarm when self_surp < threshold
+}
+
+
+def _collect_all_tokens(data, quant, fp16_key="fp16"):
+    """Gather all per-token (signal_dict, lp_quant, lp_fp16) across all chunks."""
+    rows = []
+    for chunk_key in sorted(data.keys(), key=int):
+        cdata = data[chunk_key]
+        diags    = cdata["diags"].get(quant, {})
+        lps_q    = cdata["log_probs"].get(quant, [])
+        lps_fp16 = cdata["log_probs"].get(fp16_key, [])
+        n = min(len(lps_q), len(lps_fp16),
+                len(diags.get("H", [])))
+        for t in range(n):
+            rows.append({
+                "H":         diags["H"][t]         if "H"         in diags else float("nan"),
+                "p_max":     diags["p_max"][t]     if "p_max"     in diags else float("nan"),
+                "self_surp": diags["self_surp"][t] if "self_surp" in diags else float("nan"),
+                "lp_q":      lps_q[t],
+                "lp_fp16":   lps_fp16[t],
+            })
+    return rows
+
+
+def _alarm_tpr_fpr(signal_vals, kl_vals, threshold, direction, kl_thr):
+    """At a single threshold, compute TPR and FPR.
+
+    Positive class = KL > kl_thr (token is significantly degraded).
+    Alarm fires    = signal crosses threshold in the alarm direction.
+    TPR = P(alarm | degraded),  FPR = P(alarm | not degraded).
+    """
+    sig = np.array(signal_vals)
+    kl  = np.array(kl_vals)
+    pos = kl > kl_thr          # ground truth: degraded token
+    neg = ~pos
+
+    if direction == "high":
+        alarm = sig > threshold
+    else:
+        alarm = sig < threshold
+
+    tp = np.sum(alarm & pos)
+    fp = np.sum(alarm & neg)
+    tpr = tp / pos.sum() if pos.sum() > 0 else float("nan")
+    fpr = fp / neg.sum() if neg.sum() > 0 else float("nan")
+    return float(tpr), float(fpr)
+
+
+def plot_corr(data, quants, signals, kl_thr, out_path, n_sweep=25):
+    """Correlation mode: scatter + Pearson/Spearman + threshold sweep."""
+    non_fp16 = [q for q in quants if q != "fp16"]
+    if not non_fp16:
+        print("No non-fp16 quants to analyze.", file=sys.stderr)
+        return
+
+    n_signals = len(signals)
+    n_quants  = len(non_fp16)
+    # Layout: top rows = scatter plots (signal vs KL), bottom = threshold sweep per signal
+    fig, axes = plt.subplots(
+        2, max(n_signals, n_quants),
+        figsize=(5 * max(n_signals, n_quants), 9),
+        squeeze=False)
+
+    print(f"\nCorrelation analysis  (KL threshold = {kl_thr} nats)")
+    print(f"{'quant':<18}  {'signal':<12}  {'Pearson r':>10}  {'Spearman r':>10}  "
+          f"{'n_degraded':>10}  {'n_total':>8}")
+    print("  " + "-" * 72)
+
+    # ── per-quant, per-signal scatter ─────────────────────────────────────────
+    all_data = {}   # all_data[quant][signal] = (sig_vals, kl_vals)
+    for qi, quant in enumerate(non_fp16):
+        rows = _collect_all_tokens(data, quant)
+        if not rows:
+            continue
+        kl_vals = [max(0.0, r["lp_fp16"] - r["lp_q"]) for r in rows]
+        all_data[quant] = {}
+        for si, signal in enumerate(signals):
+            sig_vals_raw = [r[signal] for r in rows]
+            # Drop NaN (self_surp step 0)
+            mask = [not math.isnan(v) for v in sig_vals_raw]
+            sig_vals = [v for v, m in zip(sig_vals_raw, mask) if m]
+            kl_clean = [v for v, m in zip(kl_vals, mask) if m]
+            all_data[quant][signal] = (sig_vals, kl_clean)
+
+            # Scatter (subsample for speed)
+            ax = axes[0][si]
+            step = max(1, len(sig_vals) // 3000)
+            xs = sig_vals[::step]
+            ys = kl_clean[::step]
+            ax.scatter(xs, ys, s=2, alpha=0.3,
+                       color=COLORS[qi % len(COLORS)], label=quant)
+
+            # Correlations
+            if len(sig_vals) >= 10:
+                pr, _ = scipy_stats.pearsonr(sig_vals, kl_clean)
+                sr, _ = scipy_stats.spearmanr(sig_vals, kl_clean)
+            else:
+                pr = sr = float("nan")
+            n_deg = sum(1 for v in kl_clean if v > kl_thr)
+            print(f"  {quant:<18}  {signal:<12}  {pr:>10.4f}  {sr:>10.4f}  "
+                  f"{n_deg:>10}  {len(kl_clean):>8}")
+
+        ax_s = axes[0][si]  # label last signal's scatter axes below
+
+    for si, signal in enumerate(signals):
+        ax = axes[0][si]
+        ax.axhline(kl_thr, color="black", linestyle="--", linewidth=0.8,
+                   label=f"KL={kl_thr} (degraded)")
+        ax.set_xlabel(signal)
+        ax.set_ylabel("KL divergence from fp16 (nats)")
+        ax.set_title(f"{signal} vs KL")
+        ax.legend(fontsize=7, markerscale=4)
+        ax.grid(True, alpha=0.2)
+
+    # ── threshold sweep: TPR/FPR curves (one subplot per signal) ─────────────
+    print(f"\nThreshold sweep (KL threshold = {kl_thr})")
+    for si, signal in enumerate(signals):
+        ax = axes[1][si]
+        direction = SIGNAL_ALARM_DIR[signal]
+        for qi, quant in enumerate(non_fp16):
+            if quant not in all_data or signal not in all_data[quant]:
+                continue
+            sig_vals, kl_clean = all_data[quant][signal]
+            if not sig_vals:
+                continue
+            lo, hi = np.percentile(sig_vals, 2), np.percentile(sig_vals, 98)
+            thresholds = np.linspace(lo, hi, n_sweep)
+            tprs, fprs = [], []
+            for thr in thresholds:
+                tpr, fpr = _alarm_tpr_fpr(sig_vals, kl_clean, thr, direction, kl_thr)
+                tprs.append(tpr)
+                fprs.append(fpr)
+            # ROC curve
+            ax.plot(fprs, tprs, color=COLORS[qi % len(COLORS)],
+                    linewidth=1.8, label=quant)
+            # Mark default threshold
+            mid = n_sweep // 2
+            ax.scatter([fprs[mid]], [tprs[mid]], color=COLORS[qi % len(COLORS)],
+                       s=40, zorder=5)
+
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.4)
+        ax.set_xlabel("FPR (false alarm rate on clean tokens)")
+        ax.set_ylabel("TPR (detection rate on degraded tokens)")
+        ax.set_title(f"ROC — {signal} as alarm signal")
+        ax.legend(fontsize=7)
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.2)
+
+    # Hide unused axes
+    for col in range(n_signals, axes.shape[1]):
+        axes[0][col].set_visible(False)
+        axes[1][col].set_visible(False)
+
+    fig.suptitle(f"Signal–KL correlation  |  KL threshold={kl_thr} nats", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\nSaved to {out_path}")
+
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -125,6 +296,14 @@ def main():
                     help="Output image file (default: entropy_plot.png)")
     ap.add_argument("--title",    default=None,
                     help="Plot title override")
+    ap.add_argument("--corr",     action="store_true",
+                    help="Correlation mode: scatter signal vs KL, Pearson/Spearman, "
+                         "ROC curves for alarm thresholds. Requires fp16 in data.")
+    ap.add_argument("--kl-threshold", type=float, default=0.1,
+                    help="KL value above which a token counts as degraded (default 0.1 nats)")
+    ap.add_argument("--signals",  nargs="+", default=["H", "p_max", "self_surp"],
+                    choices=["H", "p_max", "self_surp"],
+                    help="Signals to correlate against KL in --corr mode (default: all three)")
     args = ap.parse_args()
 
     with open(args.diags_json) as f:
@@ -140,6 +319,14 @@ def main():
     quants = args.quants if args.quants else all_quants
     # Ensure fp16 is present if needed for kl
     fp16_available = "fp16" in all_quants
+
+    if args.corr:
+        if not fp16_available:
+            print("ERROR: --corr requires fp16 in the data (used as KL reference).",
+                  file=sys.stderr)
+            sys.exit(1)
+        plot_corr(data, quants, args.signals, args.kl_threshold, args.out)
+        return
 
     metrics = args.metrics if args.metrics else [args.metric]
 
