@@ -151,6 +151,12 @@ def setup_lib(lib):
     # Vocab / tokenize
     lib.llama_vocab_n_tokens.restype  = ctypes.c_int32
     lib.llama_vocab_n_tokens.argtypes = [VocabPtr]
+    lib.llama_vocab_eos.restype  = ctypes.c_int32
+    lib.llama_vocab_eos.argtypes = [VocabPtr]
+    lib.llama_vocab_eot.restype  = ctypes.c_int32
+    lib.llama_vocab_eot.argtypes = [VocabPtr]
+    lib.llama_vocab_is_eog.restype  = ctypes.c_bool
+    lib.llama_vocab_is_eog.argtypes = [VocabPtr, ctypes.c_int32]
     lib.llama_tokenize.restype  = ctypes.c_int32
     lib.llama_tokenize.argtypes = [
         VocabPtr, ctypes.c_char_p, ctypes.c_int32,
@@ -290,3 +296,57 @@ def tokenize(lib, vocab, text: str, buf_size: int = 400_000) -> list:
     if n < 0:
         raise RuntimeError(f"tokenize failed, need buffer of {-n}")
     return list(buf[:n])
+
+
+def _probe_special(lib, vocab, text: str) -> bool:
+    """Return True if text tokenizes to exactly one token with parse_special=True."""
+    text_bytes = text.encode("utf-8")
+    buf = (ctypes.c_int32 * 4)()
+    n = lib.llama_tokenize(vocab, text_bytes, len(text_bytes), buf, 4, False, True)
+    return n == 1
+
+
+# Known chat format signatures: (probe_token, prefix, suffix, stop, name)
+_CHAT_FORMATS = [
+    # Qwen / ChatML
+    ("<|im_start|>",
+     "<|im_start|>user\n",
+     "<|im_end|>\n<|im_start|>assistant\n",
+     "<|im_end|>",
+     "qwen/chatml"),
+    # Llama 4 (uses |header_start| / |header_end| without angle brackets)
+    ("<|header_start|>",
+     "<|header_start|>user<|header_end|>\n\n",
+     "<|eot|>\n<|header_start|>assistant<|header_end|>\n\n",
+     "<|eot|>",
+     "llama4"),
+    # Llama 3
+    ("<|start_header_id|>",
+     "<|start_header_id|>user<|end_header_id|>\n\n",
+     "<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\n\n",
+     "<|eot_id|>",
+     "llama3"),
+    # OpenAI GPT-OSS (gpt-oss-*): <|start|> / <|end|> / channel mechanism
+    # Model emits <|channel|>analysis<|message|> (CoT) then <|channel|>final<|message|> (answer).
+    # <|end|> is the inter-channel separator (closes analysis, precedes final) — NOT a stop signal.
+    # <|return|> is the true EOG token, caught by llama_vocab_is_eog automatically.
+    # No explicit stop string needed; pass None so run_sweep does not add one.
+    # No system message injected here — model still generates sensible responses without it.
+    ("<|start|>",
+     "<|start|>user<|message|>",
+     "<|end|>\n<|start|>assistant",
+     None,
+     "gpt-oss"),
+]
+
+
+def detect_chat_format(lib, vocab):
+    """Probe the vocabulary to detect the model's chat format.
+
+    Returns (prefix, suffix, stop_string, format_name) or (None, None, None, "unknown").
+    Only fires when the probe token is a single special token in the vocabulary.
+    """
+    for probe, prefix, suffix, stop, name in _CHAT_FORMATS:
+        if _probe_special(lib, vocab, probe):
+            return prefix, suffix, stop, name
+    return None, None, None, "unknown"

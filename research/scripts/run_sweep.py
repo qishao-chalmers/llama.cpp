@@ -24,12 +24,15 @@ except ImportError:
     HAS_GPU_QUANT = False
 
 
-def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd):
+def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
+                        quant_fn_factory=None):
     """Build a bare CPU hook (no window logic) for a specific quant type.
     Used for sink_hook and recent_hook in _apply_window zone quantization.
     Accepts start_k/start_v for absolute-offset quantization."""
-    k_fns = [quant_mod.get_quant_fn(n) for n in k_names]
-    v_fns = [quant_mod.get_quant_fn(n) for n in v_names]
+    _fn = quant_fn_factory if quant_fn_factory is not None \
+          else (lambda n: quant_mod.get_quant_fn(n, asym=asym))
+    k_fns = [_fn(n) for n in k_names]
+    v_fns = [_fn(n) for n in v_names]
     def _zone_hook(ctx, n_new_k=None, n_new_v=None,
                    start_k=None, start_v=None, **_):
         parse_state.apply_kv_hook(lib, ctx, llama.ContextPtr,
@@ -123,7 +126,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                  use_gpu=False, n_layer=0, ctx_ptr=None,
                  default_group_size=64, n_sink=0, n_recent=0,
                  k_sink_names=None, v_sink_names=None,
-                 k_recent_names=None, v_recent_names=None):
+                 k_recent_names=None, v_recent_names=None,
+                 asym=False, quant_fn_factory=None):
     """Create a KV hook for the given K/V quant name lists.
 
     k_names / v_names: list[str] of length n_layer.
@@ -145,9 +149,13 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
         return None
 
     # Build CPU zone hooks for sink / recent zones (if zone quants requested).
-    sink_hook   = (_make_cpu_zone_hook(lib, k_sink_names,   v_sink_names,   n_pos_per_embd)
+    _fn = quant_fn_factory if quant_fn_factory is not None \
+          else (lambda n: quant_mod.get_quant_fn(n, asym=asym))
+    sink_hook   = (_make_cpu_zone_hook(lib, k_sink_names,   v_sink_names,   n_pos_per_embd,
+                                       quant_fn_factory=_fn)
                    if k_sink_names   is not None else None)
-    recent_hook = (_make_cpu_zone_hook(lib, k_recent_names, v_recent_names, n_pos_per_embd)
+    recent_hook = (_make_cpu_zone_hook(lib, k_recent_names, v_recent_names, n_pos_per_embd,
+                                       quant_fn_factory=_fn)
                    if k_recent_names is not None else None)
 
     def _layer_gs(names):
@@ -170,8 +178,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
             return _apply_window(
                 gpu_quant.make_kv_hook_gpu(lib, ctx_ptr, k_names, v_names, n_layer),
                 n_sink, n_recent, sink_hook=sink_hook, recent_hook=recent_hook)
-        k_fns = [quant_mod.get_quant_fn(n) for n in k_names]
-        v_fns = [quant_mod.get_quant_fn(n) for n in v_names]
+        k_fns = [_fn(n) for n in k_names]
+        v_fns = [_fn(n) for n in v_names]
         def hook_simple(ctx, n_new_k=None, n_new_v=None,
                         start_k=None, start_v=None, _kf=k_fns, _vf=v_fns, **_):
             parse_state.apply_kv_hook(lib, ctx, llama.ContextPtr,
@@ -216,8 +224,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
         return _apply_window(hook_gpu_mixed, n_sink, n_recent,
                              sink_hook=sink_hook, recent_hook=recent_hook)
 
-    k_fns = [quant_mod.get_quant_fn(n) for n in k_names]
-    v_fns = [quant_mod.get_quant_fn(n) for n in v_names]
+    k_fns = [_fn(n) for n in k_names]
+    v_fns = [_fn(n) for n in v_names]
     def hook_cpu_mixed(ctx, n_new_k=None, n_new_v=None, **_):
         k_per = _per_layer_new(n_new_k, k_pending, k_layer_gs)
         v_per = _per_layer_new(n_new_v, v_pending, v_layer_gs)
@@ -255,6 +263,52 @@ def get_kv_group_sizes(k_names, v_names, default_group_size):
         return default_group_size
 
     return _resolve(k_names), _resolve(v_names)
+
+
+# Task-specific stop strings keyed by corpus filename keywords.
+# These are safety-net stops for pathological outputs (fake follow-on problems,
+# role leakage, verbosity past the answer). Appended automatically; never override
+# user-specified stops.
+_TASK_STOP_RULES = [
+    # AIME / math competitions: stop at fake follow-on problem.
+    # \n\n--- intentionally omitted: gpt-oss uses --- as markdown HR in solutions,
+    # and 0-shot AIME has no --- separator in the prompt to teach fake continuation.
+    (["aime"],                      ["\n\nQuestion:"]),
+    # GSM8K: stop at fake follow-on question
+    (["gsm8k"],                     ["\n\nQuestion:"]),
+    # NIAH: answer is a single compound word — stop at first newline
+    (["niah"],                      ["\n"]),
+    # HumanEval / code: stop at next top-level function or __main__ guard
+    (["humaneval", "human_eval"],   ["\n\ndef ", "\n\nif __name__"]),
+]
+
+
+def _failure_summary(gl: dict, n_total: int) -> str:
+    """Build a compact failure-mode string from gen_len_stats for the summary print line.
+
+    Shows non-zero failure counts only. For exact-match tasks:
+      correct=7  wrong=3  trunc=2  no_match=1
+    For f1/code tasks (counters are 0): shows trunc count only if any.
+    """
+    parts = []
+    if gl.get("n_correct") or gl.get("n_wrong") or gl.get("n_trunc_fail") or gl.get("n_no_match"):
+        parts.append(f"correct={gl['n_correct']}")
+        if gl["n_wrong"]:      parts.append(f"wrong={gl['n_wrong']}")
+        if gl["n_trunc_fail"]: parts.append(f"trunc={gl['n_trunc_fail']}")
+        if gl["n_no_match"]:   parts.append(f"no_match={gl['n_no_match']}")
+        if gl.get("n_inconclusive"): parts.append(f"inconclusive={gl['n_inconclusive']}")
+    elif gl.get("n_truncated"):
+        parts.append(f"trunc={gl['n_truncated']}/{n_total}")
+    return ("  " + "  ".join(parts)) if parts else ""
+
+
+def _infer_task_stops(filename: str) -> list:
+    """Return task-specific stop strings inferred from the corpus filename."""
+    name = filename.lower()
+    for keywords, stops in _TASK_STOP_RULES:
+        if any(kw in name for kw in keywords):
+            return stops
+    return []
 
 
 def main():
@@ -317,37 +371,82 @@ def main():
                              "Has no effect when --recent-tokens is 0.")
     parser.add_argument("--show-text",      action="store_true",
                         help="Print detokenized prompt/completion and fp16 top-1 predictions.")
+    parser.add_argument("--show-gen",       action="store_true",
+                        help="Print the full generated text for each accuracy example (raw, not repr). "
+                             "Useful for inspecting CoT reasoning without the prompt noise.")
+    parser.add_argument("--show-prompt",    action="store_true",
+                        help="Print the detokenized prompt for each accuracy example (raw). "
+                             "Combine with --show-gen to see prompt + generation together.")
     parser.add_argument("--save-diags", default=None, metavar="FILE",
-                        help="Save per-token diagnostics (H, p_max, self_surp, lp) to JSON "
-                             "for later plotting. Enables diagnostic collection without --show-text.")
+                        help="Save per-token diagnostics (H, p_max, self_surp, lp) to JSON. "
+                             "Default: <out>_diags.json (auto-derived from --out).")
     parser.add_argument("--save-per-example", default=None, metavar="FILE",
-                        help="Save per-example accuracy scores and gen lengths to JSON "
-                             "(keyed by quant name). Used with --eval-accuracy for NIAH analysis.")
+                        help="Save per-example accuracy scores and gen lengths to JSON. "
+                             "Default: <out>_per_example.json (auto-derived from --out).")
     parser.add_argument("--show-text-chunk", type=int, default=None,
                         help="Which chunk/example index to show token predictions for. "
                              "Default: show all. Pass a non-negative int to show only that index.")
     parser.add_argument("--eval-accuracy",  action="store_true",
                         help="Structured mode: run greedy generation and compare extracted "
                              "answer against gold. Reports accuracy alongside PPL/KL.")
+    parser.add_argument("--save-bins",      default=None, metavar="FILE",
+                        help="Save per-bin hit counts to FILE (JSON). "
+                             "Default: <out>_bins.json (auto-derived from --out). "
+                             "Use plot_bins.py to visualize.")
+    parser.add_argument("--asym",           action="store_true",
+                        help="Use asymmetric (affine) quantization: stores min+scale per group "
+                             "instead of just scale. Gives 2^bits levels instead of 2^(bits-1). "
+                             "For int2: 4 bins {min,…,max} vs 3 bins {-s,0,+s}. "
+                             "Has no effect on fp16/bf16/fp8/nf4.")
     parser.add_argument("--skip-ppl",       action="store_true",
                         help="Skip teacher-forced PPL and KL computation. Only runs "
-                             "--eval-accuracy generation. Useful when PPL is meaningless "
-                             "(NIAH: passphrase is verbatim in context so ppl≈1.0) or to save "
-                             "time on large example sets. Requires --eval-accuracy.")
+                             "--eval-accuracy generation. Auto-enabled when --corpus-mode "
+                             "structured + --eval-accuracy are both set (use --no-skip-ppl "
+                             "to override). Requires --eval-accuracy.")
+    parser.add_argument("--no-skip-ppl",    action="store_true",
+                        help="Force PPL computation even in structured+eval-accuracy mode "
+                             "(overrides the auto-enable of --skip-ppl).")
     parser.add_argument("--max-gen-tokens", type=int, default=512,
                         help="Max new tokens to generate per example for --eval-accuracy (default 512).")
-    parser.add_argument("--answer-regex",   default=r"(?:####|[Tt]he answer is)\s*\$?\s*([\d,]+)",
-                        help="Regex with one capture group to extract the answer from generated "
-                             "text (default matches both GSM8K '#### 42' and 'The answer is 42' formats). "
-                             "Ignored when --eval-metric f1.")
-    parser.add_argument("--eval-metric",   default="exact", choices=["exact", "f1"],
+    parser.add_argument("--answer-regex",
+                        default=r"(?:####|[Tt]he answer is)\s*\$?\s*\*{0,2}\s*([\d,]+)\s*\*{0,2}|\\boxed\{([\d,]+)\}",
+                        help="Regex with capture group(s) to extract the answer from generated "
+                             "text. Matches '#### 42', 'The answer is 42', 'The answer is **42**', "
+                             "and '\\boxed{42}' formats. Ignored when --eval-metric f1.")
+    parser.add_argument("--eval-metric",   default="exact", choices=["exact", "f1", "code"],
                         help="How to compare generated answer to gold. "
                              "'exact': regex extraction + string match (default, good for GSM8K). "
                              "'f1': token-overlap F1 against all gold answers in jsonl 'answers' field "
-                             "(better for LongBench QA where multiple valid answers exist).")
+                             "(better for LongBench QA where multiple valid answers exist). "
+                             "'code': save full generated text as pred, score=0 placeholder; "
+                             "run eval_code.py afterwards for pass@1 (HumanEval).")
     parser.add_argument("--stop-strings",  nargs="*", default=["\n\nQuestion:", "\nassistant", "\n\n\n"],
                         help="Stop generation when any of these strings appear in the output. "
                              "Default includes '\\nassistant' to prevent chat role token leakage.")
+    parser.add_argument("--no-task-stops", action="store_true", default=False,
+                        help="Disable auto-inferred task-specific stop strings (useful for debugging).")
+    parser.add_argument("--prompt-prefix", default=None,
+                        help="String prepended to every example prompt before tokenization. "
+                             "If omitted, auto-detected from the model vocabulary when --eval-accuracy "
+                             "is set. Pass an empty string ('') to suppress auto-detection.")
+    parser.add_argument("--prompt-suffix", default=None,
+                        help="String appended to every example prompt before tokenization. "
+                             "If omitted, auto-detected from the model vocabulary when --eval-accuracy "
+                             "is set. Pass an empty string ('') to suppress auto-detection.")
+    parser.add_argument("--effort", default=None, choices=["low", "medium", "high"],
+                        help="GPT-OSS reasoning effort injected into the system message "
+                             "(low/medium/high). Only applies when auto-detecting gpt-oss format "
+                             "(i.e. --prompt-prefix not set explicitly). Ignored for other models.")
+    parser.add_argument("--adaptive-sim",   action="store_true",
+                        help="Simulate adaptive quantization: run draft quant (--quants entry) and "
+                             "--verifier-quant in parallel, compare window-by-window. "
+                             "Records acceptance_rate, first_fail_window, draft_fraction per example. "
+                             "Requires --eval-accuracy --skip-ppl --corpus-mode structured.")
+    parser.add_argument("--verifier-quant", default="int4_ch",
+                        help="Verifier quant for --adaptive-sim (default: int4_ch). "
+                             "Draft quant is each entry in --quants (excluding fp16 and the verifier).")
+    parser.add_argument("--adaptive-window", type=int, default=32,
+                        help="Window size (tokens) for --adaptive-sim comparison (default: 32).")
     parser.add_argument("--out",            default="results.json")
     parser.add_argument("--quants",    nargs="+",
                         default=["fp16","bf16","fp8_e4m3","fp8_e5m2","int8","int8_ch","int4","int4_ch","nf4","int2"])
@@ -369,8 +468,25 @@ def main():
         if extra not in args.quants:
             args.quants = list(args.quants) + [extra]
 
+    # ── Auto-derive sibling output paths from --out ───────────────────────────
+    def _sibling(suffix):
+        base = args.out[:-5] if args.out.endswith(".json") else args.out
+        return base + suffix
+
+    if args.save_bins        is None: args.save_bins        = _sibling("_bins.json")
+    if args.save_per_example is None: args.save_per_example = _sibling("_per_example.json")
+    if args.save_diags       is None: args.save_diags       = _sibling("_diags.json")
+
+    # ── Structured corpus implies skip-ppl by default ────────────────────────
+    # Teacher-forced PPL is meaningless for QA/reasoning tasks (GSM8K, NIAH,
+    # LongBench): the model copies reference answers token-by-token regardless
+    # of whether it can actually generate them. Auto-enable --skip-ppl unless
+    # the user explicitly passed --no-skip-ppl to override.
+    if args.corpus_mode == "structured" and args.eval_accuracy and not args.no_skip_ppl:
+        args.skip_ppl = True
+
     # ── Tee stdout+stderr to a .log file alongside the .json output ──────────
-    log_path = (args.out[:-5] if args.out.endswith(".json") else args.out) + ".log"
+    log_path = _sibling(".log")
     _log_file = open(log_path, "w", encoding="utf-8", buffering=1)
 
     class _Tee:
@@ -403,6 +519,69 @@ def main():
     vocab = lib.llama_model_get_vocab(model)
     n_vocab = lib.llama_vocab_n_tokens(vocab)
     n_layer = lib.llama_model_n_layer(model)
+
+    # End-of-generation check — stops generation when the model emits any token
+    # that the model author marked as EOG (EOS, EOT, or model-specific variants).
+    # These tokens typically detokenize to empty string, so stop-string matching
+    # would never catch them. llama_vocab_is_eog covers all cases in one call.
+    def _is_eog(token_id: int) -> bool:
+        return bool(lib.llama_vocab_is_eog(vocab, token_id))
+
+    # Auto-detect chat format and apply to --prompt-prefix / --prompt-suffix
+    # when neither was set explicitly (both are None) and --eval-accuracy is active.
+    # Passing --prompt-prefix "" explicitly suppresses auto-detection.
+    _fmt_name = "unknown"   # captured for post-processing below
+    if args.eval_accuracy and args.prompt_prefix is None and args.prompt_suffix is None:
+        auto_prefix, auto_suffix, auto_stop, fmt_name = llama.detect_chat_format(lib, vocab)
+        _fmt_name = fmt_name
+        if auto_prefix is not None:
+            args.prompt_prefix = auto_prefix
+            args.prompt_suffix = auto_suffix
+            if auto_stop and auto_stop not in args.stop_strings:
+                args.stop_strings = list(args.stop_strings) + [auto_stop]
+            # gpt-oss: replace bare user prefix with full system message when --effort is set.
+            if fmt_name == "gpt-oss" and args.effort is not None:
+                args.prompt_prefix = (
+                    f"<|start|>system<|message|>Reasoning: {args.effort}\n\n"
+                    f"# Valid channels: analysis, commentary, final. "
+                    f"Channel must be included for every message.<|end|>\n"
+                    f"<|start|>user<|message|>"
+                )
+            elif args.effort is not None:
+                print(f"[auto] --effort ignored: only applies to gpt-oss (detected: {fmt_name})", flush=True)
+            print(f"[auto] detected chat format: {fmt_name}", flush=True)
+            if args.effort is not None and fmt_name == "gpt-oss":
+                print(f"[auto] gpt-oss reasoning effort: {args.effort}", flush=True)
+            print(f"[auto] prompt-prefix: {repr(args.prompt_prefix)}", flush=True)
+            print(f"[auto] prompt-suffix: {repr(args.prompt_suffix)}", flush=True)
+            print(f"[auto] stop-string added: {repr(auto_stop)}", flush=True)
+        else:
+            print("[auto] chat format: unknown — prompt-prefix/suffix left empty", flush=True)
+
+    # Normalize: ensure prefix/suffix are strings (not None) for all downstream code.
+    if args.prompt_prefix is None:
+        args.prompt_prefix = ""
+    if args.prompt_suffix is None:
+        args.prompt_suffix = ""
+
+    # Auto-append task-specific stop strings inferred from the corpus filename.
+    # Always appended (never removes user-specified stops); only when --eval-accuracy.
+    if args.eval_accuracy and not args.no_task_stops:
+        _task_stops = _infer_task_stops(os.path.basename(args.corpus_file))
+        _added = [s for s in _task_stops if s not in args.stop_strings]
+        if _added:
+            args.stop_strings = list(args.stop_strings) + _added
+            print(f"[auto] task stops added: {[repr(s) for s in _added]}", flush=True)
+
+    # Qwen3 thinking models: \n stop fires inside <think> before the answer is emitted.
+    # When auto-detected as qwen/chatml AND <think> is a special token AND \n is a stop,
+    # append an empty think block to the suffix so the model skips thinking entirely.
+    # Only applies to auto-detected format; explicit --prompt-suffix overrides this.
+    if (_fmt_name == "qwen/chatml"
+            and "\n" in args.stop_strings
+            and llama._probe_special(lib, vocab, "<think>")):
+        args.prompt_suffix = args.prompt_suffix.rstrip("\n") + "<think>\n\n</think>\n"
+        print("[auto] qwen3 thinking suppressed: empty think block injected into suffix", flush=True)
 
     # Resolve zone quant names once (same n_layer for all sweep entries).
     k_sink_names, v_sink_names = (
@@ -585,6 +764,191 @@ def main():
         re.IGNORECASE
     )
 
+    # Fallback: last standalone number (possibly with commas/dollar sign).
+    # Used when the structured answer regex finds no match.
+    _LAST_NUM_RE = re.compile(r'[\$]?\s*\*{0,2}([\d,]+)\*{0,2}')
+
+    def run_adaptive_sim(examples, draft_hook, verifier_hook,
+                         draft_k_gs, draft_v_gs, ver_k_gs, ver_v_gs):
+        """Simulate the adaptive KV quantization scheme window-by-window.
+
+        Scheme (per example):
+          Phase 1 — fp16 generates all tokens autoregressively, saving the KV
+            state (and last token as a re-prime key) at every W-token boundary.
+          Phase 2 — for each window w:
+            a. Restore the fp16 KV state at window start (simulates KV overwrite).
+            b. Re-prime: feed the last token before the window to recover logits
+               for the first token of the window (fp16 KV, no hook).
+            c. Check: does int4 (draft_hook) also predict fp16_tokens[w_start]?
+            d. Feed fp16_tokens[w_start .. w_end-2] with draft_hook (verify_window),
+               check each greedy matches the next fp16 token.
+            e. Window accepted iff ALL predictions match.
+
+        The state restore in (a) simulates the KV overwrite after each fp16 prefill
+        verification: int4 always starts from fp16-corrected KV, never from drifting
+        int4 KV.  Real acceptance rates are therefore higher than the old post-hoc
+        comparison (which let both runs drift independently).
+
+        Returns a list of per-example dicts with keys:
+          n_tokens_fp16, n_windows, n_accepted_windows,
+          first_fail_window, first_fail_pos,
+          acceptance_rate, draft_fraction.
+        """
+        W = args.adaptive_window
+        n_prompt_base = 0   # will be set per example
+        sim_results = []
+
+        for ei, (pt, ct, label) in enumerate(examples):
+            max_ctx_avail = args.n_ctx - len(pt) - 1
+            max_gen = min(args.max_gen_tokens, max_ctx_avail)
+            if max_gen <= 0:
+                sim_results.append(None)
+                continue
+
+            # ── Phase 1: fp16 generation with KV-state checkpoints ───────────
+            mem = lib.llama_get_memory(ctx)
+            lib.llama_memory_clear(mem, True)
+
+            # Batch-prefill prompt[:-1] only; save kv0 BEFORE the last prompt
+            # token so that re-prime can decode at position n_pt-1 (X+1 rule).
+            n_pt = len(pt)
+            if n_pt > 1:
+                batch = lib.llama_batch_init(n_pt - 1, 0, 1)
+                batch.n_tokens = n_pt - 1
+                for i, tok in enumerate(pt[:-1]):
+                    batch.token[i]     = tok
+                    batch.pos[i]       = i
+                    batch.n_seq_id[i]  = 1
+                    batch.seq_id[i][0] = 0
+                    batch.logits[i]    = 0
+                if lib.llama_decode(ctx, batch) != 0:
+                    lib.llama_batch_free(batch)
+                    sim_results.append(None)
+                    continue
+                lib.llama_batch_free(batch)
+
+            # boundary_states[w] = (kv_blob, prime_token, prime_pos)
+            # prime_pos is NOT yet in KV; re-prime decodes it at X+1.
+            # Window 0: KV has 0..n_pt-2; prime decodes pt[-1] at n_pt-1.
+            kv0 = strategies.save_kv_state(lib, ctx)
+            boundary_states = [(kv0, pt[-1], n_pt - 1)]
+
+            # Decode last prompt token to get logits for first generated token.
+            ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+            if ret != 0:
+                sim_results.append(None)
+                continue
+
+            # Generate fp16 tokens, save boundary state every W tokens.
+            ptr    = lib.llama_get_logits_ith(ctx, 0)
+            logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+            token  = int(np.argmax(logits))
+            fp16_tokens = [token]
+            pos = n_pt
+
+            for _ in range(max_gen - 1):
+                if _is_eog(token):
+                    break
+                if args.stop_strings:
+                    tail = fp16_tokens[-128:]
+                    tail_text = llama.detokenize(lib, vocab, tail, remove_special=False)
+                    if any(s in tail_text for s in args.stop_strings):
+                        break
+                # Save boundary state at the start of each new window.
+                # KV has 0..pos-1; token will decode at pos → prime_pos=pos not in KV.
+                if len(fp16_tokens) % W == 0:
+                    kv_blob = strategies.save_kv_state(lib, ctx)
+                    boundary_states.append((kv_blob, token, pos))
+                ret = strategies._single_decode(lib, ctx, token, pos)
+                if ret != 0:
+                    break
+                ptr    = lib.llama_get_logits_ith(ctx, 0)
+                logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+                token  = int(np.argmax(logits))
+                fp16_tokens.append(token)
+                pos   += 1
+
+            N = len(fp16_tokens)
+            if N == 0:
+                sim_results.append(None)
+                continue
+
+            n_full_windows = N // W          # only verify complete windows
+            n_accepted        = 0
+            first_fail_window = None
+            first_fail_pos    = None
+
+            # ── Phase 2: window-by-window int4 verification ──────────────────
+            for w in range(min(n_full_windows, len(boundary_states))):
+                w_start = w * W
+                w_end   = w_start + W          # always a complete window here
+                kv_blob, prime_tok, prime_pos = boundary_states[w]
+
+                # (a) Restore fp16 KV state → simulates KV overwrite after verify
+                strategies.restore_kv_state(lib, ctx, kv_blob)
+
+                # (b) Re-prime with fp16 (no hook): feed prime_tok to get logits
+                #     for fp16_tokens[w_start].
+                ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
+                if ret != 0:
+                    break
+                ptr         = lib.llama_get_logits_ith(ctx, 0)
+                prime_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+                int4_pred0  = int(np.argmax(prime_logits))
+
+                # (c) Check first-token prediction (fp16 KV, no draft hook yet)
+                if int4_pred0 != fp16_tokens[w_start]:
+                    if first_fail_window is None:
+                        first_fail_window = w
+                        first_fail_pos    = w_start
+                    continue
+
+                # (d) Feed fp16_tokens[w_start .. w_end-2] with draft hook.
+                #     verify_window returns greedy[i] = prediction for position
+                #     n_pt+w_start+i+1, which should equal fp16_tokens[w_start+i+1].
+                window_slice = fp16_tokens[w_start:w_end - 1]   # W-1 tokens
+                greedy = strategies.verify_window(
+                    lib, ctx, n_vocab,
+                    window_slice,
+                    pos_start=n_pt + w_start,
+                    kv_hook=draft_hook,
+                    k_group_size=draft_k_gs,
+                    v_group_size=draft_v_gs)
+
+                window_ok = all(greedy[i] == fp16_tokens[w_start + i + 1]
+                                for i in range(len(greedy)))
+
+                if window_ok:
+                    n_accepted += 1
+                elif first_fail_window is None:
+                    first_fail_window = w
+                    for i, g in enumerate(greedy):
+                        if g != fp16_tokens[w_start + i + 1]:
+                            first_fail_pos = w_start + i + 1
+                            break
+
+            acceptance_rate = n_accepted / max(n_full_windows, 1)
+            draft_fraction  = n_accepted * W / max(N, 1)
+
+            entry = {
+                "label":               label,
+                "n_tokens_fp16":       N,
+                "n_windows":           n_full_windows,
+                "n_accepted_windows":  n_accepted,
+                "first_fail_window":   first_fail_window,
+                "first_fail_pos":      first_fail_pos,
+                "acceptance_rate":     acceptance_rate,
+                "draft_fraction":      draft_fraction,
+            }
+            sim_results.append(entry)
+            status = ("all_ok" if first_fail_window is None
+                      else f"fail@w{first_fail_window}/tok{first_fail_pos}")
+            print(f"  adaptive ex {ei+1}/{len(examples)}: {label} | "
+                  f"acc={acceptance_rate:.2f}  draft_frac={draft_fraction:.2f}  "
+                  f"n_tok={N}  {status}",
+                  flush=True)
+        return sim_results
+
     def eval_accuracy_pass(examples, gold_answers, kv_hook, k_group_size, v_group_size):
         """Run greedy generation on each example, score against gold, return (score_sum, n_total, per_ex, gen_len_stats).
 
@@ -593,18 +957,30 @@ def main():
         per_ex: list of (gold_display, pred_display, score) tuples.
         gen_len_stats: dict with mean_gen_tokens / mean_gen_tokens_correct / mean_gen_tokens_wrong.
         """
-        use_f1 = (args.eval_metric == "f1")
-        ans_re  = re.compile(args.answer_regex) if not use_f1 else None
+        use_f1   = (args.eval_metric == "f1")
+        use_code = (args.eval_metric == "code")
+        ans_re   = re.compile(args.answer_regex) if not use_f1 and not use_code else None
         score_sum  = 0.0
         n_total    = 0
         per_ex     = []
         gen_lens_correct = []
         gen_lens_wrong   = []
         n_truncated      = 0
+        n_correct        = 0   # score == 1.0
+        n_wrong          = 0   # pred found but incorrect (not a length issue)
+        n_trunc_fail     = 0   # truncated AND no answer extracted (length caused failure)
+        n_no_match       = 0   # finished cleanly but regex found nothing
         for ei, (pt, ct, label) in enumerate(examples):
             gold = gold_answers[ei] if gold_answers else None
             max_ctx_avail = args.n_ctx - len(pt) - 1
             max_gen = min(args.max_gen_tokens, max_ctx_avail)
+            if args.show_text and _show_this(ei, len(examples)):
+                show_chunk_text(pt, ct, label=label)
+            if args.show_prompt and _show_this(ei, len(examples)):
+                prompt_text = llama.detokenize(lib, vocab, pt)
+                print(f"\n--- prompt [{label}] ({len(pt)} tokens) ---", flush=True)
+                print(prompt_text, flush=True)
+                print("---", flush=True)
             if max_gen <= 0:
                 per_ex.append((gold, None, 0.0))
                 continue
@@ -612,15 +988,41 @@ def main():
                 lib, ctx, vocab, pt, n_vocab,
                 kv_hook=kv_hook,
                 max_new_tokens=max_gen,
+                is_eog=_is_eog,
                 stop_strings=args.stop_strings or None,
                 k_group_size=k_group_size,
                 v_group_size=v_group_size,
                 return_diagnostics=bool(args.save_per_example))
-            gen_text  = llama.detokenize(lib, vocab, gen_ids, remove_special=False).strip()
+            gen_text_raw = llama.detokenize(lib, vocab, gen_ids, remove_special=False)
+            if use_code:
+                # Preserve leading indentation — code bodies need their 4-space indent.
+                # Only strip trailing whitespace and any trailing stop-string remnant.
+                gen_text = gen_text_raw.rstrip()
+            else:
+                gen_text  = gen_text_raw.strip()
+                # Strip reasoning blocks: <think> (Qwen3/DeepSeek-R1),
+                # analysis channel (GPT-OSS)
+                gen_text  = re.sub(r'<think>.*?</think>\s*', '', gen_text, flags=re.DOTALL)
+                gen_text  = re.sub(r'<think>.*',             '', gen_text, flags=re.DOTALL).strip()
+                gen_text  = re.sub(r'<\|channel\|>analysis<\|message\|>.*?<\|end\|>\s*',
+                                   '', gen_text, flags=re.DOTALL)
+                # Extract final channel content if present
+                m_final   = re.search(r'<\|channel\|>final<\|message\|>(.*)',
+                                      gen_text, flags=re.DOTALL)
+                if m_final:
+                    gen_text = m_final.group(1).strip()
             gen_len   = len(gen_ids)
             truncated = (gen_len >= max_gen)
 
-            if use_f1:
+            if use_code:
+                # Save full generated text; scoring deferred to eval_code.py.
+                score     = 0.0          # placeholder — real score from pass@1 execution
+                pred_disp = gen_text     # full code, no truncation
+                gold_disp = ""
+                mark      = "(exec later)"
+                n_total  += 1
+                inconclusive = False
+            elif use_f1:
                 gold_list   = gold if isinstance(gold, list) else ([gold] if gold else [])
                 score       = _f1_score(gen_text, gold_list) if gold_list else 0.0
                 pred_disp   = gen_text[:80].replace("\n", "↵")
@@ -628,13 +1030,18 @@ def main():
                 mark        = f"{score:.2f}"
                 n_total    += 1
                 score_sum  += score
+                inconclusive = False
             else:
                 # Use last match: reasoning models often self-correct mid-generation.
                 # The final answer after "Wait, let me recalculate" is more faithful.
                 all_matches  = list(ans_re.finditer(gen_text))
                 all_hedge_ms = list(_HEDGE_RE.finditer(gen_text))
                 m            = all_matches[-1] if all_matches else None
-                pred         = m.group(1).replace(",", "") if m else None
+                raw          = (m.group(1) or m.group(2)) if m else None
+                if raw is None:
+                    fb = list(_LAST_NUM_RE.finditer(gen_text))
+                    raw = fb[-1].group(1) if fb else None
+                pred         = raw.replace(",", "") if raw else None
 
                 # Inconclusive: truncated while still doubting (last hedge after last answer).
                 # The model expressed uncertainty and never reached a new conclusion.
@@ -659,9 +1066,19 @@ def main():
                     score_sum  += score
 
             n_hedges     = len(_HEDGE_RE.findall(gen_text))
-            inconclusive = inconclusive if not use_f1 else False
+            inconclusive = inconclusive if not use_f1 and not use_code else False
             if truncated:
                 n_truncated += 1
+            # Failure-mode breakdown (exact-match only; f1/code use their own metrics)
+            if not use_f1 and not use_code and gold is not None:
+                if score == 1.0:
+                    n_correct += 1
+                elif pred is not None and not inconclusive:
+                    n_wrong += 1          # model gave a definite wrong answer
+                elif truncated and pred is None:
+                    n_trunc_fail += 1     # hit token/ctx limit before answer appeared
+                elif pred is None and not truncated:
+                    n_no_match += 1       # finished cleanly, regex found nothing
             (gen_lens_correct if score == 1.0 else gen_lens_wrong).append(gen_len)
             ex_entry = {"label": label, "score": score,
                         "gold": gold_disp, "pred": pred_disp,
@@ -675,6 +1092,11 @@ def main():
                   f"gold={gold_disp}  pred={pred_disp}  {mark}  gen_len={gen_len}{hedge_str}", flush=True)
             if args.show_text and _show_this(ei, len(examples)):
                 print(f"    gen: {gen_text!r}", flush=True)
+            if args.show_gen and _show_this(ei, len(examples)):
+                print(f"\n--- gen [{label}] gold={gold_disp} pred={pred_disp} {mark} ---",
+                      flush=True)
+                print(gen_text_raw.strip(), flush=True)
+                print("---", flush=True)
         mean_score = score_sum / n_total if n_total > 0 else 0.0
         all_lens = gen_lens_correct + gen_lens_wrong
         def _mean(lst): return sum(lst) / len(lst) if lst else None
@@ -686,6 +1108,11 @@ def main():
             "n_truncated":             n_truncated,
             "n_inconclusive":          sum(1 for ex in per_ex if ex["inconclusive"]),
             "mean_hedges":             _mean(all_hedges),
+            # Failure-mode breakdown (exact-match tasks only; 0 for f1/code)
+            "n_correct":               n_correct,
+            "n_wrong":                 n_wrong,
+            "n_trunc_fail":            n_trunc_fail,
+            "n_no_match":              n_no_match,
         }
         return mean_score, n_total, per_ex, gen_len_stats
 
@@ -720,8 +1147,24 @@ def main():
         raw_answers_list = []   # parallel list: rec["answers"] or [] per example
         skipped = 0
         for rec in records:
-            pt = llama.tokenize(lib, vocab, rec["prompt"])
-            ct = llama.tokenize(lib, vocab, rec["completion"])
+            # Native format: {"prompt": "...", "completion": "..."}
+            # LongBench format: {"context": "...", "input": "...", "answers": [...]}
+            if "prompt" in rec:
+                prompt_text = rec["prompt"]
+            elif "context" in rec and "input" in rec:
+                prompt_text = rec["context"] + "\n\n" + rec["input"]
+            else:
+                prompt_text = rec.get("input", "")
+
+            if "completion" in rec:
+                completion_text = rec["completion"]
+            elif "answers" in rec and rec["answers"]:
+                completion_text = rec["answers"][0] if isinstance(rec["answers"], list) else rec["answers"]
+            else:
+                completion_text = ""
+
+            pt = llama.tokenize(lib, vocab, args.prompt_prefix + prompt_text + args.prompt_suffix)
+            ct = llama.tokenize(lib, vocab, completion_text)
             total = len(pt) + len(ct)
             if total > args.n_ctx:
                 # Truncate prompt to make room for completion
@@ -748,7 +1191,11 @@ def main():
         # Extract gold answers for accuracy evaluation
         gold_answers = []
         if args.eval_accuracy:
-            if args.eval_metric == "f1":
+            if args.eval_metric == "code":
+                # No gold needed — scoring done externally by eval_code.py
+                gold_answers = [None] * len(examples)
+                print(f"  Code mode: {len(examples)} examples; pass@1 scored by eval_code.py", flush=True)
+            elif args.eval_metric == "f1":
                 # Gold = all answers from jsonl 'answers' field; fall back to completion text
                 for (pt, ct, _), raw_ans in zip(examples, raw_answers_list):
                     if raw_ans:
@@ -761,7 +1208,8 @@ def main():
                 for pt, ct, _ in examples:
                     text = llama.detokenize(lib, vocab, ct, remove_special=False)
                     m    = ans_re.search(text)
-                    gold_answers.append(m.group(1).replace(",", "") if m else None)
+                    raw = (m.group(1) or m.group(2)) if m else None
+                    gold_answers.append(raw.replace(",", "") if raw else None)
                 n_gold = sum(a is not None for a in gold_answers)
                 print(f"  Gold answers found: {n_gold}/{len(examples)}", flush=True)
 
@@ -814,8 +1262,12 @@ def main():
                 entry.update(gl)
                 if args.save_per_example:
                     _per_example_results["fp16"] = per_ex_fp16
+                    with open(args.save_per_example, "w") as _f:
+                        json.dump(_per_example_results, _f, indent=2)
                 print(f"  => {metric_label}={mean_score:.4f}  "
-                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})"
+                      + _failure_summary(gl, nt)
+                      + f"  ({elapsed:.1f}s)", flush=True)
                 results["fp16"] = entry
                 save_results(results)
         else:
@@ -841,9 +1293,9 @@ def main():
                     c["top1s"]["fp16"]     = r.top1s
                     c["log_probs"]["fp16"] = r.log_probs
                     c["diags"]["fp16"]     = r.diags
-                ppl_so_far = math.exp(-np.mean([-lp for ex in base_lps_per_ex for lp in ex]))
+                ppl_so_far = math.exp(-np.mean([lp for ex in base_lps_per_ex for lp in ex]))
                 print(f"  ex {ei+1}/{len(examples)}: {label} | ppl={ppl_so_far:.4f}", flush=True)
-            fp16_ppl = math.exp(-np.mean([-lp for ex in base_lps_per_ex for lp in ex]))
+            fp16_ppl = math.exp(-np.mean([lp for ex in base_lps_per_ex for lp in ex]))
             elapsed = time.time() - t0
             print(f"  => PPL={fp16_ppl:.4f}  kl=0.000  ({elapsed:.1f}s)", flush=True)
 
@@ -863,9 +1315,13 @@ def main():
                     if args.save_per_example:
                         _per_example_results["fp16"] = per_ex_fp16
                     print(f"  => PPL={fp16_ppl:.4f}  kl=0.000  {metric_label}={mean_score:.4f}  "
-                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})"
+                      + _failure_summary(gl, nt)
+                      + f"  ({elapsed:.1f}s)", flush=True)
                 results["fp16"] = entry
                 save_results(results)
+
+        _bins_data = {}  # quant_name -> {inner_name: tracker dict}; used by --save-bins
 
         for quant_name in args.quants:
             if quant_name == "fp16":
@@ -875,6 +1331,11 @@ def main():
 
             k_names, v_names = quant_mod.resolve_quant_layers(quant_name, n_layer)
             k_group_size, v_group_size = get_kv_group_sizes(k_names, v_names, args.quant_group_size)
+            _trackers = {}
+            def _factory(n, _t=_trackers, _a=args.asym):
+                if n not in _t:
+                    _t[n] = quant_mod.BinTracker(n, asym=_a)
+                return _t[n]
             kv_hook = make_kv_hook(lib, k_names, v_names, args.n_pos_per_embd,
                                    use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                                    default_group_size=args.quant_group_size,
@@ -883,10 +1344,40 @@ def main():
                                    k_sink_names=k_sink_names,
                                    v_sink_names=v_sink_names,
                                    k_recent_names=k_recent_names,
-                                   v_recent_names=v_recent_names)
+                                   v_recent_names=v_recent_names,
+                                   asym=args.asym,
+                                   quant_fn_factory=_factory if args.save_bins else None)
 
             if args.skip_ppl:
                 # ── Skip PPL pass: accuracy only ──────────────────────────────
+                if args.adaptive_sim and quant_name != args.verifier_quant:
+                    # Build verifier hook once per quant (verifier_quant stays fixed)
+                    ver_k_names, ver_v_names = quant_mod.resolve_quant_layers(
+                        args.verifier_quant, n_layer)
+                    ver_k_gs, ver_v_gs = get_kv_group_sizes(
+                        ver_k_names, ver_v_names, args.quant_group_size)
+                    ver_hook = make_kv_hook(
+                        lib, ver_k_names, ver_v_names, args.n_pos_per_embd,
+                        use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
+                        default_group_size=args.quant_group_size,
+                        n_sink=args.sink_tokens, n_recent=args.recent_tokens,
+                        k_sink_names=k_sink_names, v_sink_names=v_sink_names,
+                        k_recent_names=k_recent_names, v_recent_names=v_recent_names,
+                        asym=args.asym, quant_fn_factory=None)
+                    print(f"  [adaptive-sim] draft={quant_name} verifier={args.verifier_quant} "
+                          f"window={args.adaptive_window}", flush=True)
+                    sim_per_ex = run_adaptive_sim(
+                        examples, kv_hook, ver_hook,
+                        k_group_size, v_group_size, ver_k_gs, ver_v_gs)
+                    valid = [s for s in sim_per_ex if s is not None]
+                    mean_acc_rate   = sum(s["acceptance_rate"] for s in valid) / len(valid) if valid else 0.0
+                    mean_draft_frac = sum(s["draft_fraction"]  for s in valid) / len(valid) if valid else 0.0
+                    n_all_ok = sum(1 for s in valid if s["first_fail_window"] is None)
+                    print(f"  [adaptive-sim] mean_acceptance={mean_acc_rate:.3f}  "
+                          f"mean_draft_frac={mean_draft_frac:.3f}  "
+                          f"all_ok={n_all_ok}/{len(valid)}", flush=True)
+                    if args.save_per_example:
+                        _per_example_results[f"{quant_name}__adaptive_sim"] = sim_per_ex
                 mean_score, nt, per_ex_q, gl = eval_accuracy_pass(
                     examples, gold_answers,
                     kv_hook=kv_hook,
@@ -897,10 +1388,23 @@ def main():
                 entry = {"ppl": None, "mean_kl": None, "n_tokens": None,
                          metric_label: mean_score, "n_total": nt}
                 entry.update(gl)
+                if args.adaptive_sim and quant_name != args.verifier_quant and valid:
+                    entry["adaptive_sim"] = {
+                        "verifier_quant":    args.verifier_quant,
+                        "window_size":       args.adaptive_window,
+                        "mean_acceptance":   mean_acc_rate,
+                        "mean_draft_frac":   mean_draft_frac,
+                        "n_all_ok":          n_all_ok,
+                        "n_examples":        len(valid),
+                    }
                 if args.save_per_example:
                     _per_example_results[quant_name] = per_ex_q
+                    with open(args.save_per_example, "w") as _f:
+                        json.dump(_per_example_results, _f, indent=2)
                 print(f"  => {metric_label}={mean_score:.4f}  "
-                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})"
+                      + _failure_summary(gl, nt)
+                      + f"  ({elapsed:.1f}s)", flush=True)
             else:
                 all_lp = []
                 all_kl = []
@@ -941,13 +1445,34 @@ def main():
                     entry.update(gl)
                     if args.save_per_example:
                         _per_example_results[quant_name] = per_ex_q
+                        with open(args.save_per_example, "w") as _f:
+                            json.dump(_per_example_results, _f, indent=2)
                     print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  {metric_label}={mean_score:.4f}  "
-                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})  ({elapsed:.1f}s)", flush=True)
+                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})"
+                      + _failure_summary(gl, nt)
+                      + f"  ({elapsed:.1f}s)", flush=True)
                 else:
                     print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  ({elapsed:.1f}s)", flush=True)
             results[quant_name] = entry
             save_results(results)
+            if args.save_bins and _trackers:
+                _bins_data[quant_name] = {n: t.to_dict() for n, t in _trackers.items()}
 
+        if args.save_bins and _bins_data:
+            with open(args.save_bins, "w") as _f:
+                json.dump(_bins_data, _f, indent=2)
+            print(f"\nBin counts saved to {args.save_bins}", flush=True)
+        if args.save_per_example and _per_example_results:
+            with open(args.save_per_example, "w") as _f:
+                json.dump(_per_example_results, _f, indent=2)
+            print(f"Per-example results saved to {args.save_per_example}", flush=True)
+        if args.save_diags and _text_per_chunk:
+            out = {}
+            for idx, cdata in _text_per_chunk.items():
+                out[str(idx)] = {"log_probs": cdata["log_probs"], "diags": cdata["diags"]}
+            with open(args.save_diags, "w") as _f:
+                json.dump(out, _f)
+            print(f"Diagnostics saved to {args.save_diags}", flush=True)
         if args.show_text:
             show_predictions()
         lib.llama_free(ctx)
@@ -1034,6 +1559,8 @@ def main():
             results["fp16"] = fp16_entry
             save_results(results)
 
+        _bins_data = {}
+
         for quant_name in args.quants:
             if quant_name == "fp16":
                 continue
@@ -1042,6 +1569,11 @@ def main():
 
             k_names, v_names = quant_mod.resolve_quant_layers(quant_name, n_layer)
             k_group_size, v_group_size = get_kv_group_sizes(k_names, v_names, args.quant_group_size)
+            _trackers = {}
+            def _factory(n, _t=_trackers, _a=args.asym):
+                if n not in _t:
+                    _t[n] = quant_mod.BinTracker(n, asym=_a)
+                return _t[n]
             kv_hook = make_kv_hook(lib, k_names, v_names, args.n_pos_per_embd,
                                    use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                                    default_group_size=args.quant_group_size,
@@ -1050,7 +1582,9 @@ def main():
                                    k_sink_names=k_sink_names,
                                    v_sink_names=v_sink_names,
                                    k_recent_names=k_recent_names,
-                                   v_recent_names=v_recent_names)
+                                   v_recent_names=v_recent_names,
+                                   asym=args.asym,
+                                   quant_fn_factory=_factory if args.save_bins else None)
 
             all_lps = []
             all_kls = []
@@ -1085,7 +1619,24 @@ def main():
             print(f"  => {ppl_str}  kl={entry['mean_kl']:.4f}  ({elapsed:.1f}s)", flush=True)
             results[quant_name] = entry
             save_results(results)
+            if args.save_bins and _trackers:
+                _bins_data[quant_name] = {n: t.to_dict() for n, t in _trackers.items()}
 
+        if args.save_bins and _bins_data:
+            with open(args.save_bins, "w") as _f:
+                json.dump(_bins_data, _f, indent=2)
+            print(f"\nBin counts saved to {args.save_bins}", flush=True)
+        if args.save_per_example and _per_example_results:
+            with open(args.save_per_example, "w") as _f:
+                json.dump(_per_example_results, _f, indent=2)
+            print(f"Per-example results saved to {args.save_per_example}", flush=True)
+        if args.save_diags and _text_per_chunk:
+            out = {}
+            for idx, cdata in _text_per_chunk.items():
+                out[str(idx)] = {"log_probs": cdata["log_probs"], "diags": cdata["diags"]}
+            with open(args.save_diags, "w") as _f:
+                json.dump(out, _f)
+            print(f"Diagnostics saved to {args.save_diags}", flush=True)
         if args.show_text:
             show_predictions()
         print(f"\nDone. Results in {args.out}")
@@ -1183,6 +1734,8 @@ def main():
         results["fp16"] = {"ppl": fp16_ppl, "mean_kl": 0.0, "n_tokens": len(all_base_lps)}
         save_results(results)
 
+    _bins_data = {}
+
     for quant_name in args.quants:
         if quant_name == "fp16":
             continue
@@ -1191,6 +1744,11 @@ def main():
 
         k_names, v_names = quant_mod.resolve_quant_layers(quant_name, n_layer)
         k_group_size, v_group_size = get_kv_group_sizes(k_names, v_names, args.quant_group_size)
+        _trackers = {}
+        def _factory(n, _t=_trackers, _a=args.asym):
+            if n not in _t:
+                _t[n] = quant_mod.BinTracker(n, asym=_a)
+            return _t[n]
         kv_hook = make_kv_hook(lib, k_names, v_names, args.n_pos_per_embd,
                                use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                                default_group_size=args.quant_group_size,
@@ -1199,7 +1757,9 @@ def main():
                                k_sink_names=k_sink_names,
                                v_sink_names=v_sink_names,
                                k_recent_names=k_recent_names,
-                               v_recent_names=v_recent_names)
+                               v_recent_names=v_recent_names,
+                               asym=args.asym,
+                               quant_fn_factory=_factory if args.save_bins else None)
 
         all_lp = []
         all_kl = []
@@ -1225,7 +1785,13 @@ def main():
         print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  ({elapsed:.1f}s)", flush=True)
         results[quant_name] = {"ppl": ppl, "mean_kl": mean_kl, "n_tokens": len(all_lp)}
         save_results(results)
+        if args.save_bins and _trackers:
+            _bins_data[quant_name] = {n: t.to_dict() for n, t in _trackers.items()}
 
+    if args.save_bins and _bins_data:
+        with open(args.save_bins, "w") as _f:
+            json.dump(_bins_data, _f, indent=2)
+        print(f"\nBin counts saved to {args.save_bins}", flush=True)
     if args.show_text:
         show_predictions()
     if args.save_per_example and _per_example_results:

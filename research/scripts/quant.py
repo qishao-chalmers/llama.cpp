@@ -24,6 +24,13 @@ Supported formats:
   int2_tok — uniform per-token   (axis=1)
   nf4      — NormalFloat-4 lookup table
 
+Non-uniform 4-level variant (sits between int3 and int2 in quality):
+  int3_half     — 4 levels, default indices {0,3,5,7} → {0, 3/7, 5/7, 1}, per-tensor
+  int3_half_ch  — per-channel (axis=0)
+  int3_half_tok — per-token   (axis=1)
+  Custom indices: use make_int3_half([0,2,4,7], axis=0) for any combo of 4 from 0–7.
+  Step size = (max-min)/7 (int3's step); default has wide gap at bottom.
+
 Arbitrary bin-count variants (fill gap between any two power-of-2 levels):
   q5 / q5_ch / q5_tok  — exactly 5 bins (between int2's 4 and int3's 8)
   q6 / q6_ch / q6_tok  — exactly 6 bins
@@ -123,6 +130,8 @@ def _uniform_quant(arr: np.ndarray, bits: int, axis=None, dim_group_size=None) -
               e.g. head_dim=128, G=32 → 4 independent scales per token
       axis=0: split n_tokens into groups of G → [n_groups, G, n_embd], one scale per group
     """
+    if arr.size == 0:
+        return arr.astype(np.float16)
     n_levels = (1 << (bits - 1)) - 1   # int8→127, int4→7, int3→3, int4→7, int2→1
     f32 = arr.astype(np.float32)
 
@@ -158,6 +167,60 @@ def _uniform_quant(arr: np.ndarray, bits: int, axis=None, dim_group_size=None) -
     return (q * scale).astype(np.float16)
 
 
+def _uniform_quant_asym(arr: np.ndarray, bits: int = None, axis=None,
+                        dim_group_size=None, n_levels: int = None) -> np.ndarray:
+    """
+    Asymmetric (affine) uniform quantization.  Stores scale + min-offset per group.
+
+    Exactly one of bits or n_levels must be given:
+      bits     → n_levels = 2^bits - 1  (int2→3, int3→7, int4→15, int8→255)
+      n_levels → used directly          (q5_ch asym: n_levels=4 → 5 bins)
+
+    scale = (xmax - xmin) / n_levels
+    q     = round((x - xmin) / scale)  ∈ {0, 1, ..., n_levels}
+    x̂     = q * scale + xmin
+
+    axis=None : per-tensor
+    axis=0    : per-channel (one scale+offset per column / head_dim element)
+    axis=1    : per-token   (one scale+offset per row / token)
+    dim_group_size: same sub-group logic as _uniform_quant.
+    """
+    if arr.size == 0:
+        return arr.astype(np.float16)
+    if n_levels is None:
+        n_levels = (1 << bits) - 1  # int2→3, int3→7, int4→15, int8→255
+    f32 = arr.astype(np.float32)
+
+    if dim_group_size is not None and axis is not None and f32.ndim == 2:
+        n_outer, n_inner = f32.shape
+        if axis == 1:
+            assert n_inner % dim_group_size == 0
+            n_groups = n_inner // dim_group_size
+            f32_g = f32.reshape(n_outer, n_groups, dim_group_size)
+            xmin = f32_g.min(axis=2, keepdims=True)
+            xmax = f32_g.max(axis=2, keepdims=True)
+        else:  # axis == 0
+            assert n_outer % dim_group_size == 0
+            n_groups = n_outer // dim_group_size
+            f32_g = f32.reshape(n_groups, dim_group_size, n_inner)
+            xmin = f32_g.min(axis=1, keepdims=True)
+            xmax = f32_g.max(axis=1, keepdims=True)
+        scale = np.where(xmax == xmin, 1.0, (xmax - xmin) / n_levels)
+        q = np.round((f32_g - xmin) / scale).clip(0, n_levels)
+        return (q * scale + xmin).reshape(arr.shape).astype(np.float16)
+
+    if axis is None:
+        xmin = f32.min()
+        xmax = f32.max()
+    else:
+        xmin = f32.min(axis=axis, keepdims=True)
+        xmax = f32.max(axis=axis, keepdims=True)
+
+    scale = np.where(xmax == xmin, 1.0, (xmax - xmin) / n_levels)
+    q = np.round((f32 - xmin) / scale).clip(0, n_levels)
+    return (q * scale + xmin).astype(np.float16)
+
+
 def _nbin_quant(arr: np.ndarray, n_bins: int, axis=None) -> np.ndarray:
     """Symmetric quantization with exactly n_bins evenly-spaced levels.
 
@@ -171,6 +234,8 @@ def _nbin_quant(arr: np.ndarray, n_bins: int, axis=None) -> np.ndarray:
       n_bins=7 : levels at {-1, -0.667, -0.333, 0, 0.333, 0.667, 1}
       n_bins=8 : levels at {-1, -0.714, ..., 1}      (≈ int3 quality)
     """
+    if arr.size == 0:
+        return arr.astype(np.float16)
     levels = np.linspace(-1.0, 1.0, n_bins, dtype=np.float32)
     f32 = arr.astype(np.float32)
 
@@ -273,6 +338,102 @@ def quant_int3_tok(arr: np.ndarray) -> np.ndarray:
     return _uniform_quant(arr, bits=3, axis=1)
 
 
+# ── int3_half: 4-level non-uniform quantizer using int3's step size ───────────
+#
+# int3 asymmetric divides [min, max] into 7 equal steps (8 bins: indices 0-7).
+# int3_half selects 4 of those 8 positions; default is {0,3,5,7}:
+#
+#   {0,3,5,7} → {0, 3/7, 5/7, 1}  gaps: 3/7, 2/7, 2/7  (coarse bottom)
+#   {0,2,4,7} → {0, 2/7, 4/7, 1}  gaps: 2/7, 2/7, 3/7  (coarse top)
+#   {0,2,5,7} → {0, 2/7, 5/7, 1}  gaps: 2/7, 3/7, 2/7  (coarse middle)
+#
+# For custom indices use make_int3_half(indices, axis):
+#   fn = make_int3_half([0, 2, 4, 7], axis=0)
+#   out = fn(arr)
+
+def _int3_half_quant(arr: np.ndarray, axis=None, indices=(0, 3, 5, 7)) -> np.ndarray:
+    """4-level non-uniform quantizer using int3's step size (step = (max-min)/7).
+
+    indices: any 4 positions from 0–7 selecting which int3 bins to keep.
+             Default {0,3,5,7}: wide gap at bottom, finer at top.
+
+    axis=None : per-tensor
+    axis=0    : per-channel (one scale per column / head_dim element)
+    axis=1    : per-token   (one scale per row / token)
+    """
+    if arr.size == 0:
+        return arr.astype(np.float16)
+    f32    = arr.astype(np.float32)
+    LEVELS = np.array([i / 7.0 for i in indices], dtype=np.float32)
+
+    if axis is None:
+        xmin = f32.min()
+        xmax = f32.max()
+        rng  = xmax - xmin
+        if rng == 0:
+            return arr.copy()
+        cb   = xmin + LEVELS * rng                     # [4]
+        idx  = np.abs(f32[..., None] - cb).argmin(-1)  # [...]
+        result = cb[idx]
+
+    elif axis == 0:
+        # Per-channel: one codebook per column
+        xmin = f32.min(axis=0)                         # [n_embd]
+        xmax = f32.max(axis=0)
+        rng  = np.where(xmax - xmin == 0, 1.0, xmax - xmin)
+        cb   = xmin[:, None] + LEVELS[None, :] * rng[:, None]  # [n_embd, 4]
+        diff = np.abs(f32[:, :, None] - cb[None, :, :])              # [n_tok, n_embd, 4]
+        idx  = diff.argmin(axis=-1)                                   # [n_tok, n_embd]
+        result = cb[np.arange(f32.shape[1])[None, :], idx]           # [n_tok, n_embd]
+
+    elif axis == 1:
+        # Per-token: one codebook per row
+        xmin = f32.min(axis=1)                         # [n_tok]
+        xmax = f32.max(axis=1)
+        rng  = np.where(xmax - xmin == 0, 1.0, xmax - xmin)
+        cb   = xmin[:, None] + LEVELS[None, :] * rng[:, None]  # [n_tok, 4]
+        diff = np.abs(f32[:, :, None] - cb[:, None, :])         # [n_tok, n_embd, 4]
+        idx  = diff.argmin(axis=-1)                              # [n_tok, n_embd]
+        result = cb[np.arange(f32.shape[0])[:, None], idx]      # [n_tok, n_embd]
+
+    else:
+        raise ValueError(f"axis must be None, 0, or 1; got {axis}")
+
+    return result.astype(np.float16)
+
+
+def quant_int3_half(arr: np.ndarray) -> np.ndarray:
+    """INT3-half per-tensor, default indices {0,3,5,7}."""
+    return _int3_half_quant(arr, axis=None)
+
+
+def quant_int3_half_ch(arr: np.ndarray) -> np.ndarray:
+    """INT3-half per-channel, default indices {0,3,5,7}."""
+    return _int3_half_quant(arr, axis=0)
+
+
+def quant_int3_half_tok(arr: np.ndarray) -> np.ndarray:
+    """INT3-half per-token, default indices {0,3,5,7}."""
+    return _int3_half_quant(arr, axis=1)
+
+
+def make_int3_half(indices, axis=0):
+    """Factory for custom int3_half with any 4 indices from 0–7.
+
+    Usage:
+        fn = make_int3_half([0, 2, 4, 7], axis=0)   # per-channel
+        fn = make_int3_half([0, 2, 5, 7], axis=1)   # per-token
+        out = fn(arr)
+    """
+    indices = tuple(indices)
+    assert len(indices) == 4 and all(0 <= i <= 7 for i in indices), \
+        f"indices must be 4 values in 0–7, got {indices}"
+    def fn(arr, _idx=indices, _ax=axis):
+        return _int3_half_quant(arr, axis=_ax, indices=_idx)
+    fn.__name__ = f"int3_half_{''.join(str(i) for i in indices)}_{'ch' if axis==0 else 'tok' if axis==1 else 'tensor'}"
+    return fn
+
+
 # ── Dynamic grouped variants: int{N}_{ch,tok}_g{G} ───────────────────────────
 # Any group size G is supported — no new functions needed for new G values.
 #
@@ -358,6 +519,183 @@ PER_TOKEN_QUANTS   = _PerTokenSet()
 CH_QUANT_GROUP_SIZE = _ChGroupSizeMap()
 
 
+# ── Bin-index helpers (used by BinTracker) ────────────────────────────────────
+
+def _sym_bin_indices(arr: np.ndarray, n_levels: int, axis=None,
+                     dim_group_size=None) -> np.ndarray:
+    """Integer bin index in {0,...,2*n_levels} for symmetric quantization."""
+    f32 = arr.astype(np.float32)
+    if dim_group_size is not None and axis is not None and f32.ndim == 2:
+        n_outer, n_inner = f32.shape
+        if axis == 1:
+            f32_g = f32.reshape(n_outer, n_inner // dim_group_size, dim_group_size)
+            amax  = np.abs(f32_g).max(axis=2, keepdims=True)
+        else:
+            f32_g = f32.reshape(n_outer // dim_group_size, dim_group_size, n_inner)
+            amax  = np.abs(f32_g).max(axis=1, keepdims=True)
+        amax  = np.where(amax == 0, 1.0, amax)
+        scale = amax / n_levels
+        q = np.round(f32_g / scale).clip(-n_levels, n_levels).astype(np.int32)
+        return (q + n_levels).reshape(arr.shape)
+    if axis is None:
+        amax = float(np.abs(f32).max())
+        amax = amax if amax != 0 else 1.0
+    else:
+        amax = np.abs(f32).max(axis=axis, keepdims=True)
+        amax = np.where(amax == 0, 1.0, amax)
+    scale = amax / n_levels
+    q = np.round(f32 / scale).clip(-n_levels, n_levels).astype(np.int32)
+    return q + n_levels
+
+
+def _asym_bin_indices(arr: np.ndarray, n_levels: int, axis=None,
+                      dim_group_size=None) -> np.ndarray:
+    """Integer bin index in {0,...,n_levels} for asymmetric quantization."""
+    f32 = arr.astype(np.float32)
+    if dim_group_size is not None and axis is not None and f32.ndim == 2:
+        n_outer, n_inner = f32.shape
+        if axis == 1:
+            f32_g = f32.reshape(n_outer, n_inner // dim_group_size, dim_group_size)
+            xmin  = f32_g.min(axis=2, keepdims=True)
+            xmax  = f32_g.max(axis=2, keepdims=True)
+        else:
+            f32_g = f32.reshape(n_outer // dim_group_size, dim_group_size, n_inner)
+            xmin  = f32_g.min(axis=1, keepdims=True)
+            xmax  = f32_g.max(axis=1, keepdims=True)
+        scale = np.where(xmax == xmin, 1.0, (xmax - xmin) / n_levels)
+        q = np.round((f32_g - xmin) / scale).clip(0, n_levels).astype(np.int32)
+        return q.reshape(arr.shape)
+    if axis is None:
+        xmin, xmax = float(f32.min()), float(f32.max())
+        scale = (xmax - xmin) / n_levels if xmax != xmin else 1.0
+    else:
+        xmin  = f32.min(axis=axis, keepdims=True)
+        xmax  = f32.max(axis=axis, keepdims=True)
+        scale = np.where(xmax == xmin, 1.0, (xmax - xmin) / n_levels)
+    return np.round((f32 - xmin) / scale).clip(0, n_levels).astype(np.int32)
+
+
+def _nbin_indices(arr: np.ndarray, n_bins: int, axis=None) -> np.ndarray:
+    """Integer bin index in {0,...,n_bins-1} for q{N} symmetric quantization."""
+    levels = np.linspace(-1.0, 1.0, n_bins, dtype=np.float32)
+    f32    = arr.astype(np.float32)
+    if axis is None:
+        amax = float(np.abs(f32).max())
+        amax = amax if amax != 0 else 1.0
+    else:
+        amax = np.abs(f32).max(axis=axis, keepdims=True)
+        amax = np.where(amax == 0, 1.0, amax)
+    norm = (f32 / amax).clip(-1.0, 1.0)
+    return np.abs(norm[..., np.newaxis] - levels).argmin(axis=-1).astype(np.int32)
+
+
+def _make_bin_index_fn(name: str, asym: bool = False):
+    """Return (fn, n_bins, labels) for BinTracker.
+
+    fn(arr) -> int32 array of same shape containing the bin index for each element.
+    Returns (None, 0, []) for float formats (fp16/bf16/fp8/nf4) — no integer bins.
+    """
+    if name in _FLOAT_QUANTS:
+        return None, 0, []
+
+    def _sym_info(bits, axis, gsize=None):
+        nl = (1 << (bits - 1)) - 1
+        nb = 2 * nl + 1
+        lbs = [str(v) for v in range(-nl, nl + 1)]
+        fn = lambda arr, _nl=nl, _ax=axis, _gs=gsize: \
+            _sym_bin_indices(arr, _nl, _ax, dim_group_size=_gs)
+        return fn, nb, lbs
+
+    def _asym_info(n_levels, axis, gsize=None):
+        nb  = n_levels + 1
+        lbs = [str(v) for v in range(nb)]
+        fn  = lambda arr, _nl=n_levels, _ax=axis, _gs=gsize: \
+            _asym_bin_indices(arr, _nl, _ax, dim_group_size=_gs)
+        return fn, nb, lbs
+
+    if asym:
+        parsed_g = _parse_grouped_name(name)
+        if parsed_g:
+            bits, axis, gsize = parsed_g
+            return _asym_info((1 << bits) - 1, axis, gsize=gsize)
+        m = _re.match(r'^int(\d+)(?:_(ch|tok))?$', name)
+        if m and int(m.group(1)) in _VALID_BITS:
+            bits = int(m.group(1))
+            axis = {"ch": 0, "tok": 1, None: None}[m.group(2)]
+            return _asym_info((1 << bits) - 1, axis)
+        parsed2 = _parse_nbin_name(name)
+        if parsed2:
+            n_bins, axis = parsed2
+            return _asym_info(n_bins - 1, axis)
+    else:
+        m = _re.match(r'^int(\d+)(?:_(ch|tok))?$', name)
+        if m and int(m.group(1)) in _VALID_BITS:
+            bits = int(m.group(1))
+            axis = {"ch": 0, "tok": 1, None: None}[m.group(2)]
+            return _sym_info(bits, axis)
+        parsed_g = _parse_grouped_name(name)
+        if parsed_g:
+            bits, axis, gsize = parsed_g
+            return _sym_info(bits, axis, gsize=gsize)
+        parsed2 = _parse_nbin_name(name)
+        if parsed2:
+            n_bins, axis = parsed2
+            lbs = [f"{v:.3f}" for v in np.linspace(-1, 1, n_bins)]
+            fn  = lambda arr, _nb=n_bins, _ax=axis: _nbin_indices(arr, _nb, _ax)
+            return fn, n_bins, lbs
+
+    return None, 0, []
+
+
+class BinTracker:
+    """Wraps a quant function and counts how often each bin is hit.
+
+    Drop-in callable replacement for get_quant_fn() output — returns the same
+    dequantized array while accumulating integer bin hit counts in .counts.
+
+    Usage:
+        tracker = BinTracker("int3_ch")
+        quantized = tracker(arr)          # identical to get_quant_fn("int3_ch")(arr)
+        print(tracker.fractions())        # fraction of hits per bin
+    """
+
+    def __init__(self, name: str, asym: bool = False):
+        self.name   = name
+        self.asym   = asym
+        self._qfn   = get_quant_fn(name, asym=asym)
+        self._ifn, self.n_bins, self.labels = _make_bin_index_fn(name, asym)
+        self.counts = np.zeros(max(self.n_bins, 1), dtype=np.int64)
+
+    def __call__(self, arr: np.ndarray) -> np.ndarray:
+        result = self._qfn(arr)
+        if self._ifn is not None and self.n_bins > 0:
+            self.counts += np.bincount(self._ifn(arr).ravel(),
+                                       minlength=self.n_bins)
+        return result
+
+    def reset(self):
+        self.counts[:] = 0
+
+    def fractions(self) -> np.ndarray:
+        total = self.counts.sum()
+        return self.counts / total if total > 0 else np.zeros(self.n_bins)
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "asym": self.asym,
+                "n_bins": self.n_bins, "labels": self.labels,
+                "counts": self.counts.tolist()}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        obj         = cls.__new__(cls)
+        obj.name    = d["name"]
+        obj.asym    = d["asym"]
+        obj.n_bins  = d["n_bins"]
+        obj.labels  = d["labels"]
+        obj.counts  = np.array(d["counts"], dtype=np.int64)
+        return obj
+
+
 # ── Manual FP8 fallback (no ml_dtypes) ───────────────────────────────────────
 
 def _fp8_e4m3_quantize_scalar(x: float) -> float:
@@ -425,28 +763,85 @@ QUANT_FNS = {
     "int3_ch":   quant_int3_ch,
     "int3_tok":  quant_int3_tok,
     "nf4":       quant_nf4,
-    "int2":      quant_int2,
-    "int2_ch":   quant_int2_ch,
-    "int2_tok":  quant_int2_tok,
+    "int2":          quant_int2,
+    "int2_ch":       quant_int2_ch,
+    "int2_tok":      quant_int2_tok,
+    "int3_half":     quant_int3_half,
+    "int3_half_ch":  quant_int3_half_ch,
+    "int3_half_tok": quant_int3_half_tok,
 }
+
+
+def _parse_int3_half_name(name: str):
+    """Parse int3_half_ABCD[_ch|_tok] → (indices_tuple, axis) or None.
+
+    Examples:
+        int3_half_0247_ch  → ((0,2,4,7), 0)
+        int3_half_0357     → ((0,3,5,7), None)
+        int3_half_0267_tok → ((0,2,6,7), 1)
+    """
+    m = _re.match(r'^int3_half_(\d{4})(?:_(ch|tok))?$', name)
+    if m is None:
+        return None
+    indices = tuple(int(c) for c in m.group(1))
+    if len(set(indices)) != 4 or not all(0 <= i <= 7 for i in indices):
+        return None
+    axis = {"ch": 0, "tok": 1, None: None}[m.group(2)]
+    return indices, axis
 
 
 def _is_valid_quant(name: str) -> bool:
     return (name in QUANT_FNS
             or _parse_grouped_name(name) is not None
-            or _parse_nbin_name(name) is not None)
+            or _parse_nbin_name(name) is not None
+            or _parse_int3_half_name(name) is not None)
 
 
-def get_quant_fn(name: str):
+_FLOAT_QUANTS = {"fp16", "bf16", "fp8_e4m3", "fp8_e5m2", "nf4"}
+
+
+def get_quant_fn(name: str, asym: bool = False):
     """Return the quantization function for the given name.
+
+    asym=True: use asymmetric (min+scale) quantization for all integer variants.
+    Has no effect on fp16/bf16/fp8/nf4 which are float formats.
 
     Supports:
     - All named variants in QUANT_FNS (fp16, int2_ch, int4_tok, nf4, ...)
     - Any int{N}_{ch,tok}_g{G} for N in {2,3,4,8} and any G >= 1
     - Any q{N} / q{N}_ch / q{N}_tok for N >= 2
-      (e.g. q5_ch, q6_tok, q7 — arbitrary bin counts between int2 and int3,
-       or between int3 and int4, etc.)
     """
+    # Float formats are unaffected by --asym
+    if name in _FLOAT_QUANTS:
+        return QUANT_FNS[name]
+
+    if asym:
+        # Named int variants: extract bits and axis from the name
+        parsed_g = _parse_grouped_name(name)
+        if parsed_g:
+            bits, axis, gsize = parsed_g
+            def fn(arr, b=bits, ax=axis, gs=gsize):
+                return _uniform_quant_asym(arr, bits=b, axis=ax, dim_group_size=gs)
+            return fn
+        # Plain int{N}, int{N}_ch, int{N}_tok
+        _plain = _re.match(r'^int(\d+)(?:_(ch|tok))?$', name)
+        if _plain:
+            bits = int(_plain.group(1))
+            gran = _plain.group(2)
+            axis = {"ch": 0, "tok": 1, None: None}[gran]
+            if bits in _VALID_BITS:
+                def fn(arr, b=bits, ax=axis):
+                    return _uniform_quant_asym(arr, bits=b, axis=ax)
+                return fn
+        # q{N} bin-count variants: asym uses n_levels = n_bins - 1
+        # e.g. q5_ch --asym → 5 bins evenly spaced from [xmin, xmax]
+        parsed2 = _parse_nbin_name(name)
+        if parsed2:
+            n_bins, axis = parsed2
+            def fn(arr, nl=n_bins - 1, ax=axis):
+                return _uniform_quant_asym(arr, axis=ax, n_levels=nl)
+            return fn
+
     if name in QUANT_FNS:
         return QUANT_FNS[name]
     parsed = _parse_grouped_name(name)
@@ -459,11 +854,18 @@ def get_quant_fn(name: str):
         def fn(arr, nb=n_bins, ax=axis):
             return _nbin_quant(arr, n_bins=nb, axis=ax)
         return fn
+    parsed3 = _parse_int3_half_name(name)
+    if parsed3:
+        indices, axis = parsed3
+        def fn(arr, _idx=indices, _ax=axis):
+            return _int3_half_quant(arr, axis=_ax, indices=_idx)
+        return fn
     raise ValueError(
         f"Unknown quantization: '{name}'. "
         f"Named variants: {list(QUANT_FNS)}. "
         f"Dynamic grouped: int{{2,3,4,8}}_{{ch,tok}}_g{{N}}. "
-        f"Arbitrary bins: q{{N}} / q{{N}}_ch / q{{N}}_tok for any N >= 2."
+        f"Arbitrary bins: q{{N}} / q{{N}}_ch / q{{N}}_tok for any N >= 2. "
+        f"int3_half combos: int3_half_ABCD[_ch|_tok] (4 digits 0-7)."
     )
 
 

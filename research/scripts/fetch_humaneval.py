@@ -58,11 +58,13 @@ def main():
             comp_toks.append(len(completion.split()))
 
             out = {
-                "prompt":     prompt,
-                "completion": completion,
-                "dataset":    "humaneval",
-                "id":         i,
-                "task_id":    rec["task_id"],
+                "prompt":      prompt,
+                "completion":  completion,
+                "test":        rec["test"],        # test harness for eval_code.py
+                "entry_point": rec["entry_point"], # function name called by tests
+                "dataset":     "humaneval",
+                "id":          i,
+                "task_id":     rec["task_id"],
             }
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
 
@@ -72,7 +74,11 @@ def main():
           f"(max {max(prompt_toks)})")
     print(f"  Completion len : avg ~{sum(comp_toks)//n} words  "
           f"(max {max(comp_toks)})")
-    print(f"  Recommended: --n-ctx 1024 --quants fp16 int8_ch int4_ch:int4_tok")
+    print(f"  Recommended flags: --n-ctx 1024 --quants fp16 int8_ch int4_ch int3_ch int2_ch")
+    print(f"  Evaluate pass@1 after the sweep:")
+    print(f"    python3 research/scripts/eval_code.py \\")
+    print(f"        research/results/humaneval_per_example.json \\")
+    print(f"        --jsonl {args.out}")
 
 
 if __name__ == "__main__":

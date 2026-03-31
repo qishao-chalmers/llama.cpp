@@ -207,16 +207,24 @@ def main():
     ap.add_argument("per_ex_json", help="--save-per-example JSON from run_sweep.py")
     ap.add_argument("--quants",    nargs="+", default=None,
                     help="Quant names to include (default: all in file)")
-    ap.add_argument("--metric",    default=None,
-                    choices=list(DEFAULT_THRESHOLDS.keys()),
-                    help="Focus on one metric (default: all)")
+    _valid_metrics = list(DEFAULT_THRESHOLDS.keys())
+    ap.add_argument("--metric",    nargs="*", default=None,
+                    metavar="METRIC",
+                    help=f"Metrics to analyse (default: all). Choices: {_valid_metrics}")
     ap.add_argument("--threshold", type=float, default=None,
-                    help="Override default threshold for --metric")
+                    help="Override default threshold (only used when exactly one --metric given)")
     ap.add_argument("--sweep",     action="store_true",
-                    help="Sweep thresholds and print TPR/FPR grid (requires --metric)")
+                    help="Sweep thresholds and print TPR/FPR grid (loops over each --metric)")
     ap.add_argument("--summary",   action="store_true",
                     help="Print value distribution summary instead of alarm table")
     args = ap.parse_args()
+
+    # Validate metric names
+    _valid_metrics = list(DEFAULT_THRESHOLDS.keys())
+    if args.metric:
+        bad = [m for m in args.metric if m not in _valid_metrics]
+        if bad:
+            ap.error(f"invalid metric(s): {bad}; choose from {_valid_metrics}")
 
     with open(args.per_ex_json) as f:
         data = json.load(f)
@@ -243,19 +251,20 @@ def main():
         print_value_summary(per_ex_by_quant, quants)
         return
 
-    metrics = [args.metric] if args.metric else list(DEFAULT_THRESHOLDS.keys())
+    metrics = args.metric if args.metric else list(DEFAULT_THRESHOLDS.keys())
 
     if args.sweep:
         if not args.metric:
             print("--sweep requires --metric", file=sys.stderr)
             sys.exit(1)
-        thresholds, tpr_per_quant, fpr_per_quant = sweep_thresholds(
-            per_ex_by_quant, quants, args.metric)
-        print_sweep(thresholds, tpr_per_quant, fpr_per_quant, args.metric, quants)
+        for metric in metrics:
+            thresholds, tpr_per_quant, fpr_per_quant = sweep_thresholds(
+                per_ex_by_quant, quants, metric)
+            print_sweep(thresholds, tpr_per_quant, fpr_per_quant, metric, quants)
         return
 
     for metric in metrics:
-        threshold = args.threshold if (args.threshold is not None and args.metric) \
+        threshold = args.threshold if (args.threshold is not None and len(metrics) == 1) \
                     else DEFAULT_THRESHOLDS[metric]
         rows = analyze(per_ex_by_quant, quants, metric, threshold)
         print_table(rows, metric, threshold)

@@ -2,6 +2,40 @@
 
 Quick reference: pick your task, get the commands.
 
+## Benchmark Overview
+
+| Benchmark | Prompt length | Output length | Evaluation | What can fail |
+|-----------|--------------|---------------|------------|---------------|
+| WikiText2 | 2048 tok chunks | n/a (teacher-forced) | Perplexity | Distribution shift |
+| GSM8K | ~1500 tok | ~50–300 tok | Exact number match | Reasoning chain breaks |
+| NIAH | ~128K tok (H100) | ~5 tok | F1 on passphrase | Retrieval from middle context |
+| LongBench qasper | ~8192 tok | ~50 tok (fp16) / loops (int2) | F1 on answer | Comprehension + generation collapse |
+
+### WikiText2 / C4 — Flat Perplexity
+- **Prompt/output**: No split — continuous text; model predicts each next token (teacher-forced).
+- **Focus**: General language modeling quality. Does quantization make the model "worse at language" on average?
+- **Evaluation**: Perplexity (lower = better) + KL divergence vs fp16.
+
+### GSM8K — Math Reasoning Accuracy
+- **Prompt**: 8 worked examples (few-shot) + a new math word problem. ~1000–2000 tokens.
+- **Output**: Step-by-step reasoning chain ending in "The answer is 42." ~50–300 tokens.
+- **Focus**: Does quantization break multi-step arithmetic reasoning chains?
+- **Evaluation**: Regex extracts final number; exact match against gold. Score = 0 or 1.
+
+### NIAH — Needle in a Haystack
+- **Prompt**: ~128K tokens of C4 filler with one passphrase inserted at a controlled position (0%–100%).
+- **Output**: Model asked to recall the magic word. 1–5 tokens expected.
+- **Focus**: Long-context retrieval. Does quantization amplify the "lost in the middle" effect?
+- **Evaluation**: F1 against passphrase words. 110 examples = 11 positions × 10 replicates.
+
+### LongBench Qasper — Long-Document QA
+- **Prompt**: Full scientific paper (up to ~6000 tokens) + question, wrapped in chat format. Up to 8192 tokens.
+- **Output**: 1–2 sentence answer (~20–100 tokens fp16; repetition loops when int2 fails).
+- **Focus**: Does quantization impair reading comprehension over long, information-dense documents?
+- **Evaluation**: F1 between generated answer and gold phrases (multiple valid answers allowed).
+
+---
+
 ---
 
 ## 1. Wikitext PPL Sweep (flat text, teacher-forced)

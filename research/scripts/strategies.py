@@ -34,6 +34,7 @@ KL(P ∥ Q) = Σ_v P(v) · (logP(v) − logQ(v))
 where P = fp16 distribution, Q = quantized distribution.
 """
 
+import ctypes
 from collections import namedtuple
 
 import numpy as np
@@ -53,26 +54,34 @@ def _kl_div(log_p: np.ndarray, log_q: np.ndarray) -> float:
 
 def _fire_hook(kv_hook, ctx, n_pending_k, n_pending_v, k_group_size, v_group_size):
     """Fire the hook when K or V (or both) have accumulated enough tokens.
-    Returns updated (n_pending_k, n_pending_v)."""
+    Returns updated (n_pending_k, n_pending_v).
+
+    Pass 0 (not None) for the non-firing side: None means "quantize all cells"
+    in apply_kv_hook (prefill semantics), while 0 means "skip".
+    """
     do_k = n_pending_k >= k_group_size
     do_v = n_pending_v >= v_group_size
     if do_k or do_v:
         kv_hook(ctx,
-                n_new_k=n_pending_k if do_k else None,
-                n_new_v=n_pending_v if do_v else None)
+                n_new_k=n_pending_k if do_k else 0,
+                n_new_v=n_pending_v if do_v else 0)
         if do_k: n_pending_k = 0
         if do_v: n_pending_v = 0
     return n_pending_k, n_pending_v
 
 
 def _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v):
-    """Flush any remaining pending tokens at end of chunk."""
+    """Flush any remaining pending tokens at end of chunk.
+
+    Pass 0 (not None) for the non-pending side: None means "quantize all cells"
+    in apply_kv_hook (prefill semantics), while 0 means "skip".
+    """
     do_k = n_pending_k > 0
     do_v = n_pending_v > 0
     if do_k or do_v:
         kv_hook(ctx,
-                n_new_k=n_pending_k if do_k else None,
-                n_new_v=n_pending_v if do_v else None)
+                n_new_k=n_pending_k if do_k else 0,
+                n_new_v=n_pending_v if do_v else 0)
 
 
 def _collect_logits(lib, ctx, n_vocab, next_token,
@@ -126,6 +135,66 @@ def _collect_logits(lib, ctx, n_vocab, next_token,
 
     return top1
 
+
+# ── KV state save / restore ──────────────────────────────────────────────────
+
+def save_kv_state(lib, ctx, seq_id=0) -> bytes:
+    """Snapshot the KV cache for seq_id into a bytes blob."""
+    size = lib.llama_state_seq_get_size(ctx, seq_id)
+    buf  = ctypes.create_string_buffer(size)
+    written = lib.llama_state_seq_get_data(ctx, buf, size, seq_id)
+    return bytes(buf.raw[:written])
+
+
+def restore_kv_state(lib, ctx, blob: bytes, seq_id=0):
+    """Restore KV cache for seq_id from a bytes blob produced by save_kv_state."""
+    buf = ctypes.create_string_buffer(blob)
+    lib.llama_state_seq_set_data(ctx, buf, len(blob), seq_id)
+
+
+def _single_decode(lib, ctx, token: int, pos: int) -> int:
+    """Run one decode step (token at pos). Logits available at index 0. Returns ret code."""
+    batch = lib.llama_batch_init(1, 0, 1)
+    batch.n_tokens     = 1
+    batch.token[0]     = token
+    batch.pos[0]       = pos
+    batch.n_seq_id[0]  = 1
+    batch.seq_id[0][0] = 0
+    batch.logits[0]    = 1
+    ret = lib.llama_decode(ctx, batch)
+    lib.llama_batch_free(batch)
+    return ret
+
+
+def verify_window(lib, ctx, n_vocab, window_tokens, pos_start,
+                  kv_hook=None, k_group_size=64, v_group_size=64):
+    """Feed window_tokens one-by-one (starting at pos_start) with kv_hook active.
+
+    Returns greedy[i] = argmax after feeding window_tokens[i], i.e. the predicted
+    token for position pos_start+i+1.  Caller checks:
+      greedy[i] == window_tokens[i+1]   for i in 0..len-2   (intra-window)
+      greedy[-1] == <first token of next window>             (cross-window, optional)
+    """
+    greedy = []
+    n_pending_k = n_pending_v = 0
+    for i, tok in enumerate(window_tokens):
+        ret = _single_decode(lib, ctx, tok, pos_start + i)
+        if ret != 0:
+            raise RuntimeError(f"verify_window decode failed at step {i}: {ret}")
+        if kv_hook:
+            n_pending_k += 1
+            n_pending_v += 1
+            n_pending_k, n_pending_v = _fire_hook(
+                kv_hook, ctx, n_pending_k, n_pending_v, k_group_size, v_group_size)
+        ptr = lib.llama_get_logits_ith(ctx, 0)
+        logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+        greedy.append(int(np.argmax(logits)))
+    if kv_hook:
+        _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v)
+    return greedy
+
+
+# ── end KV state helpers ──────────────────────────────────────────────────────
 
 def run_chunk_token_by_token(lib, ctx, tokens, n_vocab, kv_hook=None, n_prompt=0,
                              k_group_size=64, v_group_size=64,
@@ -324,7 +393,7 @@ def _rep_rate(token_ids, window=20, ngram=3):
 
 
 def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
-                 max_new_tokens=512, eos_token_id=None,
+                 max_new_tokens=512, is_eog=None,
                  stop_strings=None,
                  k_group_size=64, v_group_size=64,
                  return_diagnostics=False):
@@ -334,8 +403,9 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     match exactly.  Returns (generated, diags) where generated is a list of
     token ids and diags is a dict{"H", "p_max", "self_surp", "rep_rate"} of
     per-step lists (or None when return_diagnostics=False).
-    Stops at max_new_tokens, when eos_token_id is produced, or when any
+    Stops at max_new_tokens, when is_eog(token) returns True, or when any
     string in stop_strings appears in the decoded suffix of the output.
+    is_eog: callable(token_id) -> bool, typically lib.llama_vocab_is_eog(vocab, id).
     """
     n_prompt = len(prompt_tokens)
     mem = lib.llama_get_memory(ctx)
@@ -375,6 +445,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     pos = n_prompt
     # For stop-string detection: keep a small rolling decode buffer
     _stop_check_len = max((len(s) for s in stop_strings), default=0) * 3 + 32 if stop_strings else 0
+    _in_think_block = False
 
     if diag_lists is not None:
         p     = np.exp(log_q)
@@ -385,7 +456,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
         diag_lists["rep_rate"].append(0.0)
 
     for _ in range(max_new_tokens - 1):
-        if eos_token_id is not None and token == eos_token_id:
+        if is_eog is not None and is_eog(token):
             break
 
         batch = lib.llama_batch_init(1, 0, 1)
@@ -427,7 +498,13 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
         if stop_strings and len(generated) >= 4:
             tail = generated[-_stop_check_len:] if _stop_check_len else generated
             tail_text = llama.detokenize(lib, vocab, tail, remove_special=False)
-            if any(s in tail_text for s in stop_strings):
+            # Track reasoning blocks: <think> (Qwen3, DeepSeek-R1),
+            # <|channel|>analysis (GPT-OSS). Skip stop strings inside them.
+            if "<think>" in tail_text or "<|channel|>analysis" in tail_text:
+                _in_think_block = True
+            if "</think>" in tail_text or "<|channel|>final" in tail_text:
+                _in_think_block = False
+            if not _in_think_block and any(s in tail_text for s in stop_strings):
                 break
 
     if kv_hook:
