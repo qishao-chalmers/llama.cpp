@@ -24,6 +24,12 @@ try:
 except ImportError:
     HAS_GPU_QUANT = False
 
+try:
+    import gpu_kv_shadow
+    HAS_GPU_KV_SHADOW = gpu_kv_shadow.HAS_CUPY
+except ImportError:
+    HAS_GPU_KV_SHADOW = False
+
 
 def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
                         quant_fn_factory=None, profile=None):
@@ -458,6 +464,10 @@ def main():
                              "of adaptive scheme end-to-end. Requires --eval-accuracy --skip-ppl.")
     parser.add_argument("--adaptive-window", type=int, default=32,
                         help="Window size (tokens) for --adaptive-sim/--adaptive-gen (default: 32).")
+    parser.add_argument("--no-adaptive-gen-gpu-shadow", action="store_true",
+                        help="For --adaptive-gen: use CPU KV blob save/restore (PCIe on GPU). "
+                             "Default: GPU device-to-device shadow checkpoint via CuPy when "
+                             "GPU KV is active.")
     parser.add_argument("--profile-kv", action="store_true",
                         help="Time llama_decode vs KV quant hook. CPU path: get/parse/quant/pack/set "
                              "(parse_state). GPU path (--flash-attn + CuPy): gpu_kv_s includes "
@@ -985,7 +995,8 @@ def main():
                   flush=True)
         return sim_results
 
-    def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs):
+    def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs,
+                         use_gpu_shadow=False, n_layer=0):
         """Real adaptive generation: fp16 bootstrap + draft-quant generation + fp16 verification.
 
         Window 0: fp16 generates W tokens (bootstrap / ground truth).
@@ -994,12 +1005,15 @@ def main():
           b. fp16 verifies draft tokens (replay with kv_hook=None).
           c. All greedy predictions match → accept; else fp16 regenerates this window.
 
-        KV save/restore (performance): every checkpoint uses save_kv_state / restore_kv_state
-        (llama_state_seq_get_data / set_data). That serializes the full per-sequence KV blob
-        through CPU bytes. For GPU-backed KV this is a device↔host copy over PCIe each call.
+        KV save/restore (performance):
+        - Default when GPU KV + CuPy: gpu_kv_shadow.GpuKvShadowCheckpoint — cudaMemcpy D→D
+          per layer via llama_get_kv_layer_info (no PCIe).
+        - With --no-adaptive-gen-gpu-shadow or CPU inference: save_kv_state / restore_kv_state
+          (llama_state_seq_get_data / set_data), full blob through CPU; PCIe each call on GPU
+          for GPU-backed KV.
         Hot path per window (after bootstrap): typically two restores (before draft, before
-        fp16 verify) plus one save after accept/reject — i.e. three full-blob transfers per
-        window attempt, with blob size growing with context length.
+        fp16 verify) plus one save after accept/reject — three checkpoint operations per window
+        attempt.
 
         Why not strategies.trim_kv_seq here: draft_hook(ctx, n_new_k=None, n_new_v=None)
         bulk-quantizes the entire KV cache in place, including the prompt region, so fp16
@@ -1014,9 +1028,18 @@ def main():
         W = args.adaptive_window
         results = []
 
-        def _restore(kv_boundary):
-            """Restore full KV from a CPU blob (PCIe for GPU KV). See run_adaptive_gen docstring."""
-            strategies.restore_kv_state(lib, ctx, kv_boundary)
+        def _save_ckpt():
+            if use_gpu_shadow:
+                ck = gpu_kv_shadow.GpuKvShadowCheckpoint()
+                ck.save(lib, ctx, n_layer)
+                return ck
+            return strategies.save_kv_state(lib, ctx)
+
+        def _restore(ck):
+            if use_gpu_shadow:
+                ck.restore(lib, ctx, n_layer)
+            else:
+                strategies.restore_kv_state(lib, ctx, ck)
 
         for ei, (pt, _, label) in enumerate(examples):
             max_ctx_avail = args.n_ctx - len(pt) - 1
@@ -1050,7 +1073,7 @@ def main():
                     continue
                 lib.llama_batch_free(batch)
                 # Save KV = 0..n_pt-2 (fp16); prime boundary for window 0
-                pre_prime_blob = strategies.save_kv_state(lib, ctx)
+                pre_prime_blob = _save_ckpt()
                 # Part 2: decode last prompt token to get bootstrap logits
                 ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
                 if ret != 0:
@@ -1076,7 +1099,7 @@ def main():
 
             gen_ids = list(bootstrap)
             # KV = 0..n_pt+len(bootstrap)-2 (all fp16)
-            kv_boundary = strategies.save_kv_state(lib, ctx)
+            kv_boundary = _save_ckpt()
             prime_tok = bootstrap[-1]
             prime_pos = n_pt + len(bootstrap) - 1
 
@@ -1175,7 +1198,7 @@ def main():
                     n_accepted += 1
                     gen_ids    += draft_toks
                     # KV is fp16 from verify_window; save new boundary blob.
-                    kv_boundary = strategies.save_kv_state(lib, ctx)
+                    kv_boundary = _save_ckpt()
                     prime_tok = draft_toks[-1]
                     prime_pos = pos_start + len(draft_toks) - 1
                 else:
@@ -1192,7 +1215,7 @@ def main():
                         kv_hook=None,
                         stop_fn=_is_eog)
                     gen_ids   += fb_toks
-                    kv_boundary = strategies.save_kv_state(lib, ctx)
+                    kv_boundary = _save_ckpt()
                     prime_tok = fb_toks[-1]
                     prime_pos = pos_start + len(fb_toks) - 1
 
@@ -1682,10 +1705,14 @@ def main():
                         asym=args.asym,
                         quant_fn_factory=_factory if args.save_bins else None,
                         profile=kv_prof)
-                    print(f"  [adaptive-gen] draft={quant_name} window={args.adaptive_window}",
+                    ag_use_shadow = (
+                        use_gpu and HAS_GPU_KV_SHADOW and not args.no_adaptive_gen_gpu_shadow)
+                    print(f"  [adaptive-gen] draft={quant_name} window={args.adaptive_window} "
+                          f"kv_ckpt={'gpu_d2d' if ag_use_shadow else 'cpu_blob'}",
                           flush=True)
                     gen_results = run_adaptive_gen(
-                        examples, adaptive_draft_hook_gen, k_group_size, v_group_size)
+                        examples, adaptive_draft_hook_gen, k_group_size, v_group_size,
+                        use_gpu_shadow=ag_use_shadow, n_layer=n_layer)
                     gen_pregenerated = gen_results
                     gen_stats_valid  = [r for r in gen_results if r is not None]
                     if gen_stats_valid:
