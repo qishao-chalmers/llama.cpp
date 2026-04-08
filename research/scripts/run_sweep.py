@@ -16,6 +16,7 @@ import llama_bindings as llama
 import parse_state
 import quant as quant_mod
 import strategies
+import kv_profile
 
 try:
     import gpu_quant
@@ -25,7 +26,7 @@ except ImportError:
 
 
 def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
-                        quant_fn_factory=None):
+                        quant_fn_factory=None, profile=None):
     """Build a bare CPU hook (no window logic) for a specific quant type.
     Used for sink_hook and recent_hook in _apply_window zone quantization.
     Accepts start_k/start_v for absolute-offset quantization."""
@@ -39,7 +40,8 @@ def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
                                   k_fn=k_fns, v_fn=v_fns,
                                   seq_id=0, n_pos_per_embd=n_pos_per_embd,
                                   n_new_k=n_new_k, n_new_v=n_new_v,
-                                  start_k=start_k, start_v=start_v)
+                                  start_k=start_k, start_v=start_v,
+                                  profile=profile)
     return _zone_hook
 
 
@@ -127,7 +129,7 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                  default_group_size=64, n_sink=0, n_recent=0,
                  k_sink_names=None, v_sink_names=None,
                  k_recent_names=None, v_recent_names=None,
-                 asym=False, quant_fn_factory=None):
+                 asym=False, quant_fn_factory=None, profile=None):
     """Create a KV hook for the given K/V quant name lists.
 
     k_names / v_names: list[str] of length n_layer.
@@ -152,10 +154,10 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
     _fn = quant_fn_factory if quant_fn_factory is not None \
           else (lambda n: quant_mod.get_quant_fn(n, asym=asym))
     sink_hook   = (_make_cpu_zone_hook(lib, k_sink_names,   v_sink_names,   n_pos_per_embd,
-                                       quant_fn_factory=_fn)
+                                       quant_fn_factory=_fn, profile=profile)
                    if k_sink_names   is not None else None)
     recent_hook = (_make_cpu_zone_hook(lib, k_recent_names, v_recent_names, n_pos_per_embd,
-                                       quant_fn_factory=_fn)
+                                       quant_fn_factory=_fn, profile=profile)
                    if k_recent_names is not None else None)
 
     def _layer_gs(names):
@@ -176,7 +178,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
         # Simple path: no per-layer tracking needed; hook fires at the right cadence
         if use_gpu and HAS_GPU_QUANT:
             return _apply_window(
-                gpu_quant.make_kv_hook_gpu(lib, ctx_ptr, k_names, v_names, n_layer),
+                gpu_quant.make_kv_hook_gpu(lib, ctx_ptr, k_names, v_names, n_layer,
+                                           profile=profile),
                 n_sink, n_recent, sink_hook=sink_hook, recent_hook=recent_hook)
         k_fns = [_fn(n) for n in k_names]
         v_fns = [_fn(n) for n in v_names]
@@ -186,7 +189,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                                       k_fn=_kf, v_fn=_vf,
                                       seq_id=0, n_pos_per_embd=n_pos_per_embd,
                                       n_new_k=n_new_k, n_new_v=n_new_v,
-                                      start_k=start_k, start_v=start_v)
+                                      start_k=start_k, start_v=start_v,
+                                      profile=profile)
         return _apply_window(hook_simple, n_sink, n_recent,
                              sink_hook=sink_hook, recent_hook=recent_hook)
 
@@ -220,7 +224,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                 gpu_quant.apply_kv_hook_gpu(
                     lib, ctx, n_layer, k_names, v_names,
                     n_new_k=None if n_new_k is None else k_per,
-                    n_new_v=None if n_new_v is None else v_per)
+                    n_new_v=None if n_new_v is None else v_per,
+                    profile=profile)
         return _apply_window(hook_gpu_mixed, n_sink, n_recent,
                              sink_hook=sink_hook, recent_hook=recent_hook)
 
@@ -234,7 +239,8 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                                       k_fn=k_fns, v_fn=v_fns,
                                       seq_id=0, n_pos_per_embd=n_pos_per_embd,
                                       n_new_k=None if n_new_k is None else k_per,
-                                      n_new_v=None if n_new_v is None else v_per)
+                                      n_new_v=None if n_new_v is None else v_per,
+                                      profile=profile)
     return _apply_window(hook_cpu_mixed, n_sink, n_recent,
                          sink_hook=sink_hook, recent_hook=recent_hook)
 
@@ -445,8 +451,19 @@ def main():
     parser.add_argument("--verifier-quant", default="int4_ch",
                         help="Verifier quant for --adaptive-sim (default: int4_ch). "
                              "Draft quant is each entry in --quants (excluding fp16 and the verifier).")
+    parser.add_argument("--adaptive-gen",    action="store_true",
+                        help="Real adaptive generation: window 0 uses fp16, then each window "
+                             "int4 draft generates W tokens, fp16 verifies; accepted windows "
+                             "use draft output, rejected fall back to fp16. Measures quality "
+                             "of adaptive scheme end-to-end. Requires --eval-accuracy --skip-ppl.")
     parser.add_argument("--adaptive-window", type=int, default=32,
-                        help="Window size (tokens) for --adaptive-sim comparison (default: 32).")
+                        help="Window size (tokens) for --adaptive-sim/--adaptive-gen (default: 32).")
+    parser.add_argument("--profile-kv", action="store_true",
+                        help="Time llama_decode vs KV quant hook. CPU path: get/parse/quant/pack/set "
+                             "(parse_state). GPU path (--flash-attn + CuPy): gpu_kv_s includes "
+                             "in-place kernels + cuda synchronize. Per-quant summary; --profile-kv-out JSON.")
+    parser.add_argument("--profile-kv-out", default=None, metavar="FILE",
+                        help="Write per-quant profile dicts as JSON (quant name -> timings).")
     parser.add_argument("--out",            default="results.json")
     parser.add_argument("--quants",    nargs="+",
                         default=["fp16","bf16","fp8_e4m3","fp8_e5m2","int8","int8_ch","int4","int4_ch","nf4","int2"])
@@ -476,6 +493,8 @@ def main():
     if args.save_bins        is None: args.save_bins        = _sibling("_bins.json")
     if args.save_per_example is None: args.save_per_example = _sibling("_per_example.json")
     if args.save_diags       is None: args.save_diags       = _sibling("_diags.json")
+    if args.profile_kv and args.profile_kv_out is None:
+        args.profile_kv_out = _sibling("_kv_profile.json")
 
     # ── Structured corpus implies skip-ppl by default ────────────────────────
     # Teacher-forced PPL is meaningless for QA/reasoning tasks (GSM8K, NIAH,
@@ -511,6 +530,11 @@ def main():
     atexit.register(_close_log)
 
     lib = llama.load_lib()
+    kv_prof = None
+    profile_agg = {}
+    if args.profile_kv:
+        kv_prof = kv_profile.KvProfile()
+        kv_profile.wrap_llama_decode(lib, kv_prof)
     lib.llama_backend_init()
 
     mparams = lib.llama_model_default_params()
@@ -805,6 +829,12 @@ def main():
                 sim_results.append(None)
                 continue
 
+            if args.show_prompt and _show_this(ei, len(examples)):
+                prompt_text = llama.detokenize(lib, vocab, pt)
+                print(f"\n--- prompt [{label}] ({len(pt)} tokens) ---", flush=True)
+                print(prompt_text, flush=True)
+                print("---", flush=True)
+
             # ── Phase 1: fp16 generation with KV-state checkpoints ───────────
             mem = lib.llama_get_memory(ctx)
             lib.llama_memory_clear(mem, True)
@@ -872,6 +902,12 @@ def main():
             if N == 0:
                 sim_results.append(None)
                 continue
+
+            if args.show_gen and _show_this(ei, len(examples)):
+                gen_text = llama.detokenize(lib, vocab, fp16_tokens, remove_special=False)
+                print(f"\n--- fp16 gen [{label}] ({N} tokens) ---", flush=True)
+                print(gen_text.strip(), flush=True)
+                print("---", flush=True)
 
             n_full_windows = N // W          # only verify complete windows
             n_accepted        = 0
@@ -949,7 +985,242 @@ def main():
                   flush=True)
         return sim_results
 
-    def eval_accuracy_pass(examples, gold_answers, kv_hook, k_group_size, v_group_size):
+    def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs):
+        """Real adaptive generation: fp16 bootstrap + int4 draft with fp16 verification.
+
+        Window 0: fp16 generates W tokens (bootstrap / ground truth).
+        Windows 1+:
+          a. int4 draft generates W tokens (starting from fp16 KV boundary).
+          b. fp16 verifies draft tokens (prefill, no hook).
+          c. All greedy predictions match → accept, output draft tokens.
+             Any mismatch → reject, fp16 regenerates this window.
+
+        GPU path (use_gpu=True): restore via trim_kv_seq (no PCIe).
+          Draft hook only quantizes newly decoded cells; fp16 values at
+          0..prime_pos-1 are never touched, so trimming draft cells is enough.
+        CPU path (use_gpu=False): restore via llama_state_seq_set_data blob.
+
+        KV invariant: positions 0..prime_pos-1 always hold fp16-derived values.
+
+        Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction.
+        """
+        W = args.adaptive_window
+        results = []
+
+        def _restore(kv_boundary):
+            """Restore KV to fp16 boundary state (always uses blob).
+
+            We always restore from a saved blob because the draft phase overwrites
+            KV in-place with int2 values (including the prompt region) before each
+            draft window.  The GPU trim_kv_seq shortcut cannot be used here since
+            it relies on fp16 values never being touched.
+            """
+            strategies.restore_kv_state(lib, ctx, kv_boundary)
+
+        for ei, (pt, _, label) in enumerate(examples):
+            max_ctx_avail = args.n_ctx - len(pt) - 1
+            max_gen = min(args.max_gen_tokens, max_ctx_avail)
+            if max_gen <= 0:
+                results.append(None)
+                continue
+
+            mem = lib.llama_get_memory(ctx)
+            lib.llama_memory_clear(mem, True)
+            n_pt = len(pt)
+
+            # ── Prompt prefill ────────────────────────────────────────────
+            # We split the prefill into two parts so that we can save a blob
+            # at KV = 0..n_pt-2 (before the last prompt token).  This blob
+            # is used as the "prime boundary" for window 0 int2 verification,
+            # giving a clean position for re-decoding pt[-1] in int2 context.
+            if n_pt > 1:
+                # Part 1: batch-prefill pt[0..n_pt-2] (no logits needed)
+                batch = lib.llama_batch_init(n_pt - 1, 0, 1)
+                batch.n_tokens = n_pt - 1
+                for i, tok in enumerate(pt[:-1]):
+                    batch.token[i]     = tok
+                    batch.pos[i]       = i
+                    batch.n_seq_id[i]  = 1
+                    batch.seq_id[i][0] = 0
+                    batch.logits[i]    = 0
+                if lib.llama_decode(ctx, batch) != 0:
+                    lib.llama_batch_free(batch)
+                    results.append(None)
+                    continue
+                lib.llama_batch_free(batch)
+                # Save KV = 0..n_pt-2 (fp16); prime boundary for window 0
+                pre_prime_blob = strategies.save_kv_state(lib, ctx)
+                # Part 2: decode last prompt token to get bootstrap logits
+                ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                if ret != 0:
+                    results.append(None)
+                    continue
+                ptr = lib.llama_get_logits_ith(ctx, 0)
+            else:
+                pre_prime_blob = None   # n_pt==1: no prefix to save
+                ret = strategies._single_decode(lib, ctx, pt[0], 0)
+                if ret != 0:
+                    results.append(None)
+                    continue
+                ptr = lib.llama_get_logits_ith(ctx, 0)
+
+            logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+
+            # ── Phase 1: fp16 bootstrap (window 0) ───────────────────────
+            bootstrap = strategies.generate_window(
+                lib, ctx, n_vocab, int(np.argmax(logits)),
+                pos_start=n_pt, W=W,
+                kv_hook=None,
+                stop_fn=_is_eog)
+
+            gen_ids = list(bootstrap)
+            # KV = 0..n_pt+len(bootstrap)-2 (all fp16)
+            kv_boundary = strategies.save_kv_state(lib, ctx)
+            prime_tok = bootstrap[-1]
+            prime_pos = n_pt + len(bootstrap) - 1
+
+            # ── Int2 verify window 0: "can int2 be a candidate?" ─────────
+            # Mirror of windows 1+ but with roles swapped: fp16 generated,
+            # int2 verifies.  Restore to pre_prime_blob (KV = 0..n_pt-2),
+            # bulk-quantize to int2, decode pt[-1] (prime), then verify the
+            # bootstrap tokens using the int2 hook — same code path as the
+            # fp16 verify in windows 1+.
+            n_accepted  = 0
+            n_attempted = 0
+            if pre_prime_blob is not None:
+                _restore(pre_prime_blob)                          # fp16, 0..n_pt-2
+                draft_hook(ctx, n_new_k=None, n_new_v=None)      # → int2
+                ret_w0 = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                if ret_w0 == 0:
+                    draft_hook(ctx, n_new_k=1, n_new_v=1)        # quantize KV[n_pt-1]
+                    ptr_w0     = lib.llama_get_logits_ith(ctx, 0)
+                    int2_log_w0 = np.ctypeslib.as_array(ptr_w0, shape=(n_vocab,)).copy()
+                    int2_pred0  = int(np.argmax(int2_log_w0))
+                    if len(bootstrap) > 1:
+                        int2_greedy_w0 = strategies.verify_window(
+                            lib, ctx, n_vocab,
+                            bootstrap[:-1],
+                            pos_start=n_pt,
+                            kv_hook=draft_hook,
+                            k_group_size=draft_k_gs, v_group_size=draft_v_gs)
+                        w0_ok = (int2_pred0 == bootstrap[0] and
+                                 all(int2_greedy_w0[i] == bootstrap[i + 1]
+                                     for i in range(len(int2_greedy_w0))))
+                    else:
+                        w0_ok = (int2_pred0 == bootstrap[0])
+                    n_attempted += 1
+                    if w0_ok:
+                        n_accepted += 1
+                # Restore fp16 kv_boundary so phase 2 starts clean
+                _restore(kv_boundary)
+
+            def _hit_stop(ids):
+                if not args.stop_strings:
+                    return False
+                tail = llama.detokenize(lib, vocab, ids[-128:], remove_special=False)
+                return any(s in tail for s in args.stop_strings)
+
+            # ── Phase 2: int2 draft + fp16 verify, window by window ──────
+            while len(gen_ids) < max_gen:
+                if _is_eog(prime_tok) or _hit_stop(gen_ids):
+                    break
+
+                pos_start = prime_pos + 1
+                w_size    = min(W, max_gen - len(gen_ids))
+                n_attempted += 1
+
+                # Step A: draft generates w_size tokens with FULL int2 KV.
+                # Restore fp16 boundary, then bulk-quantize ALL KV to int2 so
+                # the draft attends to int2 for every previous token — exactly
+                # what a real bandwidth-optimised deployment would do.
+                _restore(kv_boundary)
+                draft_hook(ctx, n_new_k=None, n_new_v=None)  # bulk: all 0..prime_pos-1 → int2
+                ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
+                if ret != 0:
+                    break
+                draft_hook(ctx, n_new_k=1, n_new_v=1)        # quantize prime_pos cell
+                ptr          = lib.llama_get_logits_ith(ctx, 0)
+                draft_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+                draft_toks   = strategies.generate_window(
+                    lib, ctx, n_vocab, int(np.argmax(draft_logits)),
+                    pos_start=pos_start, W=w_size,
+                    kv_hook=draft_hook,
+                    k_group_size=draft_k_gs, v_group_size=draft_v_gs,
+                    stop_fn=_is_eog)
+
+                # Step B: fp16 verifies draft_toks (restore fp16 boundary first).
+                _restore(kv_boundary)
+                ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
+                if ret != 0:
+                    break
+                ptr         = lib.llama_get_logits_ith(ctx, 0)
+                fp16_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+                fp16_pred0  = int(np.argmax(fp16_logits))
+
+                if len(draft_toks) > 1:
+                    fp16_greedy = strategies.verify_window(
+                        lib, ctx, n_vocab,
+                        draft_toks[:-1],
+                        pos_start=pos_start,
+                        kv_hook=None)
+                    window_ok = (fp16_pred0 == draft_toks[0] and
+                                 all(fp16_greedy[i] == draft_toks[i + 1]
+                                     for i in range(len(fp16_greedy))))
+                else:
+                    fp16_greedy = []
+                    window_ok   = (fp16_pred0 == draft_toks[0])
+
+                if window_ok:
+                    n_accepted += 1
+                    gen_ids    += draft_toks
+                    # KV is fp16 from verify_window; save new boundary blob.
+                    kv_boundary = strategies.save_kv_state(lib, ctx)
+                    prime_tok = draft_toks[-1]
+                    prime_pos = pos_start + len(draft_toks) - 1
+                else:
+                    # Fallback: fp16 generates this window (restore fp16 first).
+                    _restore(kv_boundary)
+                    ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
+                    if ret != 0:
+                        break
+                    ptr       = lib.llama_get_logits_ith(ctx, 0)
+                    fb_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+                    fb_toks   = strategies.generate_window(
+                        lib, ctx, n_vocab, int(np.argmax(fb_logits)),
+                        pos_start=pos_start, W=w_size,
+                        kv_hook=None,
+                        stop_fn=_is_eog)
+                    gen_ids   += fb_toks
+                    kv_boundary = strategies.save_kv_state(lib, ctx)
+                    prime_tok = fb_toks[-1]
+                    prime_pos = pos_start + len(fb_toks) - 1
+
+            # Trim at first EOG
+            trimmed = []
+            for tok in gen_ids:
+                if _is_eog(tok):
+                    break
+                trimmed.append(tok)
+
+            acc   = n_accepted / max(n_attempted, 1)
+            dfrac = n_accepted * W / max(len(trimmed), 1)
+            print(f"  adaptive-gen ex {ei+1}/{len(examples)}: {label} | "
+                  f"acc={acc:.2f}  draft_frac={dfrac:.2f}  "
+                  f"n_tok={len(trimmed)}", flush=True)
+
+            results.append({
+                "gen_ids":         trimmed,
+                "n_tokens":        len(trimmed),
+                "n_attempted":     n_attempted,
+                "n_accepted":      n_accepted,
+                "acceptance_rate": acc,
+                "draft_fraction":  dfrac,
+            })
+
+        return results
+
+    def eval_accuracy_pass(examples, gold_answers, kv_hook, k_group_size, v_group_size,
+                           pregenerated=None):
         """Run greedy generation on each example, score against gold, return (score_sum, n_total, per_ex, gen_len_stats).
 
         For --eval-metric exact: n_correct / n_total (accuracy).
@@ -984,15 +1255,19 @@ def main():
             if max_gen <= 0:
                 per_ex.append((gold, None, 0.0))
                 continue
-            gen_ids, gen_diags = strategies.run_generate(
-                lib, ctx, vocab, pt, n_vocab,
-                kv_hook=kv_hook,
-                max_new_tokens=max_gen,
-                is_eog=_is_eog,
-                stop_strings=args.stop_strings or None,
-                k_group_size=k_group_size,
-                v_group_size=v_group_size,
-                return_diagnostics=bool(args.save_per_example))
+            if pregenerated is not None and ei < len(pregenerated) and pregenerated[ei] is not None:
+                gen_ids   = pregenerated[ei]["gen_ids"]
+                gen_diags = {}
+            else:
+                gen_ids, gen_diags = strategies.run_generate(
+                    lib, ctx, vocab, pt, n_vocab,
+                    kv_hook=kv_hook,
+                    max_new_tokens=max_gen,
+                    is_eog=_is_eog,
+                    stop_strings=args.stop_strings or None,
+                    k_group_size=k_group_size,
+                    v_group_size=v_group_size,
+                    return_diagnostics=bool(args.save_per_example))
             gen_text_raw = llama.detokenize(lib, vocab, gen_ids, remove_special=False)
             if use_code:
                 # Preserve leading indentation — code bodies need their 4-space indent.
@@ -1326,6 +1601,8 @@ def main():
         for quant_name in args.quants:
             if quant_name == "fp16":
                 continue
+            if kv_prof is not None:
+                kv_prof.reset()
             t0 = time.time()
             print(f"\n[{quant_name}]", flush=True)
 
@@ -1346,10 +1623,12 @@ def main():
                                    k_recent_names=k_recent_names,
                                    v_recent_names=v_recent_names,
                                    asym=args.asym,
-                                   quant_fn_factory=_factory if args.save_bins else None)
+                                   quant_fn_factory=_factory if args.save_bins else None,
+                                   profile=kv_prof)
 
             if args.skip_ppl:
                 # ── Skip PPL pass: accuracy only ──────────────────────────────
+                valid = []
                 if args.adaptive_sim and quant_name != args.verifier_quant:
                     # Build verifier hook once per quant (verifier_quant stays fixed)
                     ver_k_names, ver_v_names = quant_mod.resolve_quant_layers(
@@ -1360,14 +1639,26 @@ def main():
                         lib, ver_k_names, ver_v_names, args.n_pos_per_embd,
                         use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                         default_group_size=args.quant_group_size,
-                        n_sink=args.sink_tokens, n_recent=args.recent_tokens,
-                        k_sink_names=k_sink_names, v_sink_names=v_sink_names,
-                        k_recent_names=k_recent_names, v_recent_names=v_recent_names,
-                        asym=args.asym, quant_fn_factory=None)
+                        n_sink=0, n_recent=0,
+                        asym=args.asym, quant_fn_factory=None,
+                        profile=kv_prof)
+                    # Zone-free draft hook for adaptive sim: _apply_window's
+                    # n_done counter is stateful and never reset between
+                    # verify_window calls (which restore KV to arbitrary
+                    # boundary states). Zone logic is irrelevant for short
+                    # verification windows anyway.
+                    adaptive_draft_hook = make_kv_hook(
+                        lib, k_names, v_names, args.n_pos_per_embd,
+                        use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
+                        default_group_size=args.quant_group_size,
+                        n_sink=0, n_recent=0,
+                        asym=args.asym,
+                        quant_fn_factory=_factory if args.save_bins else None,
+                        profile=kv_prof)
                     print(f"  [adaptive-sim] draft={quant_name} verifier={args.verifier_quant} "
                           f"window={args.adaptive_window}", flush=True)
                     sim_per_ex = run_adaptive_sim(
-                        examples, kv_hook, ver_hook,
+                        examples, adaptive_draft_hook, ver_hook,
                         k_group_size, v_group_size, ver_k_gs, ver_v_gs)
                     valid = [s for s in sim_per_ex if s is not None]
                     mean_acc_rate   = sum(s["acceptance_rate"] for s in valid) / len(valid) if valid else 0.0
@@ -1378,11 +1669,38 @@ def main():
                           f"all_ok={n_all_ok}/{len(valid)}", flush=True)
                     if args.save_per_example:
                         _per_example_results[f"{quant_name}__adaptive_sim"] = sim_per_ex
+                # ── Adaptive gen: real draft generation + fp16 verify ────────
+                gen_pregenerated = None
+                gen_stats_valid  = []
+                if args.adaptive_gen and quant_name != "fp16":
+                    adaptive_draft_hook_gen = make_kv_hook(
+                        lib, k_names, v_names, args.n_pos_per_embd,
+                        use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
+                        default_group_size=args.quant_group_size,
+                        n_sink=0, n_recent=0,
+                        asym=args.asym,
+                        quant_fn_factory=_factory if args.save_bins else None,
+                        profile=kv_prof)
+                    print(f"  [adaptive-gen] draft={quant_name} window={args.adaptive_window}",
+                          flush=True)
+                    gen_results = run_adaptive_gen(
+                        examples, adaptive_draft_hook_gen, k_group_size, v_group_size)
+                    gen_pregenerated = gen_results
+                    gen_stats_valid  = [r for r in gen_results if r is not None]
+                    if gen_stats_valid:
+                        mg_acc   = sum(r["acceptance_rate"] for r in gen_stats_valid) / len(gen_stats_valid)
+                        mg_dfrac = sum(r["draft_fraction"]  for r in gen_stats_valid) / len(gen_stats_valid)
+                        print(f"  [adaptive-gen] mean_acceptance={mg_acc:.3f}  "
+                              f"mean_draft_frac={mg_dfrac:.3f}", flush=True)
+                    if args.save_per_example:
+                        _per_example_results[f"{quant_name}__adaptive_gen"] = gen_results
+
                 mean_score, nt, per_ex_q, gl = eval_accuracy_pass(
                     examples, gold_answers,
                     kv_hook=kv_hook,
                     k_group_size=k_group_size,
-                    v_group_size=v_group_size)
+                    v_group_size=v_group_size,
+                    pregenerated=gen_pregenerated)
                 metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
                 elapsed = time.time() - t0
                 entry = {"ppl": None, "mean_kl": None, "n_tokens": None,
@@ -1396,6 +1714,13 @@ def main():
                         "mean_draft_frac":   mean_draft_frac,
                         "n_all_ok":          n_all_ok,
                         "n_examples":        len(valid),
+                    }
+                if args.adaptive_gen and quant_name != "fp16" and gen_stats_valid:
+                    entry["adaptive_gen"] = {
+                        "window_size":     args.adaptive_window,
+                        "mean_acceptance": mg_acc,
+                        "mean_draft_frac": mg_dfrac,
+                        "n_examples":      len(gen_stats_valid),
                     }
                 if args.save_per_example:
                     _per_example_results[quant_name] = per_ex_q
@@ -1455,6 +1780,10 @@ def main():
                     print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  ({elapsed:.1f}s)", flush=True)
             results[quant_name] = entry
             save_results(results)
+            if kv_prof is not None:
+                profile_agg[quant_name] = kv_prof.to_dict()
+                for line in kv_prof.summary_lines():
+                    print(line, flush=True)
             if args.save_bins and _trackers:
                 _bins_data[quant_name] = {n: t.to_dict() for n, t in _trackers.items()}
 
@@ -1475,6 +1804,10 @@ def main():
             print(f"Diagnostics saved to {args.save_diags}", flush=True)
         if args.show_text:
             show_predictions()
+        if args.profile_kv_out and profile_agg:
+            with open(args.profile_kv_out, "w", encoding="utf-8") as f:
+                json.dump(profile_agg, f, indent=2)
+            print(f"\nKV profile JSON → {args.profile_kv_out}", flush=True)
         lib.llama_free(ctx)
         lib.llama_model_free(model)
         lib.llama_backend_free()
@@ -1564,6 +1897,8 @@ def main():
         for quant_name in args.quants:
             if quant_name == "fp16":
                 continue
+            if kv_prof is not None:
+                kv_prof.reset()
             t0 = time.time()
             print(f"\n[{quant_name}]", flush=True)
 
@@ -1584,7 +1919,8 @@ def main():
                                    k_recent_names=k_recent_names,
                                    v_recent_names=v_recent_names,
                                    asym=args.asym,
-                                   quant_fn_factory=_factory if args.save_bins else None)
+                                   quant_fn_factory=_factory if args.save_bins else None,
+                                   profile=kv_prof)
 
             all_lps = []
             all_kls = []
@@ -1619,6 +1955,10 @@ def main():
             print(f"  => {ppl_str}  kl={entry['mean_kl']:.4f}  ({elapsed:.1f}s)", flush=True)
             results[quant_name] = entry
             save_results(results)
+            if kv_prof is not None:
+                profile_agg[quant_name] = kv_prof.to_dict()
+                for line in kv_prof.summary_lines():
+                    print(line, flush=True)
             if args.save_bins and _trackers:
                 _bins_data[quant_name] = {n: t.to_dict() for n, t in _trackers.items()}
 
@@ -1639,6 +1979,10 @@ def main():
             print(f"Diagnostics saved to {args.save_diags}", flush=True)
         if args.show_text:
             show_predictions()
+        if args.profile_kv_out and profile_agg:
+            with open(args.profile_kv_out, "w", encoding="utf-8") as f:
+                json.dump(profile_agg, f, indent=2)
+            print(f"\nKV profile JSON → {args.profile_kv_out}", flush=True)
         print(f"\nDone. Results in {args.out}")
         lib.llama_free(ctx)
         lib.llama_model_free(model)
@@ -1739,6 +2083,8 @@ def main():
     for quant_name in args.quants:
         if quant_name == "fp16":
             continue
+        if kv_prof is not None:
+            kv_prof.reset()
         t0 = time.time()
         print(f"\n[{quant_name}]", flush=True)
 
@@ -1759,7 +2105,8 @@ def main():
                                k_recent_names=k_recent_names,
                                v_recent_names=v_recent_names,
                                asym=args.asym,
-                               quant_fn_factory=_factory if args.save_bins else None)
+                               quant_fn_factory=_factory if args.save_bins else None,
+                               profile=kv_prof)
 
         all_lp = []
         all_kl = []
@@ -1785,6 +2132,10 @@ def main():
         print(f"  => PPL={ppl:.4f}  kl={mean_kl:.4f}  ({elapsed:.1f}s)", flush=True)
         results[quant_name] = {"ppl": ppl, "mean_kl": mean_kl, "n_tokens": len(all_lp)}
         save_results(results)
+        if kv_prof is not None:
+            profile_agg[quant_name] = kv_prof.to_dict()
+            for line in kv_prof.summary_lines():
+                print(line, flush=True)
         if args.save_bins and _trackers:
             _bins_data[quant_name] = {n: t.to_dict() for n, t in _trackers.items()}
 
@@ -1808,6 +2159,10 @@ def main():
         with open(args.save_diags, "w") as f:
             json.dump(out, f)
         print(f"Diagnostics saved to {args.save_diags}")
+    if args.profile_kv_out and profile_agg:
+        with open(args.profile_kv_out, "w", encoding="utf-8") as f:
+            json.dump(profile_agg, f, indent=2)
+        print(f"\nKV profile JSON → {args.profile_kv_out}", flush=True)
     print(f"\nDone. Results in {args.out}")
 
     lib.llama_free(ctx)
