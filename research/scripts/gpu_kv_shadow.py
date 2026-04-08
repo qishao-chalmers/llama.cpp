@@ -41,11 +41,12 @@ def _copyto_d2d(dst_u8, src_u8) -> None:
 class GpuKvShadowCheckpoint:
     """One KV snapshot: per-layer raw byte copies of K and V (device memory)."""
 
-    __slots__ = ("_layers",)
+    __slots__ = ("_layers", "_n_cells_saved")
 
     def __init__(self) -> None:
         self._layers: list[tuple[object, object, int, int]] | None = None
         # Each entry: (k_uint8_cp, v_uint8_cp, nbytes_k, nbytes_v)
+        self._n_cells_saved: int = 0   # logical KV length when save() ran (layer 0)
 
     def save(self, lib, ctx: llama.ContextPtr, n_layer: int) -> None:
         """Copy live KV tensors to GPU shadow buffers (DtoD)."""
@@ -76,9 +77,16 @@ class GpuKvShadowCheckpoint:
 
         cp.cuda.Device().synchronize()
         self._layers = layers
+        self._n_cells_saved = int(infos[0].n_cells)
 
     def restore(self, lib, ctx: llama.ContextPtr, n_layer: int) -> None:
-        """Copy shadow buffers back to live KV tensors (DtoD)."""
+        """Copy shadow buffers back to live KV tensors (DtoD).
+
+        Live cache may hold *more* logical positions than this snapshot (e.g. restore
+        pre-prefix checkpoint while KV still has bootstrap). We memcpy the snapshot into
+        the leading bytes of each layer buffer, then trim sequence positions
+        [n_cells_saved, inf) so metadata matches the blob restore path.
+        """
         if self._layers is None:
             raise RuntimeError("GpuKvShadowCheckpoint.restore: empty checkpoint")
         if not HAS_CUPY:
@@ -90,18 +98,26 @@ class GpuKvShadowCheckpoint:
             raise RuntimeError(
                 f"layer count mismatch: checkpoint {len(self._layers)} vs ctx {n_filled}")
 
+        n_cells_saved = self._n_cells_saved
+        n_cells_live0 = int(infos[0].n_cells)
+
         for i in range(n_filled):
             info = infos[i]
-            k_dst, v_dst, nbytes_k, nbytes_v = self._layers[i]
+            k_sh, v_sh, nbytes_k, nbytes_v = self._layers[i]
             n_cells = int(info.n_cells)
             k_stride = int(info.k_stride)
             v_stride = int(info.v_stride)
-            if n_cells * k_stride != nbytes_k or n_cells * v_stride != nbytes_v:
+            if n_cells * k_stride < nbytes_k or n_cells * v_stride < nbytes_v:
                 raise RuntimeError(
-                    f"KV shape mismatch at layer {i}: live "
-                    f"{n_cells * k_stride}/{n_cells * v_stride} vs shadow {nbytes_k}/{nbytes_v}")
+                    f"KV buffer at layer {i} too small for checkpoint: live bytes "
+                    f"{n_cells * k_stride}/{n_cells * v_stride} need {nbytes_k}/{nbytes_v}")
 
-            _copyto_d2d(_u8_view(info.k_data, nbytes_k), k_dst)
-            _copyto_d2d(_u8_view(info.v_data, nbytes_v), v_dst)
+            _copyto_d2d(_u8_view(info.k_data, nbytes_k), k_sh)
+            _copyto_d2d(_u8_view(info.v_data, nbytes_v), v_sh)
+
+        # Match llama_state_seq_set_data: logical length must equal snapshot.
+        if n_cells_live0 > n_cells_saved:
+            mem = lib.llama_get_memory(ctx)
+            lib.llama_memory_seq_rm(mem, 0, n_cells_saved, -1)
 
         cp.cuda.Device().synchronize()
