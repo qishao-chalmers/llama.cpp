@@ -26,6 +26,18 @@ def _ptr(x) -> int:
     return int(ctypes.cast(x, ctypes.c_void_p).value)
 
 
+def _u8_view(ptr, nbytes: int):
+    """uint8 CuPy array view of `nbytes` bytes at device pointer `ptr` (UnownedMemory)."""
+    mem = cp.cuda.UnownedMemory(_ptr(ptr), nbytes, owner=None)
+    return cp.ndarray(
+        (nbytes,), dtype=cp.uint8, memptr=cp.cuda.MemoryPointer(mem, 0))
+
+
+def _copyto_d2d(dst_u8, src_u8) -> None:
+    """Device-to-device copy; uses cp.copyto (portable; some CuPy builds lack memcpyDtoD)."""
+    cp.copyto(dst_u8, src_u8)
+
+
 class GpuKvShadowCheckpoint:
     """One KV snapshot: per-layer raw byte copies of K and V (device memory)."""
 
@@ -58,8 +70,8 @@ class GpuKvShadowCheckpoint:
 
             k_dst = cp.empty(nbytes_k, dtype=cp.uint8)
             v_dst = cp.empty(nbytes_v, dtype=cp.uint8)
-            cp.cuda.runtime.memcpyDtoD(k_dst.data.ptr, _ptr(info.k_data), nbytes_k)
-            cp.cuda.runtime.memcpyDtoD(v_dst.data.ptr, _ptr(info.v_data), nbytes_v)
+            _copyto_d2d(k_dst, _u8_view(info.k_data, nbytes_k))
+            _copyto_d2d(v_dst, _u8_view(info.v_data, nbytes_v))
             layers.append((k_dst, v_dst, nbytes_k, nbytes_v))
 
         cp.cuda.Device().synchronize()
@@ -89,7 +101,7 @@ class GpuKvShadowCheckpoint:
                     f"KV shape mismatch at layer {i}: live "
                     f"{n_cells * k_stride}/{n_cells * v_stride} vs shadow {nbytes_k}/{nbytes_v}")
 
-            cp.cuda.runtime.memcpyDtoD(_ptr(info.k_data), k_dst.data.ptr, nbytes_k)
-            cp.cuda.runtime.memcpyDtoD(_ptr(info.v_data), v_dst.data.ptr, nbytes_v)
+            _copyto_d2d(_u8_view(info.k_data, nbytes_k), k_dst)
+            _copyto_d2d(_u8_view(info.v_data, nbytes_v), v_dst)
 
         cp.cuda.Device().synchronize()
