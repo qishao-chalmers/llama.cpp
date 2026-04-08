@@ -986,21 +986,28 @@ def main():
         return sim_results
 
     def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs):
-        """Real adaptive generation: fp16 bootstrap + int4 draft with fp16 verification.
+        """Real adaptive generation: fp16 bootstrap + draft-quant generation + fp16 verification.
 
         Window 0: fp16 generates W tokens (bootstrap / ground truth).
         Windows 1+:
-          a. int4 draft generates W tokens (starting from fp16 KV boundary).
-          b. fp16 verifies draft tokens (prefill, no hook).
-          c. All greedy predictions match → accept, output draft tokens.
-             Any mismatch → reject, fp16 regenerates this window.
+          a. Draft quant generates W tokens (from restored fp16 boundary).
+          b. fp16 verifies draft tokens (replay with kv_hook=None).
+          c. All greedy predictions match → accept; else fp16 regenerates this window.
 
-        GPU path (use_gpu=True): restore via trim_kv_seq (no PCIe).
-          Draft hook only quantizes newly decoded cells; fp16 values at
-          0..prime_pos-1 are never touched, so trimming draft cells is enough.
-        CPU path (use_gpu=False): restore via llama_state_seq_set_data blob.
+        KV save/restore (performance): every checkpoint uses save_kv_state / restore_kv_state
+        (llama_state_seq_get_data / set_data). That serializes the full per-sequence KV blob
+        through CPU bytes. For GPU-backed KV this is a device↔host copy over PCIe each call.
+        Hot path per window (after bootstrap): typically two restores (before draft, before
+        fp16 verify) plus one save after accept/reject — i.e. three full-blob transfers per
+        window attempt, with blob size growing with context length.
 
-        KV invariant: positions 0..prime_pos-1 always hold fp16-derived values.
+        Why not strategies.trim_kv_seq here: draft_hook(ctx, n_new_k=None, n_new_v=None)
+        bulk-quantizes the entire KV cache in place, including the prompt region, so fp16
+        values are overwritten. Restoring fp16 requires the saved blob; trimming tail cells
+        only recovers length metadata, not corrupted prompt cells.
+
+        KV invariant after a successful verify: positions 0..prime_pos-1 hold fp16-derived
+        values; the next draft bulk-quantizes from that fp16 snapshot again.
 
         Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction.
         """
@@ -1008,13 +1015,7 @@ def main():
         results = []
 
         def _restore(kv_boundary):
-            """Restore KV to fp16 boundary state (always uses blob).
-
-            We always restore from a saved blob because the draft phase overwrites
-            KV in-place with int2 values (including the prompt region) before each
-            draft window.  The GPU trim_kv_seq shortcut cannot be used here since
-            it relies on fp16 values never being touched.
-            """
+            """Restore full KV from a CPU blob (PCIe for GPU KV). See run_adaptive_gen docstring."""
             strategies.restore_kv_state(lib, ctx, kv_boundary)
 
         for ei, (pt, _, label) in enumerate(examples):

@@ -152,6 +152,21 @@ def restore_kv_state(lib, ctx, blob: bytes, seq_id=0):
     lib.llama_state_seq_set_data(ctx, buf, len(blob), seq_id)
 
 
+def trim_kv_seq(lib, ctx, pos, seq_id=0):
+    """Remove all KV cells at positions >= pos from seq_id (metadata-only, no PCIe).
+
+    Could avoid blob restore after a draft if the draft hook only wrote new cells and
+    left 0..pos-1 fp16 intact; then prior fp16 would still be valid after trim.
+    run_adaptive_gen does not use this: it calls draft_hook with n_new_k/v=None (bulk
+    quant of the full cache), which overwrites the prompt too, so restore_kv_state is
+    required.
+
+    p1=-1 means "all positions from pos to end".
+    """
+    mem = lib.llama_get_memory(ctx)
+    lib.llama_memory_seq_rm(mem, seq_id, pos, -1)
+
+
 def _single_decode(lib, ctx, token: int, pos: int) -> int:
     """Run one decode step (token at pos). Logits available at index 0. Returns ret code."""
     batch = lib.llama_batch_init(1, 0, 1)
@@ -164,6 +179,44 @@ def _single_decode(lib, ctx, token: int, pos: int) -> int:
     ret = lib.llama_decode(ctx, batch)
     lib.llama_batch_free(batch)
     return ret
+
+
+def generate_window(lib, ctx, n_vocab, first_token, pos_start, W,
+                    kv_hook=None, k_group_size=64, v_group_size=64,
+                    stop_fn=None):
+    """Generate up to W tokens autoregressively starting from first_token.
+
+    first_token is the first output token; it is decoded at pos_start to
+    produce the second token's logits. The last returned token is NOT decoded
+    (its KV is not written) — it serves as the prime token for the next window.
+
+    Returns list of up to W tokens (includes first_token).
+    After return: KV has positions pos_start .. pos_start+len(output)-2 written.
+    """
+    tokens = [first_token]
+    token  = first_token
+    n_pending_k = n_pending_v = 0
+
+    for _ in range(W - 1):
+        if stop_fn and stop_fn(token):
+            break
+        ret = _single_decode(lib, ctx, token, pos_start + len(tokens) - 1)
+        if ret != 0:
+            break
+        if kv_hook:
+            n_pending_k += 1
+            n_pending_v += 1
+            n_pending_k, n_pending_v = _fire_hook(
+                kv_hook, ctx, n_pending_k, n_pending_v, k_group_size, v_group_size)
+        ptr    = lib.llama_get_logits_ith(ctx, 0)
+        logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+        token  = int(np.argmax(logits))
+        tokens.append(token)
+
+    if kv_hook:
+        _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v)
+
+    return tokens
 
 
 def verify_window(lib, ctx, n_vocab, window_tokens, pos_start,

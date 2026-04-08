@@ -21,6 +21,7 @@ Usage (called from run_sweep.py when GPU mode is active):
 """
 
 import ctypes
+import time
 
 import llama_bindings as llama
 
@@ -41,8 +42,44 @@ def _quantize_inplace_gpu(arr, fn_name, dim_group_size=None):
     if fn_name == "fp16":
         return   # no-op
 
-    # Parse bits and axis from name: intN_ch → axis=0, intN_tok → axis=1, intN → axis=None
     import re
+
+    # ── int3_half_ABCD_ch/tok: 4-level non-uniform quantizer ──────────────
+    m_half = re.match(r"int3_half_(\d{4})(?:_(ch|tok))?$", fn_name)
+    if m_half:
+        digits  = m_half.group(1)
+        suffix  = m_half.group(2)   # "ch", "tok", or None
+        indices = [int(d) for d in digits]
+        levels  = cp.array([i / 7.0 for i in indices], dtype=cp.float32)  # [4]
+        f32     = arr.astype(cp.float32)
+
+        if suffix == "ch":
+            xmin = f32.min(axis=0)                              # [n_embd]
+            xmax = f32.max(axis=0)
+            rng  = cp.where(xmax - xmin == 0, cp.float32(1.0), xmax - xmin)
+            cb   = xmin[:, None] + levels[None, :] * rng[:, None]  # [n_embd, 4]
+            diff = cp.abs(f32[:, :, None] - cb[None, :, :])        # [n_tok, n_embd, 4]
+            idx  = diff.argmin(axis=-1)                             # [n_tok, n_embd]
+            arr[:] = cb[cp.arange(f32.shape[1])[None, :], idx].astype(cp.float16)
+        elif suffix == "tok":
+            xmin = f32.min(axis=1)                              # [n_tok]
+            xmax = f32.max(axis=1)
+            rng  = cp.where(xmax - xmin == 0, cp.float32(1.0), xmax - xmin)
+            cb   = xmin[:, None] + levels[None, :] * rng[:, None]  # [n_tok, 4]
+            diff = cp.abs(f32[:, :, None] - cb[:, None, :])        # [n_tok, n_embd, 4]
+            idx  = diff.argmin(axis=-1)                             # [n_tok, n_embd]
+            arr[:] = cb[cp.arange(f32.shape[0])[:, None], idx].astype(cp.float16)
+        else:
+            xmin  = float(f32.min())
+            xmax  = float(f32.max())
+            rng   = xmax - xmin if (xmax - xmin) != 0 else 1.0
+            cb    = cp.array(xmin, dtype=cp.float32) + levels * cp.float32(rng)
+            diff  = cp.abs(f32[..., None] - cb)
+            idx   = diff.argmin(axis=-1)
+            arr[:] = cb[idx].astype(cp.float16)
+        return
+
+    # Parse bits and axis from name: intN_ch → axis=0, intN_tok → axis=1, intN → axis=None
     m = re.match(r"int(\d+)(?:_(ch|tok))?(?:_g\d+)?$", fn_name)
     if m is None:
         raise ValueError(f"gpu_quant: unsupported quant name '{fn_name}'")
@@ -92,7 +129,7 @@ def _quantize_inplace_gpu(arr, fn_name, dim_group_size=None):
 
 
 def apply_kv_hook_gpu(lib, ctx, n_layer, k_fn_names, v_fn_names,
-                      n_new_k=None, n_new_v=None):
+                      n_new_k=None, n_new_v=None, profile=None):
     """
     Quantize the last n_new_k K cells and n_new_v V cells in-place on the GPU.
 
@@ -103,9 +140,12 @@ def apply_kv_hook_gpu(lib, ctx, n_layer, k_fn_names, v_fn_names,
     v_fn_names  — quant name for V: single str (all layers) or list[str] (one per layer)
     n_new_k     — quantize last N K cells (None = all)
     n_new_v     — quantize last N V cells (None = all)
+    profile     — optional kv_profile.KvProfile; accumulates gpu_kv_s per call (after sync).
     """
     if not HAS_CUPY:
         raise RuntimeError("gpu_quant requires CuPy: pip install cupy-cuda12x")
+
+    t0 = time.perf_counter() if profile is not None else None
 
     infos = (llama.LlamaKVLayerInfo * n_layer)()
     n_filled = lib.llama_get_kv_layer_info(ctx, infos, n_layer)
@@ -155,8 +195,12 @@ def apply_kv_hook_gpu(lib, ctx, n_layer, k_fn_names, v_fn_names,
 
     cp.cuda.Device().synchronize()
 
+    if profile is not None:
+        profile.gpu_kv_s += time.perf_counter() - t0
+        profile.n_gpu_kv_hook_calls += 1
 
-def make_kv_hook_gpu(lib, ctx, k_fn_names, v_fn_names, n_layer):
+
+def make_kv_hook_gpu(lib, ctx, k_fn_names, v_fn_names, n_layer, profile=None):
     """
     Return a hook(ctx, n_new_k=None, n_new_v=None) callable that quantizes
     KV in-place on the GPU.  Same interface as parse_state.apply_kv_hook.
@@ -167,8 +211,8 @@ def make_kv_hook_gpu(lib, ctx, k_fn_names, v_fn_names, n_layer):
         raise RuntimeError("gpu_quant requires CuPy: pip install cupy-cuda12x")
 
     def hook(ctx, n_new_k=None, n_new_v=None,
-             _lib=lib, _k=k_fn_names, _v=v_fn_names, _nl=n_layer):
+             _lib=lib, _k=k_fn_names, _v=v_fn_names, _nl=n_layer, _prof=profile, **_):
         apply_kv_hook_gpu(_lib, ctx, _nl, _k, _v,
-                          n_new_k=n_new_k, n_new_v=n_new_v)
+                          n_new_k=n_new_k, n_new_v=n_new_v, profile=_prof)
 
     return hook

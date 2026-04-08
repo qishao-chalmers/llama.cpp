@@ -198,6 +198,9 @@ def setup_lib(lib):
     lib.llama_get_memory.argtypes = [ContextPtr]
     lib.llama_memory_clear.restype  = None
     lib.llama_memory_clear.argtypes = [MemoryPtr, ctypes.c_bool]
+    lib.llama_memory_seq_rm.restype  = ctypes.c_bool
+    lib.llama_memory_seq_rm.argtypes = [MemoryPtr, ctypes.c_int32,
+                                        ctypes.c_int32, ctypes.c_int32]
 
     # GPU-side KV layer info (used by gpu_quant.py)
     lib.llama_get_kv_layer_info.restype  = ctypes.c_int32
@@ -250,7 +253,7 @@ def load_lib(path=None):
     import sys
     def _log_cb(level, text, user_data):
         s = text.decode("utf-8", errors="replace")
-        if "state_read_meta" in s:
+        if "state_read_meta" in s or "CUDA graph" in s:
             return
         sys.stderr.write(s)
     lib._log_cb = _LOG_CB_TYPE(_log_cb)  # keep reference to prevent GC

@@ -36,6 +36,7 @@ GGML types: 0=F32, 1=F16, 2=Q4_0, ..., 30=BF16
 
 import ctypes
 import struct
+import time
 import numpy as np
 
 # GGML type to numpy dtype
@@ -295,7 +296,7 @@ def pack_kv_state(state: KVState, n_pos_per_embd: int = 1) -> bytearray:
 
 def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
                   n_pos_per_embd: int = 1, n_new_k=None, n_new_v=None,
-                  start_k=None, start_v=None):
+                  start_k=None, start_v=None, profile=None):
     """
     Get KV state for seq_id, apply k_fn/v_fn to each layer's K/V arrays,
     write modified state back.
@@ -314,17 +315,28 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
              are at a specific position, not the tail.
     start_v: same as start_k, applied to V.
 
+    profile: optional kv_profile.KvProfile — if set, accumulates per-phase CPU times.
+
     Returns: KVState (with modified arrays)
     """
     if k_fn is None and v_fn is None:
         return None
 
+    if profile is not None:
+        profile.n_hook_calls += 1
+
+    t0 = time.perf_counter()
     sz = lib.llama_state_seq_get_size(ctx, seq_id)
     buf = ctypes.create_string_buffer(sz)
     n_written = lib.llama_state_seq_get_data(ctx, buf, sz, seq_id)
     assert n_written > 0, "llama_state_seq_get_data returned 0"
+    if profile is not None:
+        profile.kv_get_s += time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     state = parse_kv_state(bytes(buf[:n_written]), n_pos_per_embd)
+    if profile is not None:
+        profile.kv_parse_s += time.perf_counter() - t0
 
     # Normalize k_fn / v_fn: accept single callable or list[callable] (one per layer)
     if callable(k_fn):
@@ -332,18 +344,29 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
     if callable(v_fn):
         v_fn = [v_fn] * state.n_layer
 
+    def _q(fn, arr):
+        if profile is None:
+            return fn(arr)
+        tq = time.perf_counter()
+        out = fn(arr)
+        profile.kv_quant_s += time.perf_counter() - tq
+        return out
+
     def _apply_fn(arr, fn, n_new, start):
         if fn is None or n_new == 0:
             return arr
         if n_new is None:                          # quantize all (prefill)
-            return fn(arr)
+            return _q(fn, arr)
         if start is not None:                      # absolute offset (recent-window mode)
-            end = start + n_new
-            return np.concatenate([arr[:start], fn(arr[start:end]), arr[end:]], axis=0)
+            end = min(start + n_new, arr.shape[0])
+            start = min(start, arr.shape[0])
+            if end <= start:
+                return arr
+            return np.concatenate([arr[:start], _q(fn, arr[start:end]), arr[end:]], axis=0)
         if n_new < state.cell_count:               # last-N mode (default)
             s = state.cell_count - n_new
-            return np.concatenate([arr[:s], fn(arr[s:])], axis=0)
-        return fn(arr)                             # n_new >= cell_count: quantize all
+            return np.concatenate([arr[:s], _q(fn, arr[s:])], axis=0)
+        return _q(fn, arr)                         # n_new >= cell_count: quantize all
 
     if k_fn is not None:
         state.k = [
@@ -363,10 +386,16 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
             for il, arr in enumerate(state.v)
         ]
 
+    t0 = time.perf_counter()
     modified_blob = pack_kv_state(state, n_pos_per_embd)
+    if profile is not None:
+        profile.kv_pack_s += time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     c_buf = ctypes.c_char_p(bytes(modified_blob))
     n_read = lib.llama_state_seq_set_data(ctx, c_buf, len(modified_blob), seq_id)
     assert n_read > 0, "llama_state_seq_set_data returned 0"
+    if profile is not None:
+        profile.kv_set_s += time.perf_counter() - t0
 
     return state
