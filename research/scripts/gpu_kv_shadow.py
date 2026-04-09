@@ -83,7 +83,7 @@ class GpuKvShadowCheckpoint:
         """Copy shadow buffers back to live KV tensors (DtoD).
 
         Live cache may hold *more* logical positions than this snapshot (e.g. restore
-        pre-prefix checkpoint while KV still has bootstrap). We memcpy the snapshot into
+        pre-prefix checkpoint while KV still has bootstrap window tokens). We memcpy the snapshot into
         the leading bytes of each layer buffer, then trim sequence positions
         [n_cells_saved, inf) so metadata matches the blob restore path.
         """

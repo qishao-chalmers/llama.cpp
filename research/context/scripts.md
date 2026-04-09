@@ -68,6 +68,8 @@ Returns `RunResult(log_probs, log_dists, kl_divs, top1s, diags)` namedtuple (las
       drops when model's own continuations become incoherent
 - `run_chunk_token_by_token(...)` — same interface, no batch prefill
 - `run_structured(...)` — wraps run_chunk_batch_prefill for (prompt_tokens, completion_tokens) pairs
+- `adaptive_verify_accept(logits, token_id, top_k, top_p)` — greedy / top‑K / nucleus top‑p acceptance for adaptive sim/gen
+- `verify_window(..., return_logits=False)` — optional `(greedy, logits_rows)` for soft acceptance
 - `_collect_logits(...)` — returns current top1 so run functions track prev_top1 for self_surp
 - `run_generate(lib, ctx, prompt_tokens, n_vocab, kv_hook=None, max_new_tokens=512, eos_token_id=None, k_group_size=128, v_group_size=128)`
   - Greedy autoregressive generation (for accuracy evaluation, not PPL)
@@ -169,6 +171,27 @@ python3 research/scripts/run_sweep.py model.gguf data/gsm8k_test.jsonl \
 - Default regex `####\s*([\d,]+)` matches GSM8K format `#### 42`
 - **Display note**: `--show-text` prints only first 300 chars of generation, but regex runs on full text.
   If the match is beyond 300 chars, display shows `'head...' ... 'context_around_match'` — pred is still correct.
+
+### Adaptive sim / adaptive gen (`--eval-accuracy`, structured corpus)
+| Flag | Role |
+|------|------|
+| `--adaptive-sim` | Window-wise draft vs fp16 reference (simulation). |
+| `--adaptive-gen` | Bootstrap window (fp16) + quant rollout windows + verifier replay; may fp16-fallback per window. |
+| `--adaptive-window W` | Tokens per bootstrap / quant rollout window. |
+| `--verifier-quant` | Verifier KV mode (`fp16` = batched fp16 replay where safe). |
+| `--adaptive-verify-top-k K` | Accept draft token if in verifier **top‑K** (mutually exclusive with top‑p). |
+| `--adaptive-verify-top-p P` | **Nucleus** acceptance on verifier logits `0<P≤1` (mutually exclusive with top‑k). |
+| *(default)* | Greedy acceptance (argmax match). |
+| `--qviz-html FILE` | Write grayscale HTML segment qviz (tall=dark, short=light; int2→fp16). |
+| `--qviz-ansi` | Print qviz with ANSI 24-bit background colors instead of ASCII `:` rows. |
+
+**Hooks:** `--sink-tokens`, `--recent-tokens`, `--quant-sink`, `--quant-recent` apply to adaptive draft/verifier hooks. *Caveat:* three-zone hooks track a global decode counter that is **not** reset on KV restore — use `0/0` unless you accept that interaction.
+
+**Code:** `strategies.adaptive_verify_accept()`; `verify_window(..., return_logits=True)` when top‑k/p needs full logits; fp16 verifier uses batched prefill for greedy path.
+
+**Segment qviz (ASCII, up to 8 lines):** After `segments:`, prints rows `qviz1`…`qviz8` (top→bottom), width 64 columns ≈ `n_tok/64` tokens per column. **fp16** = 8 rows of `:`; **int8** = 4 rows of `:`; **int4** = 2 rows of `:`; **int3** = 2 rows (`.` top, `:` bottom); **int2** = one `:`; other quants unchanged. Leading all-space rows are trimmed. JSON: `segment_quant_viz` (list of 1–8 strings). **`--qviz-html`**: HTML table per example (grayscale cell color by quant; stack height unchanged); **`--qviz-ansi`**: terminal colored cells (replaces ASCII lines).
+
+**vs_gold (`--adaptive-gen`):** Per-example line `vs_gold: cmp=… correct=… draft_ok=… draft_bad=… fp16_ok=… fp16_bad=…` compares each generated token to the **tokenized dataset completion** (same `completion` field as structured JSONL) for `i < min(gen_len, completion_len)`. `draft_*` counts tokens emitted from **accepted quant rollouts**; `fp16_*` counts **bootstrap + fp16 fallback** tokens. JSON: `ref_token_stats` per example; run-level `ref_token_stats_sum` in `adaptive_gen`.
 
 ## plot_entropy.py
 Reads the JSON from `--save-diags` and plots per-token diagnostics vs decode position.

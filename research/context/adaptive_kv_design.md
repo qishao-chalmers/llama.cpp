@@ -28,6 +28,8 @@ autoregressive decode — same insight as speculative decoding's batch verificat
 
 ### Phase 1 — Bootstrap (conservative, first W tokens)
 
+**Terminology (aligned with `context/left_tasks.md` and `run_adaptive_gen`):** the first **W** fp16 tokens form the **bootstrap window**; each subsequent **W**-token block generated in draft quant is a **quant rollout window**, verified under fp16 (or `--verifier-quant`).
+
 ```
 fp16:  autoregressive decode W tokens     → tokens[0:W]   (slow, ground truth)
 int4:  prefill tokens[0:W] with int4 KV  → compare logit distributions  (fast)
@@ -36,7 +38,7 @@ int4:  prefill tokens[0:W] with int4 KV  → compare logit distributions  (fast)
 - Check: KL(int4_logits, fp16_logits) < threshold (or exact token match)
 - Accepted → switch to fast phase. Rejected → stay fp16.
 
-### Phase 2 — Fast phase (repeating)
+### Phase 2 — Fast phase (repeating quant rollout windows)
 
 ```
 int4:  autoregressive decode W tokens             → tokens_draft[P:P+W]  (fast)

@@ -253,7 +253,7 @@ def load_lib(path=None):
     import sys
     def _log_cb(level, text, user_data):
         s = text.decode("utf-8", errors="replace")
-        if "state_read_meta" in s or "CUDA graph" in s:
+        if "state_read_meta" in s or "CUDA graph" in s or "create_tensor" in s:
             return
         sys.stderr.write(s)
     lib._log_cb = _LOG_CB_TYPE(_log_cb)  # keep reference to prevent GC

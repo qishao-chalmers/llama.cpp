@@ -10,8 +10,9 @@ Code: `research/scripts/` — Python ctypes wrapping `build_release/bin/libllama
 | `context/cursor_handoff.md` | **Cursor agents: start here.** Full project state, script inventory, what's done/pending, Claude Code memory locations |
 | `context/adaptive_kv_design.md` | **Adaptive KV cache design.** Base+delta split storage, adaptive decode scheme, comparison with QuantSpec/TurboQuant/KIVI, performance model, next steps |
 | `context/tasks.md` | Task guide: wikitext PPL / GSM8K accuracy / NIAH / code, full commands |
+| `context/left_tasks.md` | Deferred ideas; glossary: **bootstrap window** vs **quant rollout window** |
 | `context/analysis.md` | Analysis tools: plot_entropy.py, analyze_alarms.py, plot_niah.py |
-| `context/scripts.md` | Core infrastructure: run_sweep.py CLI flags, module architecture, quant types |
+| `context/scripts.md` | Core infrastructure: run_sweep.py CLI, adaptive sim/gen (top‑k/p, zones), quant types |
 | `context/strategies.md` | Quantization strategies, group-size semantics, three-zone KIVI |
 | `context/api.md` | ctypes bindings, struct layouts, state blob format, critical API pitfalls |
 | `context/results.md` | All experiment results tables and key findings |

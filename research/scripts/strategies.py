@@ -36,6 +36,7 @@ where P = fp16 distribution, Q = quantized distribution.
 
 import ctypes
 from collections import namedtuple
+from typing import Optional
 
 import numpy as np
 
@@ -157,14 +158,41 @@ def trim_kv_seq(lib, ctx, pos, seq_id=0):
 
     Could avoid blob restore after a draft if the draft hook only wrote new cells and
     left 0..pos-1 fp16 intact; then prior fp16 would still be valid after trim.
-    run_adaptive_gen does not use this: it calls draft_hook with n_new_k/v=None (bulk
-    quant of the full cache), which overwrites the prompt too, so restore_kv_state is
-    required.
+    run_adaptive_gen does not use this: each quant rollout window calls draft_hook with
+    n_new_k/v=None (bulk quant of the full cache), which overwrites the prompt too, so
+    restore_kv_state is required.
 
     p1=-1 means "all positions from pos to end".
     """
     mem = lib.llama_get_memory(ctx)
     lib.llama_memory_seq_rm(mem, seq_id, pos, -1)
+
+
+def adaptive_verify_accept(logits: np.ndarray, token_id: int,
+                           top_k: Optional[int], top_p: Optional[float]) -> bool:
+    """Whether token_id passes verifier acceptance under greedy, top-k, or top-p.
+
+    If top_p is set (0<p<=1), uses nucleus top-p. Else if top_k is set (>=1), uses top-k.
+    If both are None, uses greedy argmax match.
+    """
+    if top_p is not None and 0.0 < top_p <= 1.0:
+        m = float(np.max(logits))
+        pr = np.exp(logits - m)
+        pr = pr / np.sum(pr)
+        order = np.argsort(-pr)
+        cum = 0.0
+        nucleus = set()
+        for i in order:
+            cum += float(pr[i])
+            nucleus.add(int(i))
+            if cum >= top_p - 1e-12:
+                break
+        return int(token_id) in nucleus
+    if top_k is not None and top_k >= 1:
+        k = min(int(top_k), logits.size)
+        part = np.argpartition(logits, -k)[-k:]
+        return int(token_id) in part
+    return int(np.argmax(logits)) == int(token_id)
 
 
 def _single_decode(lib, ctx, token: int, pos: int) -> int:
@@ -181,10 +209,49 @@ def _single_decode(lib, ctx, token: int, pos: int) -> int:
     return ret
 
 
+def _verify_window_batched_fp16(lib, ctx, n_vocab, window_tokens, pos_start,
+                                return_logits: bool = False):
+    """Teacher-forced prefill: one llama_decode for all tokens (no KV hook).
+
+    Equivalent to sequential _single_decode per token for causal models; faster
+    when verifying under fp16 (kv_hook=None in verify_window).
+    If return_logits, returns (greedy, list of length-L full-vocab logits rows).
+    """
+    L = len(window_tokens)
+    if L == 0:
+        return ([], []) if return_logits else []
+    batch = lib.llama_batch_init(L, 0, 1)
+    for i in range(L):
+        batch.token[i]     = window_tokens[i]
+        batch.pos[i]       = pos_start + i
+        batch.n_seq_id[i]  = 1
+        batch.seq_id[i][0] = 0
+        batch.logits[i]    = 1
+    batch.n_tokens = L
+    ret = lib.llama_decode(ctx, batch)
+    lib.llama_batch_free(batch)
+    if ret != 0:
+        raise RuntimeError(f"_verify_window_batched_fp16: llama_decode failed: {ret}")
+    greedy = []
+    logits_rows = [] if return_logits else None
+    for i in range(L):
+        ptr = lib.llama_get_logits_ith(ctx, i)
+        logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+        greedy.append(int(np.argmax(logits)))
+        if return_logits:
+            logits_rows.append(logits)
+    if return_logits:
+        return greedy, logits_rows
+    return greedy
+
+
 def generate_window(lib, ctx, n_vocab, first_token, pos_start, W,
                     kv_hook=None, k_group_size=64, v_group_size=64,
                     stop_fn=None):
     """Generate up to W tokens autoregressively starting from first_token.
+
+    In run_adaptive_gen: used for the fp16 bootstrap window (kv_hook=None) and for
+    each draft-quant quant rollout window (kv_hook=draft_hook).
 
     first_token is the first output token; it is decoded at pos_start to
     produce the second token's logits. The last returned token is NOT decoded
@@ -220,15 +287,34 @@ def generate_window(lib, ctx, n_vocab, first_token, pos_start, W,
 
 
 def verify_window(lib, ctx, n_vocab, window_tokens, pos_start,
-                  kv_hook=None, k_group_size=64, v_group_size=64):
-    """Feed window_tokens one-by-one (starting at pos_start) with kv_hook active.
+                  kv_hook=None, k_group_size=64, v_group_size=64,
+                  return_logits: bool = False):
+    """Feed window_tokens (starting at pos_start) and return greedy next-token preds.
+
+    When kv_hook is None (fp16 verifier): one batched prefill (_verify_window_batched_fp16)
+    — same semantics as sequential decode, fewer llama_decode calls.
+
+    When kv_hook is set (verifier quant): sequential decode only. Each step must run
+    decode → hook (quantize new KV) → read logits so later positions attend to a
+    quantized prefix. A single batched prefill produces logits under fp16 KV for the
+    whole window; post-hoc quantization of cells cannot fix those logits, so there
+    is no drop-in batched equivalent without a different acceptance rule or backend
+    support for interleaved quant in the graph.
+
+    If return_logits is True, returns (greedy, logits_rows) where logits_rows[i]
+    is the full vocab logits after feeding window_tokens[i].
 
     Returns greedy[i] = argmax after feeding window_tokens[i], i.e. the predicted
     token for position pos_start+i+1.  Caller checks:
       greedy[i] == window_tokens[i+1]   for i in 0..len-2   (intra-window)
       greedy[-1] == <first token of next window>             (cross-window, optional)
     """
+    if kv_hook is None:
+        return _verify_window_batched_fp16(
+            lib, ctx, n_vocab, window_tokens, pos_start, return_logits=return_logits)
+
     greedy = []
+    logits_rows = [] if return_logits else None
     n_pending_k = n_pending_v = 0
     for i, tok in enumerate(window_tokens):
         ret = _single_decode(lib, ctx, tok, pos_start + i)
@@ -242,8 +328,12 @@ def verify_window(lib, ctx, n_vocab, window_tokens, pos_start,
         ptr = lib.llama_get_logits_ith(ctx, 0)
         logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
         greedy.append(int(np.argmax(logits)))
+        if return_logits:
+            logits_rows.append(logits)
     if kv_hook:
         _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v)
+    if return_logits:
+        return greedy, logits_rows
     return greedy
 
 
