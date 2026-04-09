@@ -1507,6 +1507,7 @@ def main():
                     off = 0
                     w0_ok = True
                     n_match = 0
+                    bootstrap_win_ok = 0  # full rollout-style windows accepted (window_ok)
 
                     if not bootstrap_ref_tokens:
                         w0_ok = False
@@ -1640,16 +1641,20 @@ def main():
                                         v_logits, draft_tokens[0], av_k, av_p))
                             break
 
+                        bootstrap_win_ok += 1
                         kv_roll = _save_ckpt_pair()
                         prime_tok_bs = draft_tokens[-1]
                         prime_pos_bs = pos_start + len(draft_tokens) - 1
                         off += len(draft_tokens)
 
                     # ── Per-candidate bootstrap diagnostic ───────────────
+                    _ver_lbl = verifier_quant_name if ver_hook else "fp16"
                     if not w0_ok:
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
-                                  f"(verifier prefix {n_match}/{len(bootstrap_ref_tokens)})",
+                                  f"(verifier prefix {n_match}/{len(bootstrap_ref_tokens)}) | "
+                                  f"window_ok {bootstrap_win_ok} full windows vs {_ver_lbl} "
+                                  f"(then fail; rollout-style)",
                                   flush=True)
                         else:
                             print(f"      {cand}: bootstrap FAIL", flush=True)
@@ -1766,6 +1771,8 @@ def main():
                     probe_rate = probe_accepted / max(probe_attempted, 1)
                     probe_tag = "PASS" if probe_rate >= probe_min_rate else f"FAIL (<{probe_min_rate:.2f})"
                     print(f"      {cand}: bootstrap OK "
+                          f"| {off}/{len(bootstrap_ref_tokens)} tok vs {_ver_lbl} "
+                          f"| {bootstrap_win_ok} windows accepted "
                           f"→ probe {probe_accepted}/{probe_attempted}={probe_rate:.2f} {probe_tag}",
                           flush=True)
                     scored.append({
