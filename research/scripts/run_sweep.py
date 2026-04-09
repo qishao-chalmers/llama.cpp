@@ -1348,6 +1348,25 @@ def main():
             else:
                 strategies.restore_kv_state(lib, ctx, ck)
 
+        def _save_ckpt_pair():
+            """GPU D2D snapshot plus CPU seq bytes; restore prefers GPU, falls back to CPU."""
+            if use_gpu_shadow:
+                g = gpu_kv_shadow.GpuKvShadowCheckpoint()
+                g.save(lib, ctx, n_layer)
+                c = strategies.save_kv_state(lib, ctx)
+                return (g, c)
+            return (None, strategies.save_kv_state(lib, ctx))
+
+        def _restore_ckpt_pair(pair):
+            g, c = pair
+            if g is not None:
+                try:
+                    g.restore(lib, ctx, n_layer)
+                    return
+                except RuntimeError:
+                    pass
+            strategies.restore_kv_state(lib, ctx, c)
+
         for ei, (pt, ct, label) in enumerate(examples):
             max_ctx_avail = args.n_ctx - len(pt) - 1
             max_gen = min(args.max_gen_tokens, max_ctx_avail)
@@ -1401,12 +1420,6 @@ def main():
 
             logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
 
-            # fp16 checkpoint after full prompt (KV 0..n_pt-1), before bootstrap gen.
-            # Must be saved here — not by restoring pre_prime after bootstrap — or GPU KV
-            # shadow shrinks the live buffer and restore(kv_boundary) fails (checkpoint
-            # larger than live allocation).
-            kv_after_prompt_fp16 = _save_ckpt()
-
             # ── Bootstrap window: fp16 generates W_b tokens ─────────────────
             bootstrap_tokens = strategies.generate_window(
                 lib, ctx, n_vocab, int(np.argmax(logits)),
@@ -1419,7 +1432,7 @@ def main():
             segments: list[tuple[str, int]] = []
             _emit_segment(segments, "fp16", len(bootstrap_tokens))
             # KV = 0..n_pt+len(bootstrap_tokens)-2 (all fp16)
-            kv_boundary = _save_ckpt()
+            kv_boundary = _save_ckpt_pair()
             prime_tok = bootstrap_tokens[-1]
             prime_pos = n_pt + len(bootstrap_tokens) - 1
 
@@ -1456,10 +1469,7 @@ def main():
                         asym=args.asym, quant_fn_factory=None,
                         profile=kv_prof)
 
-                    if kv_after_prompt_fp16 is None:
-                        continue
-
-                    kv_roll = kv_after_prompt_fp16
+                    kv_roll = None  # fp16 teacher after each chunk (pair or gpu/cpu ckpt)
                     prime_tok_bs = pt[-1]
                     prime_pos_bs = n_pt - 1
                     off = 0
@@ -1474,15 +1484,31 @@ def main():
                         pos_start = prime_pos_bs + 1
                         ref_chunk = bootstrap_tokens[off:off + w_chunk]
 
-                        _restore(kv_roll)
-                        cand_hook(ctx, n_new_k=None, n_new_v=None,
-                                  n_prompt=0, n_seq_len=prime_pos_bs + 1)
-                        ret = strategies._single_decode(lib, ctx, prime_tok_bs, prime_pos_bs)
-                        if ret != 0:
-                            w0_ok = False
-                            n_match = off
-                            break
-                        cand_hook(ctx, n_new_k=1, n_new_v=1)
+                        # First chunk: same as legacy bootstrap (pre_prime → quant prefill →
+                        # decode pt[-1]). Do *not* use rollout bulk+decode(prime) here: the
+                        # fp16 prompt checkpoint already has pt[-1] at n_pt-1, which would
+                        # duplicate position (llama requires Y = X+1).
+                        if off == 0:
+                            _restore(pre_prime_blob)
+                            cand_hook(ctx, n_new_k=None, n_new_v=None,
+                                      n_prompt=n_pt - 1)
+                            ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                            if ret != 0:
+                                w0_ok = False
+                                n_match = off
+                                break
+                            cand_hook(ctx, n_new_k=1, n_new_v=1)
+                        else:
+                            _restore_ckpt_pair(kv_roll)
+                            cand_hook(ctx, n_new_k=None, n_new_v=None,
+                                      n_prompt=0, n_seq_len=prime_pos_bs + 1)
+                            ret = strategies._single_decode(lib, ctx, prime_tok_bs,
+                                                            prime_pos_bs)
+                            if ret != 0:
+                                w0_ok = False
+                                n_match = off
+                                break
+                            cand_hook(ctx, n_new_k=1, n_new_v=1)
                         ptr_d = lib.llama_get_logits_ith(ctx, 0)
                         d_logits = np.ctypeslib.as_array(ptr_d, shape=(n_vocab,)).copy()
                         draft_tokens = strategies.generate_window(
@@ -1492,17 +1518,31 @@ def main():
                             k_group_size=cand_k_gs, v_group_size=cand_v_gs,
                             stop_fn=_is_eog)
 
-                        _restore(kv_roll)
-                        if ver_hook is not None:
-                            ver_hook(ctx, n_new_k=None, n_new_v=None,
-                                     n_prompt=0, n_seq_len=prime_pos_bs + 1)
-                        ret_v = strategies._single_decode(lib, ctx, prime_tok_bs, prime_pos_bs)
-                        if ret_v != 0:
-                            w0_ok = False
-                            n_match = off
-                            break
-                        if ver_hook is not None:
-                            ver_hook(ctx, n_new_k=1, n_new_v=1)
+                        if off == 0:
+                            _restore(pre_prime_blob)
+                            if ver_hook is not None:
+                                ver_hook(ctx, n_new_k=None, n_new_v=None,
+                                         n_prompt=n_pt - 1)
+                            ret_v = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                            if ret_v != 0:
+                                w0_ok = False
+                                n_match = off
+                                break
+                            if ver_hook is not None:
+                                ver_hook(ctx, n_new_k=1, n_new_v=1)
+                        else:
+                            _restore_ckpt_pair(kv_roll)
+                            if ver_hook is not None:
+                                ver_hook(ctx, n_new_k=None, n_new_v=None,
+                                         n_prompt=0, n_seq_len=prime_pos_bs + 1)
+                            ret_v = strategies._single_decode(lib, ctx, prime_tok_bs,
+                                                              prime_pos_bs)
+                            if ret_v != 0:
+                                w0_ok = False
+                                n_match = off
+                                break
+                            if ver_hook is not None:
+                                ver_hook(ctx, n_new_k=1, n_new_v=1)
                         ptr_v = lib.llama_get_logits_ith(ctx, 0)
                         v_logits = np.ctypeslib.as_array(ptr_v, shape=(n_vocab,)).copy()
 
@@ -1552,7 +1592,7 @@ def main():
                                 n_match += 1
                             break
 
-                        kv_roll = _save_ckpt()
+                        kv_roll = _save_ckpt_pair()
                         prime_tok_bs = ref_chunk[-1]
                         prime_pos_bs = pos_start + len(ref_chunk) - 1
                         off += len(ref_chunk)
@@ -1595,7 +1635,7 @@ def main():
                         probe_attempted += 1
 
                         # Draft window under candidate
-                        _restore(probe_ckpt)
+                        _restore_ckpt_pair(probe_ckpt)
                         cand_hook(ctx, n_new_k=None, n_new_v=None,
                                   n_prompt=0, n_seq_len=probe_prime_pos + 1)
                         ret_p = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
@@ -1612,7 +1652,7 @@ def main():
                             stop_fn=_is_eog)
 
                         # Verifier replay for acceptance
-                        _restore(probe_ckpt)
+                        _restore_ckpt_pair(probe_ckpt)
                         if ver_hook is not None:
                             ver_hook(ctx, n_new_k=None, n_new_v=None,
                                      n_prompt=0, n_seq_len=probe_prime_pos + 1)
@@ -1658,12 +1698,12 @@ def main():
 
                         if window_ok:
                             probe_accepted += 1
-                            probe_ckpt = _save_ckpt()
+                            probe_ckpt = _save_ckpt_pair()
                             probe_prime_tok = draft_tokens[-1]
                             probe_prime_pos = probe_prime_pos + len(draft_tokens)
                         else:
                             # Fallback: advance under fp16, like real adaptive-gen does.
-                            _restore(probe_ckpt)
+                            _restore_ckpt_pair(probe_ckpt)
                             ret_fb = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
                             if ret_fb != 0:
                                 break
@@ -1674,7 +1714,7 @@ def main():
                                 pos_start=probe_prime_pos + 1, W=probe_w,
                                 kv_hook=None,
                                 stop_fn=_is_eog)
-                            probe_ckpt = _save_ckpt()
+                            probe_ckpt = _save_ckpt_pair()
                             probe_prime_tok = fb_toks[-1]
                             probe_prime_pos = probe_prime_pos + len(fb_toks)
 
@@ -1747,7 +1787,7 @@ def main():
                     n_accepted += 1
                 # else: keep the passed-in draft_* as fallback
                 # Restore fp16 kv_boundary so phase 2 starts clean
-                _restore(kv_boundary)
+                _restore_ckpt_pair(kv_boundary)
 
             def _hit_stop(ids):
                 if not args.stop_strings:
@@ -1768,7 +1808,7 @@ def main():
                 # Restore fp16 boundary, then bulk-quantize KV (respecting sink/recent zones
                 # from --sink-tokens/--recent-tokens) so the draft attends to the correct
                 # quantized background — matching the real deployment configuration.
-                _restore(kv_boundary)
+                _restore_ckpt_pair(kv_boundary)
                 ex_draft_hook(ctx, n_new_k=None, n_new_v=None,
                               n_prompt=0, n_seq_len=prime_pos + 1)
                 ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
@@ -1785,7 +1825,7 @@ def main():
                     stop_fn=_is_eog)
 
                 # Step B: verifier replays quant_rollout_tokens (--verifier-quant, or fp16).
-                _restore(kv_boundary)
+                _restore_ckpt_pair(kv_boundary)
                 if ver_hook is not None:
                     ver_hook(ctx, n_new_k=None, n_new_v=None,
                              n_prompt=0, n_seq_len=prime_pos + 1)
@@ -1837,12 +1877,12 @@ def main():
                     path_per_tok += [ex_draft_name] * len(quant_rollout_tokens)
                     _emit_segment(segments, ex_draft_name, len(quant_rollout_tokens))
                     # KV is fp16 from verify_window; save new boundary blob.
-                    kv_boundary = _save_ckpt()
+                    kv_boundary = _save_ckpt_pair()
                     prime_tok = quant_rollout_tokens[-1]
                     prime_pos = pos_start + len(quant_rollout_tokens) - 1
                 else:
                     # Fallback: fp16 generates this window (restore fp16 first).
-                    _restore(kv_boundary)
+                    _restore_ckpt_pair(kv_boundary)
                     ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
                     if ret != 0:
                         break
@@ -1856,7 +1896,7 @@ def main():
                     gen_ids   += fb_toks
                     path_per_tok += ["fp16"] * len(fb_toks)
                     _emit_segment(segments, "fp16", len(fb_toks))
-                    kv_boundary = _save_ckpt()
+                    kv_boundary = _save_ckpt_pair()
                     prime_tok = fb_toks[-1]
                     prime_pos = pos_start + len(fb_toks) - 1
 
