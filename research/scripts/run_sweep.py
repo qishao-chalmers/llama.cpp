@@ -1263,9 +1263,10 @@ def main():
         """Real adaptive generation: bootstrap window + quant rollout windows + verify.
 
         Bootstrap window (first segment): fp16 generates W_b tokens (kv_hook=None).
-        Bootstrap candidate check replays the fp16 reference in steps of --adaptive-window
+        Bootstrap candidate check replays a teacher reference in steps of --adaptive-window
         (same restore → bulk quant → decode prime → draft W → verify as post-bootstrap
-        rollout), not one continuous quant verify over the full bootstrap length.
+        rollout).  ref_ok compares draft to that teacher: fp16 tokens when ver_hook is None,
+        else a greedy int8 run from the prompt (matches rollout's verifier teacher).
 
         Quant rollout windows (each later segment while generating):
           a. Draft quant generates W tokens from restored fp16 boundary (`draft_hook`).
@@ -1428,6 +1429,45 @@ def main():
             prime_tok = bootstrap_tokens[-1]
             prime_pos = n_pt + len(bootstrap_tokens) - 1
 
+            # Teacher for bootstrap ref_ok: fp16 string if no quant verifier; else greedy
+            # int8 (ver_hook) from the prompt — aligns candidate draft with rollout acceptance.
+            if ver_hook is not None:
+                _restore_ckpt_pair(pre_prime_blob)
+                ver_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=max(0, n_pt - 1))
+                ret_bt = strategies._single_decode(
+                    lib, ctx, pt[-1] if n_pt > 1 else pt[0],
+                    n_pt - 1 if n_pt > 1 else 0)
+                if ret_bt != 0:
+                    bootstrap_ref_tokens = list(bootstrap_tokens)
+                    print("    bootstrap: int8 teacher gen failed decode; ref_ok uses fp16",
+                          flush=True)
+                else:
+                    ver_hook(ctx, n_new_k=1, n_new_v=1)
+                    ptr_bt = lib.llama_get_logits_ith(ctx, 0)
+                    bt_logits = np.ctypeslib.as_array(ptr_bt, shape=(n_vocab,)).copy()
+                    bootstrap_ref_tokens = strategies.generate_window(
+                        lib, ctx, n_vocab, int(np.argmax(bt_logits)),
+                        pos_start=n_pt, W=len(bootstrap_tokens),
+                        kv_hook=ver_hook,
+                        k_group_size=ver_k_gs, v_group_size=ver_v_gs,
+                        stop_fn=_is_eog)
+                _restore_ckpt_pair(kv_boundary)
+                n_bt = min(len(bootstrap_tokens), len(bootstrap_ref_tokens))
+                if len(bootstrap_ref_tokens) < len(bootstrap_tokens):
+                    print(f"    bootstrap: int8 teacher len {len(bootstrap_ref_tokens)} "
+                          f"< fp16 len {len(bootstrap_tokens)}; verifying first {n_bt}",
+                          flush=True)
+                n_fp8_diff = sum(
+                    1 for i in range(n_bt)
+                    if bootstrap_tokens[i] != bootstrap_ref_tokens[i])
+                if n_fp8_diff > 0:
+                    print(f"    bootstrap: fp16 vs {verifier_quant_name} teacher differ "
+                          f"on {n_fp8_diff}/{n_bt} tokens",
+                          flush=True)
+                bootstrap_ref_tokens = bootstrap_ref_tokens[:n_bt]
+            else:
+                bootstrap_ref_tokens = bootstrap_tokens
+
             ex_draft_hook = draft_hook
             ex_draft_k_gs = draft_k_gs
             ex_draft_v_gs = draft_v_gs
@@ -1436,7 +1476,7 @@ def main():
             # ── Bootstrap pick: try each --quants candidate; score probe acceptance;
             # then pick max (probe_rate, bit_width) so int4 can win over int2 on ties.
             # Windowed bootstrap verify: same restore → bulk quant → prime decode → draft W
-            # → verifier replay as post-bootstrap rollout, repeated over bootstrap_tokens.
+            # → verifier replay as post-bootstrap rollout, repeated over bootstrap_ref_tokens.
             n_accepted  = 0
             n_attempted = 0
             if pre_prime_blob is not None:
@@ -1468,13 +1508,13 @@ def main():
                     w0_ok = True
                     n_match = 0
 
-                    if not bootstrap_tokens:
+                    if not bootstrap_ref_tokens:
                         w0_ok = False
 
-                    while w0_ok and off < len(bootstrap_tokens):
-                        w_chunk = min(W, len(bootstrap_tokens) - off)
+                    while w0_ok and off < len(bootstrap_ref_tokens):
+                        w_chunk = min(W, len(bootstrap_ref_tokens) - off)
                         pos_start = prime_pos_bs + 1
-                        ref_chunk = bootstrap_tokens[off:off + w_chunk]
+                        ref_chunk = bootstrap_ref_tokens[off:off + w_chunk]
 
                         # First chunk: same as legacy bootstrap (pre_prime → quant prefill →
                         # decode pt[-1]). Do *not* use rollout bulk+decode(prime) here: the
@@ -1589,20 +1629,20 @@ def main():
                         prime_pos_bs = pos_start + len(ref_chunk) - 1
                         off += len(ref_chunk)
 
-                    if w0_ok and off != len(bootstrap_tokens):
+                    if w0_ok and off != len(bootstrap_ref_tokens):
                         w0_ok = False
 
                     # ── Per-candidate bootstrap diagnostic ───────────────
                     if not w0_ok:
-                        if len(bootstrap_tokens) > 1 and n_match >= 0:
+                        if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
-                                  f"({n_match}/{len(bootstrap_tokens)} tokens matched)",
+                                  f"({n_match}/{len(bootstrap_ref_tokens)} tokens matched)",
                                   flush=True)
                         else:
                             print(f"      {cand}: bootstrap FAIL", flush=True)
                         failed.append({
                             "name":  cand,
-                            "match": n_match if len(bootstrap_tokens) > 1 else -1,
+                            "match": n_match if len(bootstrap_ref_tokens) > 1 else -1,
                             "bits":  _quant_bits_estimate(cand),
                             "hook":  cand_hook,
                             "k_gs":  cand_k_gs,
@@ -1747,7 +1787,7 @@ def main():
                           flush=True)
                 elif failed:
                     # No candidate passed bootstrap+probe.
-                    # Rank by n_match (most tokens matched = closest to fp16) then min
+                    # Rank by n_match (most tokens matched = closest to teacher) then min
                     # bits on ties — prefer the most accurate quant we tried, and among
                     # equals prefer the most aggressive compression.
                     # Candidates with unknown n_match (need_av / single-token) sort last.
@@ -1756,10 +1796,11 @@ def main():
                     fb_hook = fb_entry["hook"]
                     fb_k_gs = fb_entry["k_gs"]
                     fb_v_gs = fb_entry["v_gs"]
-                    match_str = (f"{fb_entry['match']}/{len(bootstrap_tokens)}"
+                    match_str = (f"{fb_entry['match']}/{len(bootstrap_ref_tokens)}"
                                  if fb_entry["match"] >= 0 else "?")
                     def _fmt_fail(s):
-                        ms = f"{s['match']}/{len(bootstrap_tokens)}" if s["match"] >= 0 else "?"
+                        ms = (f"{s['match']}/{len(bootstrap_ref_tokens)}"
+                              if s["match"] >= 0 else "?")
                         return f"{s['name']}={ms}"
                     others = ", ".join(
                         _fmt_fail(s)
