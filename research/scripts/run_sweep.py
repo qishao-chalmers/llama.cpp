@@ -1511,6 +1511,8 @@ def main():
                     n_match = 0
                     bootstrap_win_ok = 0  # full rollout-style windows accepted (window_ok)
                     bootstrap_steers = 0  # windows recovered with fp16 fallback (like rollout)
+                    bootstrap_quant_toks = 0   # tokens from draft that passed verifier
+                    bootstrap_fp16_toks = 0    # tokens from fp16 steer-back windows
 
                     if not bootstrap_ref_tokens:
                         w0_ok = False
@@ -1645,6 +1647,7 @@ def main():
                                 n_match = off
                                 break
                             bootstrap_steers += 1
+                            bootstrap_fp16_toks += len(fb_toks)
                             kv_roll = _save_ckpt_pair()
                             prime_tok_bs = fb_toks[-1]
                             prime_pos_bs = pos_start + len(fb_toks) - 1
@@ -1652,6 +1655,7 @@ def main():
                             continue
 
                         bootstrap_win_ok += 1
+                        bootstrap_quant_toks += len(draft_tokens)
                         kv_roll = _save_ckpt_pair()
                         prime_tok_bs = draft_tokens[-1]
                         prime_pos_bs = pos_start + len(draft_tokens) - 1
@@ -1663,8 +1667,9 @@ def main():
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
                                   f"(decode/empty at offset {n_match}/{len(bootstrap_ref_tokens)}) | "
-                                  f"{bootstrap_win_ok} quant windows vs {_ver_lbl} | "
-                                  f"{bootstrap_steers} fp16 steer(s)",
+                                  f"tok {bootstrap_quant_toks} quant+{_ver_lbl} + "
+                                  f"{bootstrap_fp16_toks} fp16 steer "
+                                  f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks",
                                   flush=True)
                         else:
                             print(f"      {cand}: bootstrap FAIL", flush=True)
@@ -1781,8 +1786,10 @@ def main():
                     probe_rate = probe_accepted / max(probe_attempted, 1)
                     probe_tag = "PASS" if probe_rate >= probe_min_rate else f"FAIL (<{probe_min_rate:.2f})"
                     print(f"      {cand}: bootstrap OK "
-                          f"| {off}/{len(bootstrap_ref_tokens)} tok vs {_ver_lbl} "
-                          f"| {bootstrap_win_ok} quant windows | {bootstrap_steers} fp16 steer(s) "
+                          f"| {off}/{len(bootstrap_ref_tokens)} tok: "
+                          f"{bootstrap_quant_toks} quant+{_ver_lbl} + "
+                          f"{bootstrap_fp16_toks} fp16 steer "
+                          f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks "
                           f"→ probe {probe_accepted}/{probe_attempted}={probe_rate:.2f} {probe_tag}",
                           flush=True)
                     scored.append({
