@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse, json, math, os, re, sys, time
+from collections import Counter
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +30,105 @@ try:
     HAS_GPU_KV_SHADOW = gpu_kv_shadow.HAS_CUPY
 except ImportError:
     HAS_GPU_KV_SHADOW = False
+
+
+def _adaptive_verify_label(args) -> str:
+    if args.adaptive_verify_top_p is not None:
+        return f"top_p={args.adaptive_verify_top_p}"
+    if args.adaptive_verify_top_k is not None:
+        return f"top_k={args.adaptive_verify_top_k}"
+    return "greedy"
+
+
+# Adaptive-gen segment viz: up to 8 rows × width cols (~ n_tokens/width tok/column).
+# Glyphs: int2..fp16 use ':' stacks (height varies); int3 adds a top row '.' over ':'.
+# Tuple rows are top→bottom within the stack (aligns with printed qviz top→bottom).
+# Segments name draft quant vs fp16 only — verifier (e.g. int8_ch) is not duplicated in segment labels.
+_QVIZ_HEIGHT = 8
+_QVIZ_WIDTH = 64
+
+
+def _quant_viz_stack(qname: str) -> tuple[int, str | tuple[str, ...]]:
+    """Height (1–8) and one char (repeated) or tuple of chars top→bottom for the stack."""
+    if not qname or qname == "fp16":
+        return (_QVIZ_HEIGHT, ":")
+    q = qname.lower()
+    # int8 before int4 before int3 before int2 (substring order).
+    if "int8" in q:
+        return (4, ":")
+    if "int4" in q:
+        return (2, (":", ":"))
+    if "int3" in q:
+        return (2, (".", ":"))
+    if "int2" in q:
+        return (1, ":")
+    if "nf4" in q or "fp8" in q:
+        return (1, "~")
+    if "bf16" in q:
+        return (1, "b")
+    return (1, (qname[0] if qname else "?").lower())
+
+
+def _segment_quant_viz_rows(segments, n_tokens, width=_QVIZ_WIDTH):
+    """Return 1–8 strings (top first): proportional draft/fp16 timeline; trim all-space top rows."""
+    if width <= 0 or n_tokens <= 0 or not segments:
+        return []
+    total = sum(n for _, n in segments)
+    if total <= 0:
+        return []
+    nrows = _QVIZ_HEIGHT
+    rows = [[" "] * width for _ in range(nrows)]
+    for k in range(width):
+        mid = (k + 0.5) * total / width
+        acc = 0.0
+        qn = segments[-1][0]
+        for q, n in segments:
+            if acc + n > mid:
+                qn = q
+                break
+            acc += n
+        h, ch_spec = _quant_viz_stack(qn)
+        base = nrows - h
+        if isinstance(ch_spec, tuple):
+            for i in range(h):
+                rows[base + i][k] = ch_spec[i]
+        else:
+            for r in range(base, nrows):
+                rows[r][k] = ch_spec
+    while len(rows) > 1 and all(rows[0][j] == " " for j in range(width)):
+        rows.pop(0)
+    return ["".join(r) for r in rows]
+
+
+_QVIZ_LEGEND = (
+    "qviz: draft/fp16 (~n_tok/64/col); fp16=:::::::: int8=:::: int4=:: int3=.: int2=:; "
+    "verifier quant not in segment names"
+)
+
+
+
+def _quant_bits_estimate(qspec: str) -> int:
+    """Best-effort bit-width estimate for ordering candidate quant specs."""
+    if not qspec:
+        return 16
+    s = qspec.lower()
+    # Split k:v and layer-range segments; take the maximum bit-width seen.
+    segs = s.replace(":", "/").split("/")
+    bits = 0
+    for seg in segs:
+        if "int2" in seg:
+            bits = max(bits, 2)
+        elif "int3" in seg:
+            bits = max(bits, 3)
+        elif "int4" in seg or "nf4" in seg:
+            bits = max(bits, 4)
+        elif "int8" in seg or "fp8" in seg:
+            bits = max(bits, 8)
+        elif "bf16" in seg:
+            bits = max(bits, 16)
+        elif "fp16" in seg:
+            bits = max(bits, 16)
+    return bits or 16
 
 
 def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
@@ -366,12 +466,16 @@ def main():
     parser.add_argument("--sink-tokens",        type=int, default=0,
                         help="Leave the first N tokens unquantized (attention sinks). "
                              "Papers show initial tokens absorb disproportionate attention mass; "
-                             "keeping them in fp16 often recovers quality at minimal memory cost.")
+                             "keeping them in fp16 often recovers quality at minimal memory cost. "
+                             "With --adaptive-gen/--adaptive-sim, zone hooks track a global "
+                             "decode counter that is not reset on KV restore — use 0 unless you "
+                             "understand the interaction.")
     parser.add_argument("--recent-tokens",      type=int, default=0,
                         help="Keep the most recent N tokens in fp16 at all times (KIVI-style). "
                              "When new tokens arrive and older ones fall out of this window, "
                              "they get quantized. Combined with --sink-tokens this gives three "
-                             "zones: sinks (fp16) | stale (quantized) | recent (fp16).")
+                             "zones: sinks (fp16) | stale (quantized) | recent (fp16). "
+                             "Same KV-restore caveat as --sink-tokens for adaptive modes.")
     parser.add_argument("--quant-sink",         default=None,
                         help="Quant type for the sink zone instead of fp16 "
                              "(e.g. 'int8_ch'). Supports K:V split and layer-range syntax. "
@@ -456,16 +560,28 @@ def main():
                              "Requires --eval-accuracy --skip-ppl --corpus-mode structured.")
     parser.add_argument("--verifier-quant", default="int8_ch",
                         help="Verifier KV quant: --adaptive-sim (draft vs verifier windows) and "
-                             "--adaptive-gen Step B (replay draft under this quant). "
+                             "--adaptive-gen (replay each quant rollout window under this quant). "
                              "Default int8_ch. Use fp16 for strict fp16-teacher verification. "
                              "Draft sweep uses each --quants entry (excluding fp16 and this verifier).")
     parser.add_argument("--adaptive-gen",    action="store_true",
-                        help="Real adaptive generation: window 0 uses fp16, then each window "
-                             "int4 draft generates W tokens, fp16 verifies; accepted windows "
-                             "use draft output, rejected fall back to fp16. Measures quality "
-                             "of adaptive scheme end-to-end. Requires --eval-accuracy --skip-ppl.")
-    parser.add_argument("--adaptive-window", type=int, default=32,
-                        help="Window size (tokens) for --adaptive-sim/--adaptive-gen (default: 32).")
+                        help="Real adaptive generation: bootstrap window (fp16 generates W tokens); "
+                             "then quant rollout windows (draft quant generates W tokens, verifier "
+                             "replays; accept or fp16 fallback). Requires --eval-accuracy --skip-ppl.")
+    parser.add_argument("--adaptive-window", type=int, default=8,
+                        help="Rollout window size W (tokens) for each quant draft / fp16 verify "
+                             "cycle in --adaptive-sim/--adaptive-gen (default: 8).")
+    parser.add_argument("--bootstrap-window", type=int, default=32,
+                        help="Bootstrap window size W_b (tokens): fp16 generates W_b tokens in "
+                             "window 0, candidates verify all W_b for bootstrap pass/fail "
+                             "(default: 32). Separate from --adaptive-window.")
+    parser.add_argument("--adaptive-verify-top-k", type=int, default=None, metavar="K",
+                        help="For --adaptive-sim/--adaptive-gen: accept draft tokens that appear "
+                             "in the verifier's top-K (per position). Mutually exclusive with "
+                             "--adaptive-verify-top-p. Default: greedy (argmax) match.")
+    parser.add_argument("--adaptive-verify-top-p", type=float, default=None, metavar="P",
+                        help="For --adaptive-sim/--adaptive-gen: nucleus top-p acceptance on "
+                             "verifier logits at each position (0<P<=1). Mutually exclusive with "
+                             "--adaptive-verify-top-k.")
     parser.add_argument("--no-adaptive-gen-gpu-shadow", action="store_true",
                         help="For --adaptive-gen: use CPU KV blob save/restore (PCIe on GPU). "
                              "Default: GPU device-to-device shadow checkpoint via CuPy when "
@@ -489,6 +605,13 @@ def main():
                              "Combined with --quant-k (defaults to fp16 if omitted).")
     args = parser.parse_args()
 
+    if args.adaptive_verify_top_k is not None and args.adaptive_verify_top_k < 1:
+        parser.error("--adaptive-verify-top-k must be >= 1")
+    if args.adaptive_verify_top_p is not None:
+        if not (0.0 < args.adaptive_verify_top_p <= 1.0):
+            parser.error("--adaptive-verify-top-p must be in (0, 1]")
+    if args.adaptive_verify_top_k is not None and args.adaptive_verify_top_p is not None:
+        parser.error("use only one of --adaptive-verify-top-k and --adaptive-verify-top-p")
     # Merge --quant-k / --quant-v into the quants list as one extra entry
     if args.quant_k is not None or args.quant_v is not None:
         k_spec = args.quant_k or "fp16"
@@ -942,36 +1065,53 @@ def main():
                     break
                 ptr         = lib.llama_get_logits_ith(ctx, 0)
                 prime_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-                int4_pred0  = int(np.argmax(prime_logits))
 
                 # (c) Check first-token prediction (fp16 KV, no draft hook yet)
-                if int4_pred0 != fp16_tokens[w_start]:
+                av_k, av_p = args.adaptive_verify_top_k, args.adaptive_verify_top_p
+                need_av = av_k is not None or av_p is not None
+                if not strategies.adaptive_verify_accept(
+                        prime_logits, fp16_tokens[w_start], av_k, av_p):
                     if first_fail_window is None:
                         first_fail_window = w
                         first_fail_pos    = w_start
                     continue
 
                 # (d) Feed fp16_tokens[w_start .. w_end-2] with draft hook.
-                #     verify_window returns greedy[i] = prediction for position
-                #     n_pt+w_start+i+1, which should equal fp16_tokens[w_start+i+1].
                 window_slice = fp16_tokens[w_start:w_end - 1]   # W-1 tokens
-                greedy = strategies.verify_window(
-                    lib, ctx, n_vocab,
-                    window_slice,
-                    pos_start=n_pt + w_start,
-                    kv_hook=draft_hook,
-                    k_group_size=draft_k_gs,
-                    v_group_size=draft_v_gs)
-
-                window_ok = all(greedy[i] == fp16_tokens[w_start + i + 1]
-                                for i in range(len(greedy)))
+                if need_av:
+                    greedy, log_rows = strategies.verify_window(
+                        lib, ctx, n_vocab,
+                        window_slice,
+                        pos_start=n_pt + w_start,
+                        kv_hook=draft_hook,
+                        k_group_size=draft_k_gs,
+                        v_group_size=draft_v_gs,
+                        return_logits=True)
+                    window_ok = all(
+                        strategies.adaptive_verify_accept(
+                            log_rows[i], fp16_tokens[w_start + i + 1], av_k, av_p)
+                        for i in range(len(greedy)))
+                else:
+                    greedy = strategies.verify_window(
+                        lib, ctx, n_vocab,
+                        window_slice,
+                        pos_start=n_pt + w_start,
+                        kv_hook=draft_hook,
+                        k_group_size=draft_k_gs,
+                        v_group_size=draft_v_gs)
+                    window_ok = all(greedy[i] == fp16_tokens[w_start + i + 1]
+                                    for i in range(len(greedy)))
 
                 if window_ok:
                     n_accepted += 1
                 elif first_fail_window is None:
                     first_fail_window = w
                     for i, g in enumerate(greedy):
-                        if g != fp16_tokens[w_start + i + 1]:
+                        ok_i = (
+                            strategies.adaptive_verify_accept(
+                                log_rows[i], fp16_tokens[w_start + i + 1], av_k, av_p)
+                            if need_av else (g == fp16_tokens[w_start + i + 1]))
+                        if not ok_i:
                             first_fail_pos = w_start + i + 1
                             break
 
@@ -987,6 +1127,7 @@ def main():
                 "first_fail_pos":      first_fail_pos,
                 "acceptance_rate":     acceptance_rate,
                 "draft_fraction":      draft_fraction,
+                "adaptive_verify":     _adaptive_verify_label(args),
             }
             sim_results.append(entry)
             status = ("all_ok" if first_fail_window is None
@@ -1000,14 +1141,16 @@ def main():
     def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs,
                          use_gpu_shadow=False, n_layer=0, draft_quant_name="draft",
                          ver_hook=None, ver_k_gs=64, ver_v_gs=64,
-                         verifier_quant_name="fp16"):
-        """Real adaptive generation: fp16 bootstrap + draft-quant generation + fp16 verification.
+                         verifier_quant_name="fp16",
+                         draft_quant_candidates=None):
+        """Real adaptive generation: bootstrap window + quant rollout windows + verify.
 
-        Window 0: fp16 generates W tokens (bootstrap / ground truth).
-        Windows 1+:
-          a. Draft quant generates W tokens (from restored fp16 boundary).
-          b. fp16 verifies draft tokens (replay with kv_hook=None).
-          c. All greedy predictions match → accept; else fp16 regenerates this window.
+        Bootstrap window (first segment): fp16 generates W tokens (kv_hook=None).
+        Quant rollout windows (each later segment while generating):
+          a. Draft quant generates W tokens from restored fp16 boundary (`draft_hook`).
+          b. Verifier replays those tokens (`ver_hook` or fp16 if None).
+          c. Verifier acceptance (--adaptive-verify-top-k / --adaptive-verify-top-p or greedy);
+           on accept keep quant rollout; else fp16 regenerates this window (fallback).
 
         KV save/restore (performance):
         - Default when GPU KV + CuPy: gpu_kv_shadow.GpuKvShadowCheckpoint — cudaMemcpy D→D
@@ -1015,9 +1158,9 @@ def main():
         - With --no-adaptive-gen-gpu-shadow or CPU inference: save_kv_state / restore_kv_state
           (llama_state_seq_get_data / set_data), full blob through CPU; PCIe each call on GPU
           for GPU-backed KV.
-        Hot path per window (after bootstrap): typically two restores (before draft, before
-        fp16 verify) plus one save after accept/reject — three checkpoint operations per window
-        attempt.
+        Hot path per quant rollout window: typically two restores (before draft quant,
+        before verifier) plus one save after accept/reject — three checkpoint operations per
+        window attempt.
 
         Why not strategies.trim_kv_seq here: draft_hook(ctx, n_new_k=None, n_new_v=None)
         bulk-quantizes the entire KV cache in place, including the prompt region, so fp16
@@ -1027,14 +1170,25 @@ def main():
         KV invariant after a successful verify: positions 0..prime_pos-1 hold fp16-derived
         values; the next draft bulk-quantizes from that fp16 snapshot again.
 
-        Step B (verify): ver_hook=None when --verifier-quant fp16 (teacher). Otherwise bulk-quant
-        + verify_window under --verifier-quant — acceptance matches that verifier replay.
+        Step B (verify, per quant rollout window): ver_hook=None when --verifier-quant fp16
+        (teacher) — verify_window uses one batched fp16 prefill for the replayed tokens.
+        With a quant verifier (ver_hook set), verify_window stays token-by-token so each
+        logits step sees quantized KV; there is no correct single-batch shortcut for that.
 
-        Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction,
-        segments (list of {quant, n_tokens} for generated output timeline).
+        Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction, segments.
         """
-        W = args.adaptive_window
+        W   = args.adaptive_window    # rollout window size (int2 draft / fp16 verify cycles)
+        W_b = args.bootstrap_window   # bootstrap window size (window 0 fp16 + candidate verify)
         results = []
+        av_k = args.adaptive_verify_top_k
+        av_p = args.adaptive_verify_top_p
+        need_av = av_k is not None or av_p is not None
+        qviz_legend_printed = False
+
+        cand_specs = draft_quant_candidates if draft_quant_candidates is not None else [draft_quant_name]
+        cand_specs = [c for c in cand_specs if c and c != "fp16"]
+        _ord = {c: i for i, c in enumerate(cand_specs)}
+        cand_specs = sorted(cand_specs, key=lambda c: (_quant_bits_estimate(c), _ord.get(c, 10**9)))
 
         def _emit_segment(buf: list, name: str, n: int) -> None:
             """Merge consecutive runs with the same quant label."""
@@ -1073,7 +1227,7 @@ def main():
             else:
                 strategies.restore_kv_state(lib, ctx, ck)
 
-        for ei, (pt, _, label) in enumerate(examples):
+        for ei, (pt, ct, label) in enumerate(examples):
             max_ctx_avail = args.n_ctx - len(pt) - 1
             max_gen = min(args.max_gen_tokens, max_ctx_avail)
             if max_gen <= 0:
@@ -1106,14 +1260,18 @@ def main():
                 lib.llama_batch_free(batch)
                 # Save KV = 0..n_pt-2 (fp16); prime boundary for window 0
                 pre_prime_blob = _save_ckpt()
-                # Part 2: decode last prompt token to get bootstrap logits
+                # Part 2: decode last prompt token (logits for bootstrap window)
                 ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
                 if ret != 0:
                     results.append(None)
                     continue
                 ptr = lib.llama_get_logits_ith(ctx, 0)
             else:
-                pre_prime_blob = None   # n_pt==1: no prefix to save
+                # n_pt==1: still need a checkpoint *before* decoding the sole prompt token,
+                # so bootstrap candidate selection can restore → quantize → decode pt[0]
+                # (same roles as pre_prime_blob for n_pt>1). Without this, pre_prime_blob is
+                # None and we skip draft auto-pick, leaving draft_quant_name (often int2_ch).
+                pre_prime_blob = _save_ckpt()
                 ret = strategies._single_decode(lib, ctx, pt[0], 0)
                 if ret != 0:
                     results.append(None)
@@ -1122,53 +1280,286 @@ def main():
 
             logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
 
-            # ── Phase 1: fp16 bootstrap (window 0) ───────────────────────
-            bootstrap = strategies.generate_window(
+            # ── Bootstrap window: fp16 generates W_b tokens ─────────────────
+            bootstrap_tokens = strategies.generate_window(
                 lib, ctx, n_vocab, int(np.argmax(logits)),
-                pos_start=n_pt, W=W,
+                pos_start=n_pt, W=W_b,
                 kv_hook=None,
                 stop_fn=_is_eog)
 
-            gen_ids = list(bootstrap)
+            gen_ids = list(bootstrap_tokens)
+            path_per_tok = ["fp16"] * len(gen_ids)
             segments: list[tuple[str, int]] = []
-            _emit_segment(segments, "fp16", len(bootstrap))
-            # KV = 0..n_pt+len(bootstrap)-2 (all fp16)
+            _emit_segment(segments, "fp16", len(bootstrap_tokens))
+            # KV = 0..n_pt+len(bootstrap_tokens)-2 (all fp16)
             kv_boundary = _save_ckpt()
-            prime_tok = bootstrap[-1]
-            prime_pos = n_pt + len(bootstrap) - 1
+            prime_tok = bootstrap_tokens[-1]
+            prime_pos = n_pt + len(bootstrap_tokens) - 1
 
-            # ── Int2 verify window 0: "can int2 be a candidate?" ─────────
-            # Mirror of windows 1+ but with roles swapped: fp16 generated,
-            # int2 verifies.  Restore to pre_prime_blob (KV = 0..n_pt-2),
-            # bulk-quantize to int2, decode pt[-1] (prime), then verify the
-            # bootstrap tokens using the int2 hook — same code path as the
-            # fp16 verify in windows 1+.
+            ex_draft_hook = draft_hook
+            ex_draft_k_gs = draft_k_gs
+            ex_draft_v_gs = draft_v_gs
+            ex_draft_name = draft_quant_name
+
+            # ── Bootstrap pick: try each --quants candidate; score probe acceptance;
+            # then pick max (probe_rate, bit_width) so int4 can win over int2 on ties.
+            # Restore to pre_prime_blob (KV = 0..n_pt-2), bulk-quantize, prime pt[-1],
+            # verify bootstrap_tokens — same path as verifier replay in rollout windows.
             n_accepted  = 0
             n_attempted = 0
             if pre_prime_blob is not None:
-                _restore(pre_prime_blob)                          # fp16, 0..n_pt-2
-                draft_hook(ctx, n_new_k=None, n_new_v=None)      # → int2
-                ret_w0 = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
-                if ret_w0 == 0:
-                    draft_hook(ctx, n_new_k=1, n_new_v=1)        # quantize KV[n_pt-1]
-                    ptr_w0     = lib.llama_get_logits_ith(ctx, 0)
-                    int2_log_w0 = np.ctypeslib.as_array(ptr_w0, shape=(n_vocab,)).copy()
-                    int2_pred0  = int(np.argmax(int2_log_w0))
-                    if len(bootstrap) > 1:
-                        int2_greedy_w0 = strategies.verify_window(
-                            lib, ctx, n_vocab,
-                            bootstrap[:-1],
-                            pos_start=n_pt,
-                            kv_hook=draft_hook,
-                            k_group_size=draft_k_gs, v_group_size=draft_v_gs)
-                        w0_ok = (int2_pred0 == bootstrap[0] and
-                                 all(int2_greedy_w0[i] == bootstrap[i + 1]
-                                     for i in range(len(int2_greedy_w0))))
+                picked = None
+                scored = []  # bootstrap+probe results per candidate (for final argmax)
+                failed = []  # candidates that failed bootstrap, with n_match score
+                tried = cand_specs or [draft_quant_name]
+                for cand in tried:
+                    _restore(pre_prime_blob)  # fp16, 0..n_pt-2
+                    cand_k_names, cand_v_names = quant_mod.resolve_quant_layers(cand, n_layer)
+                    cand_k_gs, cand_v_gs = get_kv_group_sizes(
+                        cand_k_names, cand_v_names, args.quant_group_size)
+                    cand_hook = make_kv_hook(
+                        lib, cand_k_names, cand_v_names, args.n_pos_per_embd,
+                        use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
+                        default_group_size=args.quant_group_size,
+                        n_sink=args.sink_tokens,
+                        n_recent=args.recent_tokens,
+                        k_sink_names=k_sink_names,
+                        v_sink_names=v_sink_names,
+                        k_recent_names=k_recent_names,
+                        v_recent_names=v_recent_names,
+                        asym=args.asym, quant_fn_factory=None,
+                        profile=kv_prof)
+
+                    cand_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=n_pt - 1)
+                    ret_w0 = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                    if ret_w0 != 0:
+                        continue
+                    cand_hook(ctx, n_new_k=1, n_new_v=1)  # quantize KV[n_pt-1]
+                    ptr_w0      = lib.llama_get_logits_ith(ctx, 0)
+                    cand_log_w0 = np.ctypeslib.as_array(ptr_w0, shape=(n_vocab,)).copy()
+
+                    if len(bootstrap_tokens) > 1:
+                        if need_av:
+                            cand_greedy_w0, cand_rows = strategies.verify_window(
+                                lib, ctx, n_vocab,
+                                bootstrap_tokens[:-1],
+                                pos_start=n_pt,
+                                kv_hook=cand_hook,
+                                k_group_size=cand_k_gs, v_group_size=cand_v_gs,
+                                return_logits=True)
+                            w0_ok = (
+                                strategies.adaptive_verify_accept(
+                                    cand_log_w0, bootstrap_tokens[0], av_k, av_p)
+                                and all(
+                                    strategies.adaptive_verify_accept(
+                                        cand_rows[i], bootstrap_tokens[i + 1], av_k, av_p)
+                                    for i in range(len(cand_greedy_w0))))
+                        else:
+                            cand_pred0 = int(np.argmax(cand_log_w0))
+                            cand_greedy_w0 = strategies.verify_window(
+                                lib, ctx, n_vocab,
+                                bootstrap_tokens[:-1],
+                                pos_start=n_pt,
+                                kv_hook=cand_hook,
+                                k_group_size=cand_k_gs, v_group_size=cand_v_gs)
+                            w0_ok = (cand_pred0 == bootstrap_tokens[0] and
+                                     all(cand_greedy_w0[i] == bootstrap_tokens[i + 1]
+                                         for i in range(len(cand_greedy_w0))))
                     else:
-                        w0_ok = (int2_pred0 == bootstrap[0])
-                    n_attempted += 1
-                    if w0_ok:
-                        n_accepted += 1
+                        w0_ok = strategies.adaptive_verify_accept(
+                            cand_log_w0, bootstrap_tokens[0], av_k, av_p)
+
+                    # ── Per-candidate bootstrap diagnostic ───────────────
+                    if not w0_ok:
+                        if not need_av and len(bootstrap_tokens) > 1:
+                            # W total checks: cand_pred0 (1) + cand_greedy_w0 (W-1)
+                            n_match = int(cand_pred0 == bootstrap_tokens[0])
+                            n_match += sum(
+                                1 for i, g in enumerate(cand_greedy_w0)
+                                if g == bootstrap_tokens[i + 1])
+                            w_total = len(bootstrap_tokens)  # W = cand_pred0 + greedy_w0
+                            print(f"      {cand}: bootstrap FAIL "
+                                  f"({n_match}/{w_total} tokens matched)",
+                                  flush=True)
+                        else:
+                            n_match = -1  # unknown (need_av or single-token bootstrap)
+                            print(f"      {cand}: bootstrap FAIL", flush=True)
+                        failed.append({
+                            "name":  cand,
+                            "match": n_match,
+                            "bits":  _quant_bits_estimate(cand),
+                            "hook":  cand_hook,
+                            "k_gs":  cand_k_gs,
+                            "v_gs":  cand_v_gs,
+                        })
+                        continue
+
+                    # Probe: estimate early acceptance rate over a few rollout windows.
+                    # This avoids picking a low-bit quant that passes bootstrap but is
+                    # rejected frequently once rollout starts.
+                    probe_windows = 4
+                    probe_min_rate = 0.90
+                    probe_ckpt = kv_boundary
+                    probe_prime_tok = prime_tok
+                    probe_prime_pos = prime_pos
+                    probe_attempted = 0
+                    probe_accepted = 0
+                    for _ in range(probe_windows):
+                        probe_w = min(W, max_gen - len(gen_ids))
+                        if probe_w <= 0 or _is_eog(probe_prime_tok):
+                            break
+                        probe_attempted += 1
+
+                        # Draft window under candidate
+                        _restore(probe_ckpt)
+                        cand_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=probe_prime_pos)
+                        ret_p = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
+                        if ret_p != 0:
+                            break
+                        cand_hook(ctx, n_new_k=1, n_new_v=1)
+                        ptr_p = lib.llama_get_logits_ith(ctx, 0)
+                        cand_draft_logits = np.ctypeslib.as_array(ptr_p, shape=(n_vocab,)).copy()
+                        draft_tokens = strategies.generate_window(
+                            lib, ctx, n_vocab, int(np.argmax(cand_draft_logits)),
+                            pos_start=probe_prime_pos + 1, W=probe_w,
+                            kv_hook=cand_hook,
+                            k_group_size=cand_k_gs, v_group_size=cand_v_gs,
+                            stop_fn=_is_eog)
+
+                        # Verifier replay for acceptance
+                        _restore(probe_ckpt)
+                        if ver_hook is not None:
+                            ver_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=probe_prime_pos)
+                        ret_vp = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
+                        if ret_vp != 0:
+                            break
+                        if ver_hook is not None:
+                            ver_hook(ctx, n_new_k=1, n_new_v=1)
+                        ptr_vp = lib.llama_get_logits_ith(ctx, 0)
+                        vp_logits = np.ctypeslib.as_array(ptr_vp, shape=(n_vocab,)).copy()
+                        if len(draft_tokens) > 1:
+                            if need_av:
+                                vp_greedy, vp_rows = strategies.verify_window(
+                                    lib, ctx, n_vocab,
+                                    draft_tokens[:-1],
+                                    pos_start=probe_prime_pos + 1,
+                                    kv_hook=ver_hook,
+                                    k_group_size=ver_k_gs,
+                                    v_group_size=ver_v_gs,
+                                    return_logits=True)
+                                window_ok = (
+                                    strategies.adaptive_verify_accept(
+                                        vp_logits, draft_tokens[0], av_k, av_p)
+                                    and all(
+                                        strategies.adaptive_verify_accept(
+                                            vp_rows[i], draft_tokens[i + 1], av_k, av_p)
+                                        for i in range(len(vp_greedy))))
+                            else:
+                                vp_pred0 = int(np.argmax(vp_logits))
+                                vp_greedy = strategies.verify_window(
+                                    lib, ctx, n_vocab,
+                                    draft_tokens[:-1],
+                                    pos_start=probe_prime_pos + 1,
+                                    kv_hook=ver_hook,
+                                    k_group_size=ver_k_gs,
+                                    v_group_size=ver_v_gs)
+                                window_ok = (vp_pred0 == draft_tokens[0] and
+                                             all(vp_greedy[i] == draft_tokens[i + 1]
+                                                 for i in range(len(vp_greedy))))
+                        else:
+                            window_ok = strategies.adaptive_verify_accept(
+                                vp_logits, draft_tokens[0], av_k, av_p)
+
+                        if window_ok:
+                            probe_accepted += 1
+                            probe_ckpt = _save_ckpt()
+                            probe_prime_tok = draft_tokens[-1]
+                            probe_prime_pos = probe_prime_pos + len(draft_tokens)
+                        else:
+                            # Fallback: advance under fp16, like real adaptive-gen does.
+                            _restore(probe_ckpt)
+                            ret_fb = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
+                            if ret_fb != 0:
+                                break
+                            ptr_fb = lib.llama_get_logits_ith(ctx, 0)
+                            fb_logits = np.ctypeslib.as_array(ptr_fb, shape=(n_vocab,)).copy()
+                            fb_toks = strategies.generate_window(
+                                lib, ctx, n_vocab, int(np.argmax(fb_logits)),
+                                pos_start=probe_prime_pos + 1, W=probe_w,
+                                kv_hook=None,
+                                stop_fn=_is_eog)
+                            probe_ckpt = _save_ckpt()
+                            probe_prime_tok = fb_toks[-1]
+                            probe_prime_pos = probe_prime_pos + len(fb_toks)
+
+                    probe_rate = probe_accepted / max(probe_attempted, 1)
+                    probe_tag = "PASS" if probe_rate >= probe_min_rate else f"FAIL (<{probe_min_rate:.2f})"
+                    print(f"      {cand}: bootstrap OK "
+                          f"→ probe {probe_accepted}/{probe_attempted}={probe_rate:.2f} {probe_tag}",
+                          flush=True)
+                    scored.append({
+                        "name":   cand,
+                        "rate":   probe_rate,
+                        "acc":    probe_accepted,
+                        "tot":    probe_attempted,
+                        "bits":   _quant_bits_estimate(cand),
+                        "hook":   cand_hook,
+                        "k_gs":   cand_k_gs,
+                        "v_gs":   cand_v_gs,
+                    })
+
+                # Among candidates that pass the probe threshold, pick the most
+                # aggressive (lowest bits) — the goal is maximum compression that
+                # still meets the acceptance bar.  On a bits tie, prefer higher rate.
+                # If nothing clears the threshold, fall back to the highest-rate
+                # candidate (safest choice among those that were scored).
+                if scored:
+                    eligible = [s for s in scored if s["rate"] >= probe_min_rate]
+                    if eligible:
+                        win = min(eligible, key=lambda s: (s["bits"], -s["rate"]))
+                    else:
+                        win = max(scored, key=lambda s: (s["rate"], s["bits"]))
+                    picked = (win["name"], win["hook"], win["k_gs"], win["v_gs"])
+                    summ = ", ".join(
+                        f"{s['name']}={s['rate']:.2f}({s['acc']}/{s['tot']})"
+                        for s in sorted(scored, key=lambda s: (_quant_bits_estimate(s["name"]), s["name"])))
+                    print(f"    bootstrap_pick [{label}]: {win['name']}  "
+                          f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})  "
+                          f"[{summ}]",
+                          flush=True)
+                elif failed:
+                    # No candidate passed bootstrap+probe.
+                    # Rank by n_match (most tokens matched = closest to fp16) then min
+                    # bits on ties — prefer the most accurate quant we tried, and among
+                    # equals prefer the most aggressive compression.
+                    # Candidates with unknown n_match (need_av / single-token) sort last.
+                    fb_entry = max(failed, key=lambda s: (s["match"], -s["bits"]))
+                    fb = fb_entry["name"]
+                    fb_hook = fb_entry["hook"]
+                    fb_k_gs = fb_entry["k_gs"]
+                    fb_v_gs = fb_entry["v_gs"]
+                    match_str = (f"{fb_entry['match']}/{len(bootstrap_tokens)}"
+                                 if fb_entry["match"] >= 0 else "?")
+                    def _fmt_fail(s):
+                        ms = f"{s['match']}/{len(bootstrap_tokens)}" if s["match"] >= 0 else "?"
+                        return f"{s['name']}={ms}"
+                    others = ", ".join(
+                        _fmt_fail(s)
+                        for s in sorted(failed, key=lambda s: (_quant_bits_estimate(s["name"]), s["name"]))
+                        if s["name"] != fb)
+                    picked = (fb, fb_hook, fb_k_gs, fb_v_gs)
+                    print(f"    bootstrap_pick [{label}]: {fb}  FALLBACK (best n_match={match_str})"
+                          + (f"  [{others}]" if others else ""),
+                          flush=True)
+                else:
+                    print(f"    bootstrap_pick [{label}]: NONE  (no candidates in tried)", flush=True)
+
+                n_attempted += 1
+                if picked is not None:
+                    ex_draft_name, ex_draft_hook, ex_draft_k_gs, ex_draft_v_gs = picked
+                if scored:
+                    n_accepted += 1
+                # else: keep the passed-in draft_* as fallback
                 # Restore fp16 kv_boundary so phase 2 starts clean
                 _restore(kv_boundary)
 
@@ -1178,7 +1569,7 @@ def main():
                 tail = llama.detokenize(lib, vocab, ids[-128:], remove_special=False)
                 return any(s in tail for s in args.stop_strings)
 
-            # ── Phase 2: int2 draft + fp16 verify, window by window ──────
+            # ── Quant rollout windows: draft quant + verifier, until max_gen ─
             while len(gen_ids) < max_gen:
                 if _is_eog(prime_tok) or _hit_stop(gen_ids):
                     break
@@ -1187,29 +1578,29 @@ def main():
                 w_size    = min(W, max_gen - len(gen_ids))
                 n_attempted += 1
 
-                # Step A: draft generates w_size tokens with FULL int2 KV.
-                # Restore fp16 boundary, then bulk-quantize ALL KV to int2 so
-                # the draft attends to int2 for every previous token — exactly
-                # what a real bandwidth-optimised deployment would do.
+                # Step A: draft generates w_size tokens with quantized KV.
+                # Restore fp16 boundary, then bulk-quantize KV (respecting sink/recent zones
+                # from --sink-tokens/--recent-tokens) so the draft attends to the correct
+                # quantized background — matching the real deployment configuration.
                 _restore(kv_boundary)
-                draft_hook(ctx, n_new_k=None, n_new_v=None)  # bulk: all 0..prime_pos-1 → int2
+                ex_draft_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=prime_pos)  # bulk: 0..prime_pos-1 → draft
                 ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
                 if ret != 0:
                     break
-                draft_hook(ctx, n_new_k=1, n_new_v=1)        # quantize prime_pos cell
+                ex_draft_hook(ctx, n_new_k=1, n_new_v=1)        # quantize prime_pos cell
                 ptr          = lib.llama_get_logits_ith(ctx, 0)
                 draft_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-                draft_toks   = strategies.generate_window(
+                quant_rollout_tokens = strategies.generate_window(
                     lib, ctx, n_vocab, int(np.argmax(draft_logits)),
                     pos_start=pos_start, W=w_size,
-                    kv_hook=draft_hook,
-                    k_group_size=draft_k_gs, v_group_size=draft_v_gs,
+                    kv_hook=ex_draft_hook,
+                    k_group_size=ex_draft_k_gs, v_group_size=ex_draft_v_gs,
                     stop_fn=_is_eog)
 
-                # Step B: verifier replays draft_toks (--verifier-quant, or fp16 if ver_hook None).
+                # Step B: verifier replays quant_rollout_tokens (--verifier-quant, or fp16).
                 _restore(kv_boundary)
                 if ver_hook is not None:
-                    ver_hook(ctx, n_new_k=None, n_new_v=None)
+                    ver_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=prime_pos)
                 ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
                 if ret != 0:
                     break
@@ -1217,31 +1608,50 @@ def main():
                     ver_hook(ctx, n_new_k=1, n_new_v=1)
                 ptr         = lib.llama_get_logits_ith(ctx, 0)
                 v_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-                v_pred0  = int(np.argmax(v_logits))
 
-                if len(draft_toks) > 1:
-                    v_greedy = strategies.verify_window(
-                        lib, ctx, n_vocab,
-                        draft_toks[:-1],
-                        pos_start=pos_start,
-                        kv_hook=ver_hook,
-                        k_group_size=ver_k_gs,
-                        v_group_size=ver_v_gs)
-                    window_ok = (v_pred0 == draft_toks[0] and
-                                 all(v_greedy[i] == draft_toks[i + 1]
-                                     for i in range(len(v_greedy))))
+                if len(quant_rollout_tokens) > 1:
+                    if need_av:
+                        v_greedy, v_log_rows = strategies.verify_window(
+                            lib, ctx, n_vocab,
+                            quant_rollout_tokens[:-1],
+                            pos_start=pos_start,
+                            kv_hook=ver_hook,
+                            k_group_size=ver_k_gs,
+                            v_group_size=ver_v_gs,
+                            return_logits=True)
+                        window_ok = (
+                            strategies.adaptive_verify_accept(
+                                v_logits, quant_rollout_tokens[0], av_k, av_p)
+                            and all(
+                                strategies.adaptive_verify_accept(
+                                    v_log_rows[i], quant_rollout_tokens[i + 1], av_k, av_p)
+                                for i in range(len(v_greedy))))
+                    else:
+                        v_pred0 = int(np.argmax(v_logits))
+                        v_greedy = strategies.verify_window(
+                            lib, ctx, n_vocab,
+                            quant_rollout_tokens[:-1],
+                            pos_start=pos_start,
+                            kv_hook=ver_hook,
+                            k_group_size=ver_k_gs,
+                            v_group_size=ver_v_gs)
+                        window_ok = (v_pred0 == quant_rollout_tokens[0] and
+                                     all(v_greedy[i] == quant_rollout_tokens[i + 1]
+                                         for i in range(len(v_greedy))))
                 else:
                     v_greedy = []
-                    window_ok   = (v_pred0 == draft_toks[0])
+                    window_ok = strategies.adaptive_verify_accept(
+                        v_logits, quant_rollout_tokens[0], av_k, av_p)
 
                 if window_ok:
                     n_accepted += 1
-                    gen_ids    += draft_toks
-                    _emit_segment(segments, draft_quant_name, len(draft_toks))
+                    gen_ids    += quant_rollout_tokens
+                    path_per_tok += [ex_draft_name] * len(quant_rollout_tokens)
+                    _emit_segment(segments, ex_draft_name, len(quant_rollout_tokens))
                     # KV is fp16 from verify_window; save new boundary blob.
                     kv_boundary = _save_ckpt()
-                    prime_tok = draft_toks[-1]
-                    prime_pos = pos_start + len(draft_toks) - 1
+                    prime_tok = quant_rollout_tokens[-1]
+                    prime_pos = pos_start + len(quant_rollout_tokens) - 1
                 else:
                     # Fallback: fp16 generates this window (restore fp16 first).
                     _restore(kv_boundary)
@@ -1256,27 +1666,49 @@ def main():
                         kv_hook=None,
                         stop_fn=_is_eog)
                     gen_ids   += fb_toks
+                    path_per_tok += ["fp16"] * len(fb_toks)
                     _emit_segment(segments, "fp16", len(fb_toks))
                     kv_boundary = _save_ckpt()
                     prime_tok = fb_toks[-1]
                     prime_pos = pos_start + len(fb_toks) - 1
 
-            # Trim at first EOG
+            # Trim at first EOG (keep path aligned with trimmed output)
             trimmed = []
-            for tok in gen_ids:
+            trimmed_path = []
+            for tok, pq in zip(gen_ids, path_per_tok):
                 if _is_eog(tok):
                     break
                 trimmed.append(tok)
+                trimmed_path.append(pq)
 
             acc   = n_accepted / max(n_attempted, 1)
             dfrac = n_accepted * W / max(len(trimmed), 1)
             seg_adj = _adjust_segments_for_trim(segments, len(gen_ids), len(trimmed))
-            seg_line = "  ".join(f"{q}({n})" for q, n in seg_adj)
             print(f"  adaptive-gen ex {ei+1}/{len(examples)}: {label} | "
                   f"acc={acc:.2f}  draft_frac={dfrac:.2f}  "
+                  f"verify={_adaptive_verify_label(args)}  "
                   f"n_tok={len(trimmed)}", flush=True)
-            if seg_line:
-                print(f"    segments: {seg_line}", flush=True)
+            if seg_adj:
+                # Condense segments: total tokens per quant, and number of runs per quant
+                seg_toks: Counter = Counter()
+                seg_runs: Counter = Counter()
+                for q, n in seg_adj:
+                    seg_toks[q] += n
+                    seg_runs[q] += 1
+                quants_seen = sorted(seg_toks, key=lambda q: -seg_toks[q])
+                seg_summary = "  ".join(
+                    f"{q}: {seg_toks[q]}tok/{seg_runs[q]}runs"
+                    for q in quants_seen)
+                print(f"    segments({len(seg_adj)}): {seg_summary}", flush=True)
+            qviz_lines = []
+            if seg_adj:
+                qviz_lines = _segment_quant_viz_rows(seg_adj, len(trimmed), width=_QVIZ_WIDTH)
+                if qviz_lines:
+                    if not qviz_legend_printed:
+                        print(f"    {_QVIZ_LEGEND}", flush=True)
+                        qviz_legend_printed = True
+                    for i, row in enumerate(qviz_lines):
+                        print(f"    qviz{i + 1}: {row}", flush=True)
 
             results.append({
                 "gen_ids":           trimmed,
@@ -1286,7 +1718,9 @@ def main():
                 "acceptance_rate":   acc,
                 "draft_fraction":    dfrac,
                 "verifier_quant":    verifier_quant_name,
+                "adaptive_verify":   _adaptive_verify_label(args),
                 "segments":          [{"quant": q, "n_tokens": n} for q, n in seg_adj],
+                "segment_quant_viz": qviz_lines,
             })
 
         return results
@@ -1669,6 +2103,7 @@ def main():
                 save_results(results)
 
         _bins_data = {}  # quant_name -> {inner_name: tracker dict}; used by --save-bins
+        adaptive_gen_done = False
 
         for quant_name in args.quants:
             if quant_name == "fp16":
@@ -1711,24 +2146,31 @@ def main():
                         lib, ver_k_names, ver_v_names, args.n_pos_per_embd,
                         use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                         default_group_size=args.quant_group_size,
-                        n_sink=0, n_recent=0,
+                        n_sink=args.sink_tokens,
+                        n_recent=args.recent_tokens,
+                        k_sink_names=k_sink_names,
+                        v_sink_names=v_sink_names,
+                        k_recent_names=k_recent_names,
+                        v_recent_names=v_recent_names,
                         asym=args.asym, quant_fn_factory=None,
                         profile=kv_prof)
-                    # Zone-free draft hook for adaptive sim: _apply_window's
-                    # n_done counter is stateful and never reset between
-                    # verify_window calls (which restore KV to arbitrary
-                    # boundary states). Zone logic is irrelevant for short
-                    # verification windows anyway.
                     adaptive_draft_hook = make_kv_hook(
                         lib, k_names, v_names, args.n_pos_per_embd,
                         use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                         default_group_size=args.quant_group_size,
-                        n_sink=0, n_recent=0,
+                        n_sink=args.sink_tokens,
+                        n_recent=args.recent_tokens,
+                        k_sink_names=k_sink_names,
+                        v_sink_names=v_sink_names,
+                        k_recent_names=k_recent_names,
+                        v_recent_names=v_recent_names,
                         asym=args.asym,
                         quant_fn_factory=_factory if args.save_bins else None,
                         profile=kv_prof)
                     print(f"  [adaptive-sim] draft={quant_name} verifier={args.verifier_quant} "
-                          f"window={args.adaptive_window}", flush=True)
+                          f"window={args.adaptive_window} verify={_adaptive_verify_label(args)} "
+                          f"sink={args.sink_tokens} recent={args.recent_tokens}",
+                          flush=True)
                     sim_per_ex = run_adaptive_sim(
                         examples, adaptive_draft_hook, ver_hook,
                         k_group_size, v_group_size, ver_k_gs, ver_v_gs)
@@ -1741,15 +2183,20 @@ def main():
                           f"all_ok={n_all_ok}/{len(valid)}", flush=True)
                     if args.save_per_example:
                         _per_example_results[f"{quant_name}__adaptive_sim"] = sim_per_ex
-                # ── Adaptive gen: draft generation + configurable verify (Step B) ─
+                # ── Adaptive gen: quant rollout windows + verifier replay ─────────
                 gen_pregenerated = None
                 gen_stats_valid  = []
-                if args.adaptive_gen and quant_name != "fp16":
+                if args.adaptive_gen and not adaptive_gen_done and quant_name != "fp16":
                     adaptive_draft_hook_gen = make_kv_hook(
                         lib, k_names, v_names, args.n_pos_per_embd,
                         use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                         default_group_size=args.quant_group_size,
-                        n_sink=0, n_recent=0,
+                        n_sink=args.sink_tokens,
+                        n_recent=args.recent_tokens,
+                        k_sink_names=k_sink_names,
+                        v_sink_names=v_sink_names,
+                        k_recent_names=k_recent_names,
+                        v_recent_names=v_recent_names,
                         asym=args.asym,
                         quant_fn_factory=_factory if args.save_bins else None,
                         profile=kv_prof)
@@ -1763,7 +2210,12 @@ def main():
                             lib, ver_k_names, ver_v_names, args.n_pos_per_embd,
                             use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
                             default_group_size=args.quant_group_size,
-                            n_sink=0, n_recent=0,
+                            n_sink=args.sink_tokens,
+                            n_recent=args.recent_tokens,
+                            k_sink_names=k_sink_names,
+                            v_sink_names=v_sink_names,
+                            k_recent_names=k_recent_names,
+                            v_recent_names=v_recent_names,
                             asym=args.asym, quant_fn_factory=None,
                             profile=kv_prof)
                     else:
@@ -1771,8 +2223,10 @@ def main():
                         ver_k_gs, ver_v_gs = k_group_size, v_group_size
                     ag_use_shadow = (
                         use_gpu and HAS_GPU_KV_SHADOW and not args.no_adaptive_gen_gpu_shadow)
-                    print(f"  [adaptive-gen] draft={quant_name} verify={ver_vq} "
-                          f"window={args.adaptive_window} "
+                    cand_specs = [q for q in args.quants if q != "fp16"]
+                    print(f"  [adaptive-gen] draft=auto({len(cand_specs)}) verify={ver_vq} "
+                          f"bootstrap_window={args.bootstrap_window} rollout_window={args.adaptive_window} "
+                          f"sink={args.sink_tokens} recent={args.recent_tokens} "
                           f"kv_ckpt={'gpu_d2d' if ag_use_shadow else 'cpu_blob'}",
                           flush=True)
                     gen_results = run_adaptive_gen(
@@ -1780,7 +2234,9 @@ def main():
                         use_gpu_shadow=ag_use_shadow, n_layer=n_layer,
                         draft_quant_name=quant_name,
                         ver_hook=ver_hook_gen, ver_k_gs=ver_k_gs, ver_v_gs=ver_v_gs,
-                        verifier_quant_name=ver_vq)
+                        verifier_quant_name=ver_vq,
+                        draft_quant_candidates=cand_specs)
+                    adaptive_gen_done = True
                     gen_pregenerated = gen_results
                     gen_stats_valid  = [r for r in gen_results if r is not None]
                     if gen_stats_valid:
@@ -1806,19 +2262,27 @@ def main():
                     entry["adaptive_sim"] = {
                         "verifier_quant":    args.verifier_quant,
                         "window_size":       args.adaptive_window,
+                        "adaptive_verify":   _adaptive_verify_label(args),
+                        "sink_tokens":       args.sink_tokens,
+                        "recent_tokens":     args.recent_tokens,
                         "mean_acceptance":   mean_acc_rate,
                         "mean_draft_frac":   mean_draft_frac,
                         "n_all_ok":          n_all_ok,
                         "n_examples":        len(valid),
                     }
                 if args.adaptive_gen and quant_name != "fp16" and gen_stats_valid:
-                    entry["adaptive_gen"] = {
-                        "window_size":       args.adaptive_window,
+                    ag_entry = {
+                        "rollout_window":    args.adaptive_window,
+                        "bootstrap_window":  args.bootstrap_window,
                         "verifier_quant":    args.verifier_quant,
+                        "adaptive_verify":   _adaptive_verify_label(args),
+                        "sink_tokens":       args.sink_tokens,
+                        "recent_tokens":     args.recent_tokens,
                         "mean_acceptance":   mg_acc,
                         "mean_draft_frac":   mg_dfrac,
                         "n_examples":        len(gen_stats_valid),
                     }
+                    entry["adaptive_gen"] = ag_entry
                 if args.save_per_example:
                     _per_example_results[quant_name] = per_ex_q
                     with open(args.save_per_example, "w") as _f:
