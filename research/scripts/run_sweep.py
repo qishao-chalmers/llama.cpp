@@ -1264,9 +1264,11 @@ def main():
 
         Bootstrap window (first segment): fp16 generates W_b tokens (kv_hook=None).
         Bootstrap candidate check uses the same windowed path as rollout: each chunk
-        passes iff window_ok (verifier accepts draft). A solo int8/fp16 greedy string is
-        still computed only to print fp16-vs-int8 diagnostics — it is not required to
-        match the draft (that extra check was stricter than rollout and misleading).
+        passes iff window_ok (verifier accepts draft). On verify failure, bootstrap
+        steers back like rollout: restore the chunk boundary and regenerate that window
+        with fp16 (kv_hook=None), then continue. A solo int8/fp16 greedy string is still
+        computed only to print fp16-vs-int8 diagnostics — it is not required to match
+        the draft (that extra check was stricter than rollout and misleading).
 
         Quant rollout windows (each later segment while generating):
           a. Draft quant generates W tokens from restored fp16 boundary (`draft_hook`).
@@ -1508,6 +1510,7 @@ def main():
                     w0_ok = True
                     n_match = 0
                     bootstrap_win_ok = 0  # full rollout-style windows accepted (window_ok)
+                    bootstrap_steers = 0  # windows recovered with fp16 fallback (like rollout)
 
                     if not bootstrap_ref_tokens:
                         w0_ok = False
@@ -1615,31 +1618,38 @@ def main():
                         # (Do not also require draft == solo int8/fp16 teacher — int3 can agree
                         # with int8 verifier while differing from a separate int8 greedy run.)
                         if not window_ok:
-                            w0_ok = False
-                            n_match = off
-                            if len(draft_tokens) > 1:
-                                if need_av:
-                                    if strategies.adaptive_verify_accept(
-                                            v_logits, draft_tokens[0], av_k, av_p):
-                                        n_match += 1
-                                        for i in range(len(v_greedy)):
-                                            if not strategies.adaptive_verify_accept(
-                                                    v_log_rows[i], draft_tokens[i + 1],
-                                                    av_k, av_p):
-                                                break
-                                            n_match += 1
-                                else:
-                                    if v_pred0 == draft_tokens[0]:
-                                        n_match += 1
-                                        for i in range(len(v_greedy)):
-                                            if v_greedy[i] != draft_tokens[i + 1]:
-                                                break
-                                            n_match += 1
+                            # Steer back: same as quant rollout on reject — restore boundary,
+                            # fp16-decodes prime, fp16-generates this window (no draft hook).
+                            if off == 0:
+                                _restore_ckpt_pair(pre_prime_blob)
+                                ret_fb = strategies._single_decode(
+                                    lib, ctx, pt[-1], n_pt - 1)
                             else:
-                                n_match += int(
-                                    strategies.adaptive_verify_accept(
-                                        v_logits, draft_tokens[0], av_k, av_p))
-                            break
+                                _restore_ckpt_pair(kv_roll)
+                                ret_fb = strategies._single_decode(
+                                    lib, ctx, prime_tok_bs, prime_pos_bs)
+                            if ret_fb != 0:
+                                w0_ok = False
+                                n_match = off
+                                break
+                            ptr_fb = lib.llama_get_logits_ith(ctx, 0)
+                            fb_logits = np.ctypeslib.as_array(
+                                ptr_fb, shape=(n_vocab,)).copy()
+                            fb_toks = strategies.generate_window(
+                                lib, ctx, n_vocab, int(np.argmax(fb_logits)),
+                                pos_start=pos_start, W=w_chunk,
+                                kv_hook=None,
+                                stop_fn=_is_eog)
+                            if not fb_toks:
+                                w0_ok = False
+                                n_match = off
+                                break
+                            bootstrap_steers += 1
+                            kv_roll = _save_ckpt_pair()
+                            prime_tok_bs = fb_toks[-1]
+                            prime_pos_bs = pos_start + len(fb_toks) - 1
+                            off += len(fb_toks)
+                            continue
 
                         bootstrap_win_ok += 1
                         kv_roll = _save_ckpt_pair()
@@ -1652,9 +1662,9 @@ def main():
                     if not w0_ok:
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
-                                  f"(verifier prefix {n_match}/{len(bootstrap_ref_tokens)}) | "
-                                  f"window_ok {bootstrap_win_ok} full windows vs {_ver_lbl} "
-                                  f"(then fail; rollout-style)",
+                                  f"(decode/empty at offset {n_match}/{len(bootstrap_ref_tokens)}) | "
+                                  f"{bootstrap_win_ok} quant windows vs {_ver_lbl} | "
+                                  f"{bootstrap_steers} fp16 steer(s)",
                                   flush=True)
                         else:
                             print(f"      {cand}: bootstrap FAIL", flush=True)
@@ -1772,7 +1782,7 @@ def main():
                     probe_tag = "PASS" if probe_rate >= probe_min_rate else f"FAIL (<{probe_min_rate:.2f})"
                     print(f"      {cand}: bootstrap OK "
                           f"| {off}/{len(bootstrap_ref_tokens)} tok vs {_ver_lbl} "
-                          f"| {bootstrap_win_ok} windows accepted "
+                          f"| {bootstrap_win_ok} quant windows | {bootstrap_steers} fp16 steer(s) "
                           f"→ probe {probe_accepted}/{probe_attempted}={probe_rate:.2f} {probe_tag}",
                           flush=True)
                     scored.append({
