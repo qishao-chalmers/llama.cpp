@@ -1263,10 +1263,10 @@ def main():
         """Real adaptive generation: bootstrap window + quant rollout windows + verify.
 
         Bootstrap window (first segment): fp16 generates W_b tokens (kv_hook=None).
-        Bootstrap candidate check replays a teacher reference in steps of --adaptive-window
-        (same restore → bulk quant → decode prime → draft W → verify as post-bootstrap
-        rollout).  ref_ok compares draft to that teacher: fp16 tokens when ver_hook is None,
-        else a greedy int8 run from the prompt (matches rollout's verifier teacher).
+        Bootstrap candidate check uses the same windowed path as rollout: each chunk
+        passes iff window_ok (verifier accepts draft). A solo int8/fp16 greedy string is
+        still computed only to print fp16-vs-int8 diagnostics — it is not required to
+        match the draft (that extra check was stricter than rollout and misleading).
 
         Quant rollout windows (each later segment while generating):
           a. Draft quant generates W tokens from restored fp16 boundary (`draft_hook`).
@@ -1514,7 +1514,6 @@ def main():
                     while w0_ok and off < len(bootstrap_ref_tokens):
                         w_chunk = min(W, len(bootstrap_ref_tokens) - off)
                         pos_start = prime_pos_bs + 1
-                        ref_chunk = bootstrap_ref_tokens[off:off + w_chunk]
 
                         # First chunk: same as legacy bootstrap (pre_prime → quant prefill →
                         # decode pt[-1]). Do *not* use rollout bulk+decode(prime) here: the
@@ -1611,32 +1610,46 @@ def main():
                             window_ok = strategies.adaptive_verify_accept(
                                 v_logits, draft_tokens[0], av_k, av_p)
 
-                        ref_ok = (len(draft_tokens) == len(ref_chunk) and
-                                  all(draft_tokens[i] == ref_chunk[i]
-                                      for i in range(len(ref_chunk))))
-
-                        if not (window_ok and ref_ok):
+                        # Same acceptance as post-bootstrap rollout: verifier vs draft only.
+                        # (Do not also require draft == solo int8/fp16 teacher — int3 can agree
+                        # with int8 verifier while differing from a separate int8 greedy run.)
+                        if not window_ok:
                             w0_ok = False
                             n_match = off
-                            for i in range(min(len(draft_tokens), len(ref_chunk))):
-                                if draft_tokens[i] != ref_chunk[i]:
-                                    break
-                                n_match += 1
+                            if len(draft_tokens) > 1:
+                                if need_av:
+                                    if strategies.adaptive_verify_accept(
+                                            v_logits, draft_tokens[0], av_k, av_p):
+                                        n_match += 1
+                                        for i in range(len(v_greedy)):
+                                            if not strategies.adaptive_verify_accept(
+                                                    v_log_rows[i], draft_tokens[i + 1],
+                                                    av_k, av_p):
+                                                break
+                                            n_match += 1
+                                else:
+                                    if v_pred0 == draft_tokens[0]:
+                                        n_match += 1
+                                        for i in range(len(v_greedy)):
+                                            if v_greedy[i] != draft_tokens[i + 1]:
+                                                break
+                                            n_match += 1
+                            else:
+                                n_match += int(
+                                    strategies.adaptive_verify_accept(
+                                        v_logits, draft_tokens[0], av_k, av_p))
                             break
 
                         kv_roll = _save_ckpt_pair()
-                        prime_tok_bs = ref_chunk[-1]
-                        prime_pos_bs = pos_start + len(ref_chunk) - 1
-                        off += len(ref_chunk)
-
-                    if w0_ok and off != len(bootstrap_ref_tokens):
-                        w0_ok = False
+                        prime_tok_bs = draft_tokens[-1]
+                        prime_pos_bs = pos_start + len(draft_tokens) - 1
+                        off += len(draft_tokens)
 
                     # ── Per-candidate bootstrap diagnostic ───────────────
                     if not w0_ok:
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
-                                  f"({n_match}/{len(bootstrap_ref_tokens)} tokens matched)",
+                                  f"(verifier prefix {n_match}/{len(bootstrap_ref_tokens)})",
                                   flush=True)
                         else:
                             print(f"      {cand}: bootstrap FAIL", flush=True)
