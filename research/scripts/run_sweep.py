@@ -1262,7 +1262,11 @@ def main():
                          draft_quant_candidates=None):
         """Real adaptive generation: bootstrap window + quant rollout windows + verify.
 
-        Bootstrap window (first segment): fp16 generates W tokens (kv_hook=None).
+        Bootstrap window (first segment): fp16 generates W_b tokens (kv_hook=None).
+        Bootstrap candidate check replays the fp16 reference in steps of --adaptive-window
+        (same restore → bulk quant → decode prime → draft W → verify as post-bootstrap
+        rollout), not one continuous quant verify over the full bootstrap length.
+
         Quant rollout windows (each later segment while generating):
           a. Draft quant generates W tokens from restored fp16 boundary (`draft_hook`).
           b. Verifier replays those tokens (`ver_hook` or fp16 if None).
@@ -1413,6 +1417,18 @@ def main():
             prime_tok = bootstrap_tokens[-1]
             prime_pos = n_pt + len(bootstrap_tokens) - 1
 
+            # fp16 checkpoint after full prompt (KV 0..n_pt-1): same boundary rollout uses
+            # for the first window (restore → bulk quant with n_seq_len=n_pt).
+            kv_after_prompt_fp16 = None
+            if pre_prime_blob is not None:
+                _restore(pre_prime_blob)
+                ret_pp = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                if ret_pp != 0:
+                    results.append(None)
+                    continue
+                kv_after_prompt_fp16 = _save_ckpt()
+                _restore(kv_boundary)
+
             ex_draft_hook = draft_hook
             ex_draft_k_gs = draft_k_gs
             ex_draft_v_gs = draft_v_gs
@@ -1420,8 +1436,8 @@ def main():
 
             # ── Bootstrap pick: try each --quants candidate; score probe acceptance;
             # then pick max (probe_rate, bit_width) so int4 can win over int2 on ties.
-            # Restore to pre_prime_blob (KV = 0..n_pt-2), bulk-quantize, prime pt[-1],
-            # verify bootstrap_tokens — same path as verifier replay in rollout windows.
+            # Windowed bootstrap verify: same restore → bulk quant → prime decode → draft W
+            # → verifier replay as post-bootstrap rollout, repeated over bootstrap_tokens.
             n_accepted  = 0
             n_attempted = 0
             if pre_prime_blob is not None:
@@ -1430,7 +1446,6 @@ def main():
                 failed = []  # candidates that failed bootstrap, with n_match score
                 tried = cand_specs or [draft_quant_name]
                 for cand in tried:
-                    _restore(pre_prime_blob)  # fp16, 0..n_pt-2
                     cand_k_names, cand_v_names = quant_mod.resolve_quant_layers(cand, n_layer)
                     cand_k_gs, cand_v_gs = get_kv_group_sizes(
                         cand_k_names, cand_v_names, args.quant_group_size)
@@ -1447,63 +1462,121 @@ def main():
                         asym=args.asym, quant_fn_factory=None,
                         profile=kv_prof)
 
-                    cand_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=n_pt - 1)
-                    ret_w0 = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
-                    if ret_w0 != 0:
+                    if kv_after_prompt_fp16 is None:
                         continue
-                    cand_hook(ctx, n_new_k=1, n_new_v=1)  # quantize KV[n_pt-1]
-                    ptr_w0      = lib.llama_get_logits_ith(ctx, 0)
-                    cand_log_w0 = np.ctypeslib.as_array(ptr_w0, shape=(n_vocab,)).copy()
 
-                    if len(bootstrap_tokens) > 1:
-                        if need_av:
-                            cand_greedy_w0, cand_rows = strategies.verify_window(
-                                lib, ctx, n_vocab,
-                                bootstrap_tokens[:-1],
-                                pos_start=n_pt,
-                                kv_hook=cand_hook,
-                                k_group_size=cand_k_gs, v_group_size=cand_v_gs,
-                                return_logits=True)
-                            w0_ok = (
-                                strategies.adaptive_verify_accept(
-                                    cand_log_w0, bootstrap_tokens[0], av_k, av_p)
-                                and all(
+                    kv_roll = kv_after_prompt_fp16
+                    prime_tok_bs = pt[-1]
+                    prime_pos_bs = n_pt - 1
+                    off = 0
+                    w0_ok = True
+                    n_match = 0
+
+                    if not bootstrap_tokens:
+                        w0_ok = False
+
+                    while w0_ok and off < len(bootstrap_tokens):
+                        w_chunk = min(W, len(bootstrap_tokens) - off)
+                        pos_start = prime_pos_bs + 1
+                        ref_chunk = bootstrap_tokens[off:off + w_chunk]
+
+                        _restore(kv_roll)
+                        cand_hook(ctx, n_new_k=None, n_new_v=None,
+                                  n_prompt=0, n_seq_len=prime_pos_bs + 1)
+                        ret = strategies._single_decode(lib, ctx, prime_tok_bs, prime_pos_bs)
+                        if ret != 0:
+                            w0_ok = False
+                            n_match = off
+                            break
+                        cand_hook(ctx, n_new_k=1, n_new_v=1)
+                        ptr_d = lib.llama_get_logits_ith(ctx, 0)
+                        d_logits = np.ctypeslib.as_array(ptr_d, shape=(n_vocab,)).copy()
+                        draft_tokens = strategies.generate_window(
+                            lib, ctx, n_vocab, int(np.argmax(d_logits)),
+                            pos_start=pos_start, W=w_chunk,
+                            kv_hook=cand_hook,
+                            k_group_size=cand_k_gs, v_group_size=cand_v_gs,
+                            stop_fn=_is_eog)
+
+                        _restore(kv_roll)
+                        if ver_hook is not None:
+                            ver_hook(ctx, n_new_k=None, n_new_v=None,
+                                     n_prompt=0, n_seq_len=prime_pos_bs + 1)
+                        ret_v = strategies._single_decode(lib, ctx, prime_tok_bs, prime_pos_bs)
+                        if ret_v != 0:
+                            w0_ok = False
+                            n_match = off
+                            break
+                        if ver_hook is not None:
+                            ver_hook(ctx, n_new_k=1, n_new_v=1)
+                        ptr_v = lib.llama_get_logits_ith(ctx, 0)
+                        v_logits = np.ctypeslib.as_array(ptr_v, shape=(n_vocab,)).copy()
+
+                        if len(draft_tokens) > 1:
+                            if need_av:
+                                v_greedy, v_log_rows = strategies.verify_window(
+                                    lib, ctx, n_vocab,
+                                    draft_tokens[:-1],
+                                    pos_start=pos_start,
+                                    kv_hook=ver_hook,
+                                    k_group_size=ver_k_gs,
+                                    v_group_size=ver_v_gs,
+                                    return_logits=True)
+                                window_ok = (
                                     strategies.adaptive_verify_accept(
-                                        cand_rows[i], bootstrap_tokens[i + 1], av_k, av_p)
-                                    for i in range(len(cand_greedy_w0))))
+                                        v_logits, draft_tokens[0], av_k, av_p)
+                                    and all(
+                                        strategies.adaptive_verify_accept(
+                                            v_log_rows[i], draft_tokens[i + 1], av_k, av_p)
+                                        for i in range(len(v_greedy))))
+                            else:
+                                v_pred0 = int(np.argmax(v_logits))
+                                v_greedy = strategies.verify_window(
+                                    lib, ctx, n_vocab,
+                                    draft_tokens[:-1],
+                                    pos_start=pos_start,
+                                    kv_hook=ver_hook,
+                                    k_group_size=ver_k_gs,
+                                    v_group_size=ver_v_gs)
+                                window_ok = (v_pred0 == draft_tokens[0] and
+                                             all(v_greedy[i] == draft_tokens[i + 1]
+                                                 for i in range(len(v_greedy))))
                         else:
-                            cand_pred0 = int(np.argmax(cand_log_w0))
-                            cand_greedy_w0 = strategies.verify_window(
-                                lib, ctx, n_vocab,
-                                bootstrap_tokens[:-1],
-                                pos_start=n_pt,
-                                kv_hook=cand_hook,
-                                k_group_size=cand_k_gs, v_group_size=cand_v_gs)
-                            w0_ok = (cand_pred0 == bootstrap_tokens[0] and
-                                     all(cand_greedy_w0[i] == bootstrap_tokens[i + 1]
-                                         for i in range(len(cand_greedy_w0))))
-                    else:
-                        w0_ok = strategies.adaptive_verify_accept(
-                            cand_log_w0, bootstrap_tokens[0], av_k, av_p)
+                            window_ok = strategies.adaptive_verify_accept(
+                                v_logits, draft_tokens[0], av_k, av_p)
+
+                        ref_ok = (len(draft_tokens) == len(ref_chunk) and
+                                  all(draft_tokens[i] == ref_chunk[i]
+                                      for i in range(len(ref_chunk))))
+
+                        if not (window_ok and ref_ok):
+                            w0_ok = False
+                            n_match = off
+                            for i in range(min(len(draft_tokens), len(ref_chunk))):
+                                if draft_tokens[i] != ref_chunk[i]:
+                                    break
+                                n_match += 1
+                            break
+
+                        kv_roll = _save_ckpt()
+                        prime_tok_bs = ref_chunk[-1]
+                        prime_pos_bs = pos_start + len(ref_chunk) - 1
+                        off += len(ref_chunk)
+
+                    if w0_ok and off != len(bootstrap_tokens):
+                        w0_ok = False
 
                     # ── Per-candidate bootstrap diagnostic ───────────────
                     if not w0_ok:
-                        if not need_av and len(bootstrap_tokens) > 1:
-                            # W total checks: cand_pred0 (1) + cand_greedy_w0 (W-1)
-                            n_match = int(cand_pred0 == bootstrap_tokens[0])
-                            n_match += sum(
-                                1 for i, g in enumerate(cand_greedy_w0)
-                                if g == bootstrap_tokens[i + 1])
-                            w_total = len(bootstrap_tokens)  # W = cand_pred0 + greedy_w0
+                        if len(bootstrap_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
-                                  f"({n_match}/{w_total} tokens matched)",
+                                  f"({n_match}/{len(bootstrap_tokens)} tokens matched)",
                                   flush=True)
                         else:
-                            n_match = -1  # unknown (need_av or single-token bootstrap)
                             print(f"      {cand}: bootstrap FAIL", flush=True)
                         failed.append({
                             "name":  cand,
-                            "match": n_match,
+                            "match": n_match if len(bootstrap_tokens) > 1 else -1,
                             "bits":  _quant_bits_estimate(cand),
                             "hook":  cand_hook,
                             "k_gs":  cand_k_gs,
