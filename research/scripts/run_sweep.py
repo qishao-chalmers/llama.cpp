@@ -1401,6 +1401,12 @@ def main():
 
             logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
 
+            # fp16 checkpoint after full prompt (KV 0..n_pt-1), before bootstrap gen.
+            # Must be saved here — not by restoring pre_prime after bootstrap — or GPU KV
+            # shadow shrinks the live buffer and restore(kv_boundary) fails (checkpoint
+            # larger than live allocation).
+            kv_after_prompt_fp16 = _save_ckpt()
+
             # ── Bootstrap window: fp16 generates W_b tokens ─────────────────
             bootstrap_tokens = strategies.generate_window(
                 lib, ctx, n_vocab, int(np.argmax(logits)),
@@ -1416,18 +1422,6 @@ def main():
             kv_boundary = _save_ckpt()
             prime_tok = bootstrap_tokens[-1]
             prime_pos = n_pt + len(bootstrap_tokens) - 1
-
-            # fp16 checkpoint after full prompt (KV 0..n_pt-1): same boundary rollout uses
-            # for the first window (restore → bulk quant with n_seq_len=n_pt).
-            kv_after_prompt_fp16 = None
-            if pre_prime_blob is not None:
-                _restore(pre_prime_blob)
-                ret_pp = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
-                if ret_pp != 0:
-                    results.append(None)
-                    continue
-                kv_after_prompt_fp16 = _save_ckpt()
-                _restore(kv_boundary)
 
             ex_draft_hook = draft_hook
             ex_draft_k_gs = draft_k_gs
