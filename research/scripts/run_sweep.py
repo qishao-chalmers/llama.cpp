@@ -455,8 +455,10 @@ def main():
                              "Records acceptance_rate, first_fail_window, draft_fraction per example. "
                              "Requires --eval-accuracy --skip-ppl --corpus-mode structured.")
     parser.add_argument("--verifier-quant", default="int4_ch",
-                        help="Verifier quant for --adaptive-sim (default: int4_ch). "
-                             "Draft quant is each entry in --quants (excluding fp16 and the verifier).")
+                        help="Verifier KV quant: --adaptive-sim (draft vs verifier windows) and "
+                             "--adaptive-gen Step B (replay draft under this quant vs fp16 restore). "
+                             "Default int4_ch. For adaptive-gen with a fp16 teacher, pass fp16. "
+                             "Draft sweep uses each --quants entry (excluding fp16 and this verifier).")
     parser.add_argument("--adaptive-gen",    action="store_true",
                         help="Real adaptive generation: window 0 uses fp16, then each window "
                              "int4 draft generates W tokens, fp16 verifies; accepted windows "
@@ -996,7 +998,9 @@ def main():
         return sim_results
 
     def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs,
-                         use_gpu_shadow=False, n_layer=0, draft_quant_name="draft"):
+                         use_gpu_shadow=False, n_layer=0, draft_quant_name="draft",
+                         ver_hook=None, ver_k_gs=64, ver_v_gs=64,
+                         verifier_quant_name="fp16"):
         """Real adaptive generation: fp16 bootstrap + draft-quant generation + fp16 verification.
 
         Window 0: fp16 generates W tokens (bootstrap / ground truth).
@@ -1022,6 +1026,9 @@ def main():
 
         KV invariant after a successful verify: positions 0..prime_pos-1 hold fp16-derived
         values; the next draft bulk-quantizes from that fp16 snapshot again.
+
+        Step B (verify): ver_hook=None when --verifier-quant fp16 (teacher). Otherwise bulk-quant
+        + verify_window under --verifier-quant — acceptance matches that verifier replay.
 
         Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction,
         segments (list of {quant, n_tokens} for generated output timeline).
@@ -1199,27 +1206,33 @@ def main():
                     k_group_size=draft_k_gs, v_group_size=draft_v_gs,
                     stop_fn=_is_eog)
 
-                # Step B: fp16 verifies draft_toks (restore fp16 boundary first).
+                # Step B: verifier replays draft_toks (--verifier-quant, or fp16 if ver_hook None).
                 _restore(kv_boundary)
+                if ver_hook is not None:
+                    ver_hook(ctx, n_new_k=None, n_new_v=None)
                 ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
                 if ret != 0:
                     break
+                if ver_hook is not None:
+                    ver_hook(ctx, n_new_k=1, n_new_v=1)
                 ptr         = lib.llama_get_logits_ith(ctx, 0)
-                fp16_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-                fp16_pred0  = int(np.argmax(fp16_logits))
+                v_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+                v_pred0  = int(np.argmax(v_logits))
 
                 if len(draft_toks) > 1:
-                    fp16_greedy = strategies.verify_window(
+                    v_greedy = strategies.verify_window(
                         lib, ctx, n_vocab,
                         draft_toks[:-1],
                         pos_start=pos_start,
-                        kv_hook=None)
-                    window_ok = (fp16_pred0 == draft_toks[0] and
-                                 all(fp16_greedy[i] == draft_toks[i + 1]
-                                     for i in range(len(fp16_greedy))))
+                        kv_hook=ver_hook,
+                        k_group_size=ver_k_gs,
+                        v_group_size=ver_v_gs)
+                    window_ok = (v_pred0 == draft_toks[0] and
+                                 all(v_greedy[i] == draft_toks[i + 1]
+                                     for i in range(len(v_greedy))))
                 else:
-                    fp16_greedy = []
-                    window_ok   = (fp16_pred0 == draft_toks[0])
+                    v_greedy = []
+                    window_ok   = (v_pred0 == draft_toks[0])
 
                 if window_ok:
                     n_accepted += 1
@@ -1266,13 +1279,14 @@ def main():
                 print(f"    segments: {seg_line}", flush=True)
 
             results.append({
-                "gen_ids":         trimmed,
-                "n_tokens":        len(trimmed),
-                "n_attempted":     n_attempted,
-                "n_accepted":      n_accepted,
-                "acceptance_rate": acc,
-                "draft_fraction":  dfrac,
-                "segments":        [{"quant": q, "n_tokens": n} for q, n in seg_adj],
+                "gen_ids":           trimmed,
+                "n_tokens":          len(trimmed),
+                "n_attempted":       n_attempted,
+                "n_accepted":        n_accepted,
+                "acceptance_rate":   acc,
+                "draft_fraction":    dfrac,
+                "verifier_quant":    verifier_quant_name,
+                "segments":          [{"quant": q, "n_tokens": n} for q, n in seg_adj],
             })
 
         return results
@@ -1727,7 +1741,7 @@ def main():
                           f"all_ok={n_all_ok}/{len(valid)}", flush=True)
                     if args.save_per_example:
                         _per_example_results[f"{quant_name}__adaptive_sim"] = sim_per_ex
-                # ── Adaptive gen: real draft generation + fp16 verify ────────
+                # ── Adaptive gen: draft generation + configurable verify (Step B) ─
                 gen_pregenerated = None
                 gen_stats_valid  = []
                 if args.adaptive_gen and quant_name != "fp16":
@@ -1739,15 +1753,34 @@ def main():
                         asym=args.asym,
                         quant_fn_factory=_factory if args.save_bins else None,
                         profile=kv_prof)
+                    ver_vq = args.verifier_quant
+                    if ver_vq != "fp16":
+                        ver_k_names, ver_v_names = quant_mod.resolve_quant_layers(
+                            ver_vq, n_layer)
+                        ver_k_gs, ver_v_gs = get_kv_group_sizes(
+                            ver_k_names, ver_v_names, args.quant_group_size)
+                        ver_hook_gen = make_kv_hook(
+                            lib, ver_k_names, ver_v_names, args.n_pos_per_embd,
+                            use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
+                            default_group_size=args.quant_group_size,
+                            n_sink=0, n_recent=0,
+                            asym=args.asym, quant_fn_factory=None,
+                            profile=kv_prof)
+                    else:
+                        ver_hook_gen = None
+                        ver_k_gs, ver_v_gs = k_group_size, v_group_size
                     ag_use_shadow = (
                         use_gpu and HAS_GPU_KV_SHADOW and not args.no_adaptive_gen_gpu_shadow)
-                    print(f"  [adaptive-gen] draft={quant_name} window={args.adaptive_window} "
+                    print(f"  [adaptive-gen] draft={quant_name} verify={ver_vq} "
+                          f"window={args.adaptive_window} "
                           f"kv_ckpt={'gpu_d2d' if ag_use_shadow else 'cpu_blob'}",
                           flush=True)
                     gen_results = run_adaptive_gen(
                         examples, adaptive_draft_hook_gen, k_group_size, v_group_size,
                         use_gpu_shadow=ag_use_shadow, n_layer=n_layer,
-                        draft_quant_name=quant_name)
+                        draft_quant_name=quant_name,
+                        ver_hook=ver_hook_gen, ver_k_gs=ver_k_gs, ver_v_gs=ver_v_gs,
+                        verifier_quant_name=ver_vq)
                     gen_pregenerated = gen_results
                     gen_stats_valid  = [r for r in gen_results if r is not None]
                     if gen_stats_valid:
@@ -1780,10 +1813,11 @@ def main():
                     }
                 if args.adaptive_gen and quant_name != "fp16" and gen_stats_valid:
                     entry["adaptive_gen"] = {
-                        "window_size":     args.adaptive_window,
-                        "mean_acceptance": mg_acc,
-                        "mean_draft_frac": mg_dfrac,
-                        "n_examples":      len(gen_stats_valid),
+                        "window_size":       args.adaptive_window,
+                        "verifier_quant":    args.verifier_quant,
+                        "mean_acceptance":   mg_acc,
+                        "mean_draft_frac":   mg_dfrac,
+                        "n_examples":        len(gen_stats_valid),
                     }
                 if args.save_per_example:
                     _per_example_results[quant_name] = per_ex_q
