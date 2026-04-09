@@ -996,7 +996,7 @@ def main():
         return sim_results
 
     def run_adaptive_gen(examples, draft_hook, draft_k_gs, draft_v_gs,
-                         use_gpu_shadow=False, n_layer=0):
+                         use_gpu_shadow=False, n_layer=0, draft_quant_name="draft"):
         """Real adaptive generation: fp16 bootstrap + draft-quant generation + fp16 verification.
 
         Window 0: fp16 generates W tokens (bootstrap / ground truth).
@@ -1023,10 +1023,35 @@ def main():
         KV invariant after a successful verify: positions 0..prime_pos-1 hold fp16-derived
         values; the next draft bulk-quantizes from that fp16 snapshot again.
 
-        Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction.
+        Returns list of dicts per example: gen_ids, acceptance_rate, draft_fraction,
+        segments (list of {quant, n_tokens} for generated output timeline).
         """
         W = args.adaptive_window
         results = []
+
+        def _emit_segment(buf: list, name: str, n: int) -> None:
+            """Merge consecutive runs with the same quant label."""
+            if n <= 0:
+                return
+            if buf and buf[-1][0] == name:
+                buf[-1] = (name, buf[-1][1] + n)
+            else:
+                buf.append((name, n))
+
+        def _adjust_segments_for_trim(buf: list, gen_len: int, trimmed_len: int) -> list:
+            """Drop trailing token counts when trimming at EOG (gen_ids longer than trimmed)."""
+            if gen_len <= trimmed_len or not buf:
+                return buf
+            drop = gen_len - trimmed_len
+            out = list(buf)
+            while drop > 0 and out:
+                name, n = out[-1]
+                if n > drop:
+                    out[-1] = (name, n - drop)
+                    break
+                drop -= n
+                out.pop()
+            return out
 
         def _save_ckpt():
             if use_gpu_shadow:
@@ -1098,6 +1123,8 @@ def main():
                 stop_fn=_is_eog)
 
             gen_ids = list(bootstrap)
+            segments: list[tuple[str, int]] = []
+            _emit_segment(segments, "fp16", len(bootstrap))
             # KV = 0..n_pt+len(bootstrap)-2 (all fp16)
             kv_boundary = _save_ckpt()
             prime_tok = bootstrap[-1]
@@ -1197,6 +1224,7 @@ def main():
                 if window_ok:
                     n_accepted += 1
                     gen_ids    += draft_toks
+                    _emit_segment(segments, draft_quant_name, len(draft_toks))
                     # KV is fp16 from verify_window; save new boundary blob.
                     kv_boundary = _save_ckpt()
                     prime_tok = draft_toks[-1]
@@ -1215,6 +1243,7 @@ def main():
                         kv_hook=None,
                         stop_fn=_is_eog)
                     gen_ids   += fb_toks
+                    _emit_segment(segments, "fp16", len(fb_toks))
                     kv_boundary = _save_ckpt()
                     prime_tok = fb_toks[-1]
                     prime_pos = pos_start + len(fb_toks) - 1
@@ -1228,9 +1257,13 @@ def main():
 
             acc   = n_accepted / max(n_attempted, 1)
             dfrac = n_accepted * W / max(len(trimmed), 1)
+            seg_adj = _adjust_segments_for_trim(segments, len(gen_ids), len(trimmed))
+            seg_line = "  ".join(f"{q}({n})" for q, n in seg_adj)
             print(f"  adaptive-gen ex {ei+1}/{len(examples)}: {label} | "
                   f"acc={acc:.2f}  draft_frac={dfrac:.2f}  "
                   f"n_tok={len(trimmed)}", flush=True)
+            if seg_line:
+                print(f"    segments: {seg_line}", flush=True)
 
             results.append({
                 "gen_ids":         trimmed,
@@ -1239,6 +1272,7 @@ def main():
                 "n_accepted":      n_accepted,
                 "acceptance_rate": acc,
                 "draft_fraction":  dfrac,
+                "segments":        [{"quant": q, "n_tokens": n} for q, n in seg_adj],
             })
 
         return results
@@ -1712,7 +1746,8 @@ def main():
                           flush=True)
                     gen_results = run_adaptive_gen(
                         examples, adaptive_draft_hook_gen, k_group_size, v_group_size,
-                        use_gpu_shadow=ag_use_shadow, n_layer=n_layer)
+                        use_gpu_shadow=ag_use_shadow, n_layer=n_layer,
+                        draft_quant_name=quant_name)
                     gen_pregenerated = gen_results
                     gen_stats_valid  = [r for r in gen_results if r is not None]
                     if gen_stats_valid:
