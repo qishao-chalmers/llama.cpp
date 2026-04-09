@@ -6,7 +6,7 @@ Usage:
         --n-ctx 128 --n-chunks 20 --n-threads 8 --out results.json
 """
 
-import argparse, json, math, os, re, sys, time
+import argparse, html, json, math, os, re, sys, time
 from collections import Counter
 import numpy as np
 
@@ -100,6 +100,106 @@ def _segment_quant_viz_rows(segments, n_tokens, width=_QVIZ_WIDTH):
     return ["".join(r) for r in rows]
 
 
+def _quant_viz_color_hex(qname: str) -> str:
+    """Background color for segment column: light gray (int2) → black (fp16)."""
+    if not qname or qname == "fp16":
+        return "#000000"
+    q = qname.lower()
+    if "int8" in q:
+        return "#2a2a2a"
+    if "int4" in q:
+        return "#555555"
+    if "int3" in q:
+        return "#909090"
+    if "int2" in q:
+        return "#c8c8c8"
+    if "nf4" in q or "fp8" in q:
+        return "#707070"
+    if "bf16" in q:
+        return "#404040"
+    return "#808080"
+
+
+def _hex_to_rgb_triple(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _segment_quant_viz_color_rows(segments, n_tokens, width=_QVIZ_WIDTH):
+    """Same geometry as ASCII qviz: list of rows (top first), each cell None or #RGB hex."""
+    if width <= 0 or n_tokens <= 0 or not segments:
+        return []
+    total = sum(n for _, n in segments)
+    if total <= 0:
+        return []
+    nrows = _QVIZ_HEIGHT
+    rows = [[None] * width for _ in range(nrows)]
+    for k in range(width):
+        mid = (k + 0.5) * total / width
+        acc = 0.0
+        qn = segments[-1][0]
+        for q, n in segments:
+            if acc + n > mid:
+                qn = q
+                break
+            acc += n
+        col = _quant_viz_color_hex(qn)
+        h, _ = _quant_viz_stack(qn)
+        base = nrows - h
+        for r in range(base, nrows):
+            rows[r][k] = col
+    while len(rows) > 1 and all(rows[0][j] is None for j in range(width)):
+        rows.pop(0)
+    return rows
+
+
+def _segment_quant_viz_html(segments, n_tokens, width=_QVIZ_WIDTH, title=""):
+    """HTML table: one cell per token column; height = stack; color = quant (gray scale)."""
+    color_rows = _segment_quant_viz_color_rows(segments, n_tokens, width=width)
+    if not color_rows:
+        return ""
+    parts = []
+    if title:
+        parts.append(f'<div class="qviz-title">{html.escape(title)}</div>')
+    parts.append('<table class="qviz-grid" style="border-collapse:collapse;border-spacing:0;margin:4px 0;">')
+    for row in color_rows:
+        parts.append("<tr>")
+        for cell in row:
+            if cell is None:
+                parts.append("""<td style="width:10px;height:10px;padding:0;background:#ffffff;"></td>""")
+            else:
+                parts.append(
+                    f'<td style="width:10px;height:10px;padding:0;background:{cell};"></td>')
+        parts.append("</tr>")
+    parts.append("</table>")
+    parts.append(
+        '<p class="qviz-legend" style="font-size:11px;color:#444;margin:0">'
+        "Taller = higher precision (fp16); darker = higher precision; "
+        "int2 light gray → fp16 black.</p>")
+    return "".join(parts)
+
+
+def _segment_quant_viz_ansi_lines(segments, n_tokens, width=_QVIZ_WIDTH):
+    """Return lines for terminal: 24-bit background color per cell, two spaces per column."""
+    color_rows = _segment_quant_viz_color_rows(segments, n_tokens, width=width)
+    if not color_rows:
+        return []
+    reset = "\033[0m"
+    white = "\033[48;2;255;255;255m"
+    lines = []
+    for row in color_rows:
+        buf = []
+        for cell in row:
+            if cell is None:
+                buf.append(f"{white}  ")
+            else:
+                r, g, b = _hex_to_rgb_triple(cell)
+                buf.append(f"\033[48;2;{r};{g};{b}m  ")
+        buf.append(reset)
+        lines.append("".join(buf))
+    return lines
+
+
 _QVIZ_LEGEND = (
     "qviz: draft/fp16 (~n_tok/64/col); fp16=:::::::: int8=:::: int4=:: int3=.: int2=:; "
     "verifier quant not in segment names"
@@ -170,6 +270,12 @@ def _apply_window(main_hook, n_sink, n_recent,
 
     Prefill: all three zones quantized in one shot.
     Caller must pass n_prompt= on the prefill call so zone boundaries are known.
+
+    Adaptive-gen / KV-restore bulk quantize: pass n_prompt=0 and n_seq_len= (number of
+    tokens currently in the restored cache). That calls main_hook(n_new_k=None) once,
+    which resets per-layer pending and quantizes all cells — required for mixed
+    group-size hooks. Do *not* pass a fake n_prompt=prime_pos here: the zone splitter
+    mis-partitions the cache and passing stale sizes as n_new_k corrupts pending.
     """
     if (n_sink <= 0 and n_recent <= 0
             and sink_hook is None and recent_hook is None):
@@ -177,11 +283,17 @@ def _apply_window(main_hook, n_sink, n_recent,
 
     n_done = [0]  # K and V fire together after the group-size equality fix
 
-    def window_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=0, **_):
+    def window_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=0, n_seq_len=None, **_):
         G = n_new_k  # == n_new_v in practice; use a single counter
 
         if G is None:
-            # ── Prefill ──────────────────────────────────────────────────────
+            # ── Full-cache bulk (adaptive-gen after restore): no zone split ─────
+            if n_prompt == 0:
+                main_hook(ctx, n_new_k=None, n_new_v=None)
+                if n_seq_len is not None:
+                    n_done[0] = n_seq_len
+                return
+            # ── Prefill with zones (PPL / prompt load) ─────────────────────────
             n_done[0] = n_prompt
             sink_end     = min(n_sink, n_prompt)
             mid_start    = sink_end
@@ -586,6 +698,11 @@ def main():
                         help="For --adaptive-gen: use CPU KV blob save/restore (PCIe on GPU). "
                              "Default: GPU device-to-device shadow checkpoint via CuPy when "
                              "GPU KV is active.")
+    parser.add_argument("--qviz-html", default=None, metavar="FILE",
+                        help="With --adaptive-gen: write grayscale HTML segment qviz (tall=dark, "
+                             "short=light) to FILE.")
+    parser.add_argument("--qviz-ansi", action="store_true",
+                        help="With --adaptive-gen: print qviz using ANSI 24-bit background colors.")
     parser.add_argument("--profile-kv", action="store_true",
                         help="Time llama_decode vs KV quant hook. CPU path: get/parse/quant/pack/set "
                              "(parse_state). GPU path (--flash-attn + CuPy): gpu_kv_s includes "
@@ -1412,7 +1529,8 @@ def main():
 
                         # Draft window under candidate
                         _restore(probe_ckpt)
-                        cand_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=probe_prime_pos)
+                        cand_hook(ctx, n_new_k=None, n_new_v=None,
+                                  n_prompt=0, n_seq_len=probe_prime_pos + 1)
                         ret_p = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
                         if ret_p != 0:
                             break
@@ -1429,7 +1547,8 @@ def main():
                         # Verifier replay for acceptance
                         _restore(probe_ckpt)
                         if ver_hook is not None:
-                            ver_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=probe_prime_pos)
+                            ver_hook(ctx, n_new_k=None, n_new_v=None,
+                                     n_prompt=0, n_seq_len=probe_prime_pos + 1)
                         ret_vp = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
                         if ret_vp != 0:
                             break
@@ -1583,7 +1702,8 @@ def main():
                 # from --sink-tokens/--recent-tokens) so the draft attends to the correct
                 # quantized background — matching the real deployment configuration.
                 _restore(kv_boundary)
-                ex_draft_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=prime_pos)  # bulk: 0..prime_pos-1 → draft
+                ex_draft_hook(ctx, n_new_k=None, n_new_v=None,
+                              n_prompt=0, n_seq_len=prime_pos + 1)
                 ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
                 if ret != 0:
                     break
@@ -1600,7 +1720,8 @@ def main():
                 # Step B: verifier replays quant_rollout_tokens (--verifier-quant, or fp16).
                 _restore(kv_boundary)
                 if ver_hook is not None:
-                    ver_hook(ctx, n_new_k=None, n_new_v=None, n_prompt=prime_pos)
+                    ver_hook(ctx, n_new_k=None, n_new_v=None,
+                             n_prompt=0, n_seq_len=prime_pos + 1)
                 ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
                 if ret != 0:
                     break
@@ -1701,14 +1822,26 @@ def main():
                     for q in quants_seen)
                 print(f"    segments({len(seg_adj)}): {seg_summary}", flush=True)
             qviz_lines = []
+            qviz_html_fragment = None
             if seg_adj:
                 qviz_lines = _segment_quant_viz_rows(seg_adj, len(trimmed), width=_QVIZ_WIDTH)
+                if getattr(args, "qviz_html", None):
+                    qviz_html_fragment = _segment_quant_viz_html(
+                        seg_adj, len(trimmed), width=_QVIZ_WIDTH, title=label)
                 if qviz_lines:
                     if not qviz_legend_printed:
                         print(f"    {_QVIZ_LEGEND}", flush=True)
+                        if getattr(args, "qviz_ansi", False):
+                            print("    qviz-ansi: 24-bit background; taller=darker; "
+                                  "int2 light gray → fp16 black; empty=white", flush=True)
                         qviz_legend_printed = True
-                    for i, row in enumerate(qviz_lines):
-                        print(f"    qviz{i + 1}: {row}", flush=True)
+                    if getattr(args, "qviz_ansi", False):
+                        for i, line in enumerate(_segment_quant_viz_ansi_lines(
+                                seg_adj, len(trimmed), width=_QVIZ_WIDTH)):
+                            print(f"    qviz{i + 1}: {line}", flush=True)
+                    else:
+                        for i, row in enumerate(qviz_lines):
+                            print(f"    qviz{i + 1}: {row}", flush=True)
 
             results.append({
                 "gen_ids":           trimmed,
@@ -1721,6 +1854,7 @@ def main():
                 "adaptive_verify":   _adaptive_verify_label(args),
                 "segments":          [{"quant": q, "n_tokens": n} for q, n in seg_adj],
                 "segment_quant_viz": qviz_lines,
+                "segment_quant_viz_html": qviz_html_fragment,
             })
 
         return results
@@ -2246,6 +2380,19 @@ def main():
                               f"mean_draft_frac={mg_dfrac:.3f}", flush=True)
                     if args.save_per_example:
                         _per_example_results[f"{quant_name}__adaptive_gen"] = gen_results
+                    if args.qviz_html and gen_results:
+                        out_h = args.qviz_html
+                        with open(out_h, "w", encoding="utf-8") as hf:
+                            hf.write("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                                     "<title>segment qviz</title>\n")
+                            hf.write("<style>body{font-family:system-ui,sans-serif;margin:12px}"
+                                     "</style></head><body>\n")
+                            for r in gen_results:
+                                if r and r.get("segment_quant_viz_html"):
+                                    hf.write(r["segment_quant_viz_html"])
+                                    hf.write("<hr/>\n")
+                            hf.write("</body></html>\n")
+                        print(f"  [adaptive-gen] qviz HTML written: {out_h}", flush=True)
 
                 mean_score, nt, per_ex_q, gl = eval_accuracy_pass(
                     examples, gold_answers,
