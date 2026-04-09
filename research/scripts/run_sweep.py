@@ -454,10 +454,10 @@ def main():
                              "--verifier-quant in parallel, compare window-by-window. "
                              "Records acceptance_rate, first_fail_window, draft_fraction per example. "
                              "Requires --eval-accuracy --skip-ppl --corpus-mode structured.")
-    parser.add_argument("--verifier-quant", default="int4_ch",
+    parser.add_argument("--verifier-quant", default="int8_ch",
                         help="Verifier KV quant: --adaptive-sim (draft vs verifier windows) and "
-                             "--adaptive-gen Step B (replay draft under this quant vs fp16 restore). "
-                             "Default int4_ch. For adaptive-gen with a fp16 teacher, pass fp16. "
+                             "--adaptive-gen Step B (replay draft under this quant). "
+                             "Default int8_ch. Use fp16 for strict fp16-teacher verification. "
                              "Draft sweep uses each --quants entry (excluding fp16 and this verifier).")
     parser.add_argument("--adaptive-gen",    action="store_true",
                         help="Real adaptive generation: window 0 uses fp16, then each window "
