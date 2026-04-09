@@ -1273,12 +1273,11 @@ def main():
           c. Verifier acceptance (--adaptive-verify-top-k / --adaptive-verify-top-p or greedy);
            on accept keep quant rollout; else fp16 regenerates this window (fallback).
 
-        KV save/restore (performance):
-        - Default when GPU KV + CuPy: gpu_kv_shadow.GpuKvShadowCheckpoint — cudaMemcpy D→D
-          per layer via llama_get_kv_layer_info (no PCIe).
-        - With --no-adaptive-gen-gpu-shadow or CPU inference: save_kv_state / restore_kv_state
-          (llama_state_seq_get_data / set_data), full blob through CPU; PCIe each call on GPU
-          for GPU-backed KV.
+        KV save/restore:
+        - With --adaptive-gen-gpu-shadow: each checkpoint saves GPU D2D tensors plus a CPU
+          seq blob; restore uses the CPU path so metadata matches llama (D2D-only restore
+          can desync positions vs tensor bytes). PCIe cost is like the no-CuPy case.
+        - Without gpu-shadow: save_kv_state / restore_kv_state only.
         Hot path per quant rollout window: typically two restores (before draft quant,
         before verifier) plus one save after accept/reject — three checkpoint operations per
         window attempt.
@@ -1335,21 +1334,14 @@ def main():
                 out.pop()
             return out
 
-        def _save_ckpt():
-            if use_gpu_shadow:
-                ck = gpu_kv_shadow.GpuKvShadowCheckpoint()
-                ck.save(lib, ctx, n_layer)
-                return ck
-            return strategies.save_kv_state(lib, ctx)
-
-        def _restore(ck):
-            if use_gpu_shadow:
-                ck.restore(lib, ctx, n_layer)
-            else:
-                strategies.restore_kv_state(lib, ctx, ck)
-
         def _save_ckpt_pair():
-            """GPU D2D snapshot plus CPU seq bytes; restore prefers GPU, falls back to CPU."""
+            """GPU D2D snapshot plus CPU seq bytes.
+
+            Restore always uses the CPU blob when present: D2D memcpy alone does not
+            reliably resync llama KV metadata (v_cells / positions) with tensor bytes,
+            which breaks bootstrap verify under --adaptive-gen-gpu-shadow; CPU restore
+            matches the no-CuPy path. GPU copies are kept for debugging / future use.
+            """
             if use_gpu_shadow:
                 g = gpu_kv_shadow.GpuKvShadowCheckpoint()
                 g.save(lib, ctx, n_layer)
@@ -1359,13 +1351,13 @@ def main():
 
         def _restore_ckpt_pair(pair):
             g, c = pair
+            if c is not None:
+                strategies.restore_kv_state(lib, ctx, c)
+                return
             if g is not None:
-                try:
-                    g.restore(lib, ctx, n_layer)
-                    return
-                except RuntimeError:
-                    pass
-            strategies.restore_kv_state(lib, ctx, c)
+                g.restore(lib, ctx, n_layer)
+                return
+            raise RuntimeError("restore_ckpt_pair: empty checkpoint")
 
         for ei, (pt, ct, label) in enumerate(examples):
             max_ctx_avail = args.n_ctx - len(pt) - 1
@@ -1399,7 +1391,7 @@ def main():
                     continue
                 lib.llama_batch_free(batch)
                 # Save KV = 0..n_pt-2 (fp16); prime boundary for window 0
-                pre_prime_blob = _save_ckpt()
+                pre_prime_blob = _save_ckpt_pair()
                 # Part 2: decode last prompt token (logits for bootstrap window)
                 ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
                 if ret != 0:
@@ -1411,7 +1403,7 @@ def main():
                 # so bootstrap candidate selection can restore → quantize → decode pt[0]
                 # (same roles as pre_prime_blob for n_pt>1). Without this, pre_prime_blob is
                 # None and we skip draft auto-pick, leaving draft_quant_name (often int2_ch).
-                pre_prime_blob = _save_ckpt()
+                pre_prime_blob = _save_ckpt_pair()
                 ret = strategies._single_decode(lib, ctx, pt[0], 0)
                 if ret != 0:
                     results.append(None)
@@ -1489,7 +1481,7 @@ def main():
                         # fp16 prompt checkpoint already has pt[-1] at n_pt-1, which would
                         # duplicate position (llama requires Y = X+1).
                         if off == 0:
-                            _restore(pre_prime_blob)
+                            _restore_ckpt_pair(pre_prime_blob)
                             cand_hook(ctx, n_new_k=None, n_new_v=None,
                                       n_prompt=n_pt - 1)
                             ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
@@ -1519,7 +1511,7 @@ def main():
                             stop_fn=_is_eog)
 
                         if off == 0:
-                            _restore(pre_prime_blob)
+                            _restore_ckpt_pair(pre_prime_blob)
                             if ver_hook is not None:
                                 ver_hook(ctx, n_new_k=None, n_new_v=None,
                                          n_prompt=n_pt - 1)
