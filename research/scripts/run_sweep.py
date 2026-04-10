@@ -231,6 +231,20 @@ def _quant_bits_estimate(qspec: str) -> int:
     return bits or 16
 
 
+def _bootstrap_est_cost_ms_per_tok(agree_rate: float, t_quant: float, t_recover: float) -> float:
+    """Expected ms/token: a * t_quant + (1-a) * t_recover (mixture model)."""
+    return agree_rate * t_quant + (1.0 - agree_rate) * t_recover
+
+
+def _bootstrap_quant_ms_lookup(name: str, ms_map: dict, default_ms) -> float:
+    """Resolve ms/token for quant path; default_ms used when name missing from ms_map."""
+    if name in ms_map:
+        return float(ms_map[name])
+    if default_ms is not None:
+        return float(default_ms)
+    raise KeyError(name)
+
+
 def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
                         quant_fn_factory=None, profile=None):
     """Build a bare CPU hook (no window logic) for a specific quant type.
@@ -690,13 +704,28 @@ def main():
                         metavar="N",
                         help="After bootstrap, run N rollout probe windows per candidate "
                              "(default: 0 = disabled). When disabled, bootstrap_pick uses "
-                             "bootstrap agree-rate + --bootstrap-pick-epsilon (see there).")
+                             "--bootstrap-pick-mode (agree-rate vs cost; see there).")
     parser.add_argument("--bootstrap-pick-epsilon", type=float, default=0.02,
                         metavar="E",
-                        help="With --bootstrap-probe-windows 0: among candidates whose "
-                             "verifier-agree rate is within E of the best, pick the lowest-bit "
-                             "quant. Agree rate = (full-window + verif-prefix tokens) / bootstrap "
-                             "ref length. Default 0.02.")
+                        help="With --bootstrap-probe-windows 0 and --bootstrap-pick-mode agree-rate: "
+                             "among candidates whose verifier-agree rate is within E of the best, "
+                             "pick the lowest-bit quant. Default 0.02.")
+    parser.add_argument("--bootstrap-pick-mode", choices=("agree-rate", "cost"),
+                        default="agree-rate",
+                        help="When --bootstrap-probe-windows 0: agree-rate (ε band + min bits) or "
+                             "cost (min expected ms/token; requires --bootstrap-ms-recover and "
+                             "quant timings). Ignored when probe is enabled.")
+    parser.add_argument("--bootstrap-ms-recover", type=float, default=None,
+                        metavar="MS",
+                        help="For --bootstrap-pick-mode cost: ms per token on fp16/int8 recovery "
+                             "(reject path). Required for cost mode.")
+    parser.add_argument("--bootstrap-ms-quant-file", default=None, metavar="FILE",
+                        help="JSON object mapping quant name -> ms per token on accepted draft "
+                             "path. For cost mode: provide this and/or --bootstrap-ms-quant-default.")
+    parser.add_argument("--bootstrap-ms-quant-default", type=float, default=None,
+                        metavar="MS",
+                        help="For cost mode: ms/token for any quant name missing in "
+                             "--bootstrap-ms-quant-file.")
     parser.add_argument("--adaptive-verify-top-k", type=int, default=None, metavar="K",
                         help="For --adaptive-sim/--adaptive-gen: accept draft tokens that appear "
                              "in the verifier's top-K (per position). Mutually exclusive with "
@@ -735,6 +764,10 @@ def main():
 
     if args.bootstrap_pick_epsilon < 0:
         parser.error("--bootstrap-pick-epsilon must be >= 0")
+    if args.bootstrap_ms_recover is not None and args.bootstrap_ms_recover < 0:
+        parser.error("--bootstrap-ms-recover must be >= 0")
+    if args.bootstrap_ms_quant_default is not None and args.bootstrap_ms_quant_default < 0:
+        parser.error("--bootstrap-ms-quant-default must be >= 0")
     if args.adaptive_verify_top_k is not None and args.adaptive_verify_top_k < 1:
         parser.error("--adaptive-verify-top-k must be >= 1")
     if args.adaptive_verify_top_p is not None:
@@ -1281,8 +1314,10 @@ def main():
         steers back like rollout: restore the chunk boundary and regenerate that window
         with fp16 (kv_hook=None), then continue.  Logs report verifier–draft prefix length
         within each failed chunk (verif-prefix + chunk-tail).  Post-bootstrap probe windows
-        are controlled by --bootstrap-probe-windows (default 0 = disabled) and
-        --bootstrap-pick-epsilon (best agree-rate band, then min bits).
+        are controlled by --bootstrap-probe-windows (default 0 = disabled).
+        When probe is off: --bootstrap-pick-mode agree-rate uses --bootstrap-pick-epsilon
+        (band + min bits); cost mode minimizes a*t_quant+(1-a)*t_recover using
+        --bootstrap-ms-recover and --bootstrap-ms-quant-file / --bootstrap-ms-quant-default.
         A solo int8/fp16 greedy string is still
         computed only to print fp16-vs-int8 diagnostics — it is not required to match
         the draft (that extra check was stricter than rollout and misleading).
@@ -1536,6 +1571,28 @@ def main():
                 tried = cand_specs or [draft_quant_name]
                 bootstrap_probe_disabled = max(0, args.bootstrap_probe_windows) == 0
                 probe_min_rate = 0.90
+                use_cost_pick = (
+                    bootstrap_probe_disabled
+                    and args.bootstrap_pick_mode == "cost")
+                cost_t_recover = None
+                cost_ms_map = {}
+                cost_ms_default = None
+                if use_cost_pick:
+                    if args.bootstrap_ms_recover is None:
+                        raise ValueError(
+                            "--bootstrap-pick-mode cost requires --bootstrap-ms-recover")
+                    cost_t_recover = float(args.bootstrap_ms_recover)
+                    if args.bootstrap_ms_quant_file:
+                        qpath = os.path.expanduser(args.bootstrap_ms_quant_file)
+                        with open(qpath, encoding="utf-8") as _cf:
+                            cost_ms_map = json.load(_cf)
+                        if not isinstance(cost_ms_map, dict):
+                            raise ValueError("--bootstrap-ms-quant-file must be a JSON object")
+                    cost_ms_default = args.bootstrap_ms_quant_default
+                    if not cost_ms_map and cost_ms_default is None:
+                        raise ValueError(
+                            "--bootstrap-pick-mode cost requires --bootstrap-ms-quant-file "
+                            "and/or --bootstrap-ms-quant-default")
                 for cand in tried:
                     cand_k_names, cand_v_names = quant_mod.resolve_quant_layers(cand, n_layer)
                     cand_k_gs, cand_v_gs = get_kv_group_sizes(
@@ -1873,6 +1930,19 @@ def main():
                           flush=True)
                     _br_len = max(len(bootstrap_ref_tokens), 1)
                     _agree_toks = bootstrap_quant_toks + bootstrap_prefix_ok_toks
+                    _ar = _agree_toks / _br_len
+                    _est_cost = None
+                    if use_cost_pick:
+                        try:
+                            _tq = _bootstrap_quant_ms_lookup(
+                                cand, cost_ms_map, cost_ms_default)
+                        except KeyError as _e:
+                            raise KeyError(
+                                f"bootstrap cost mode: no ms/token for quant {cand!r}; "
+                                f"add to --bootstrap-ms-quant-file or set "
+                                f"--bootstrap-ms-quant-default") from _e
+                        _est_cost = _bootstrap_est_cost_ms_per_tok(
+                            _ar, _tq, cost_t_recover)
                     scored.append({
                         "name":   cand,
                         "rate":   probe_rate,
@@ -1886,7 +1956,8 @@ def main():
                         "bootstrap_mismatch_toks":    bootstrap_mismatch_toks,
                         "probe_disabled":             probe_disabled,
                         "bootstrap_agree_toks":       _agree_toks,
-                        "bootstrap_agree_rate":       _agree_toks / _br_len,
+                        "bootstrap_agree_rate":       _ar,
+                        "est_cost_ms_per_tok":        _est_cost,
                     })
 
                 # Among candidates that pass the probe threshold, pick the most
@@ -1894,15 +1965,19 @@ def main():
                 # still meets the acceptance bar.  On a bits tie, prefer higher rate.
                 # If nothing clears the threshold, fall back to the highest-rate
                 # candidate (safest choice among those that were scored).
-                # When probe is disabled: best bootstrap_agree_rate, then candidates
-                # within --bootstrap-pick-epsilon of that rate, then min bits in that band.
+                # When probe is disabled: agree-rate mode (ε band + min bits) or cost mode
+                # (min a*t_quant + (1-a)*t_recover, tie-break bits).
                 if scored:
                     if bootstrap_probe_disabled:
                         eligible = scored
                     else:
                         eligible = [s for s in scored if s["rate"] >= probe_min_rate]
                     if eligible:
-                        if bootstrap_probe_disabled:
+                        if bootstrap_probe_disabled and use_cost_pick:
+                            win = min(
+                                eligible,
+                                key=lambda s: (s["est_cost_ms_per_tok"], s["bits"]))
+                        elif bootstrap_probe_disabled:
                             eps = float(args.bootstrap_pick_epsilon)
                             best_ag = max(s["bootstrap_agree_rate"] for s in eligible)
                             band = [
@@ -1916,21 +1991,34 @@ def main():
                     picked = (win["name"], win["hook"], win["k_gs"], win["v_gs"])
                     _br_show = len(bootstrap_ref_tokens)
                     if bootstrap_probe_disabled:
-                        summ = ", ".join(
-                            f"{s['name']}=agree{s['bootstrap_agree_rate']:.3f}"
-                            f"({s['bootstrap_agree_toks']}/{_br_show})"
-                            for s in sorted(scored, key=lambda s: (
-                                _quant_bits_estimate(s["name"]), s["name"])))
+                        if use_cost_pick:
+                            summ = ", ".join(
+                                f"{s['name']}=cost{s['est_cost_ms_per_tok']:.5f}"
+                                f"(agree{s['bootstrap_agree_rate']:.3f})"
+                                for s in sorted(scored, key=lambda s: (
+                                    _quant_bits_estimate(s["name"]), s["name"])))
+                        else:
+                            summ = ", ".join(
+                                f"{s['name']}=agree{s['bootstrap_agree_rate']:.3f}"
+                                f"({s['bootstrap_agree_toks']}/{_br_show})"
+                                for s in sorted(scored, key=lambda s: (
+                                    _quant_bits_estimate(s["name"]), s["name"])))
                     else:
                         summ = ", ".join(
                             f"{s['name']}={s['rate']:.2f}({s['acc']}/{s['tot']})"
                             for s in sorted(scored, key=lambda s: (
                                 _quant_bits_estimate(s["name"]), s["name"])))
-                    pick_note = (
-                        f"probe disabled → agree {win['bootstrap_agree_rate']:.3f} "
-                        f"(ε={args.bootstrap_pick_epsilon} band → min bits)"
-                        if bootstrap_probe_disabled else
-                        f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})")
+                    if bootstrap_probe_disabled and use_cost_pick:
+                        pick_note = (
+                            f"probe disabled → min cost {win['est_cost_ms_per_tok']:.5f} ms/tok "
+                            f"(a*t_q+(1-a)*t_rec)")
+                    elif bootstrap_probe_disabled:
+                        pick_note = (
+                            f"probe disabled → agree {win['bootstrap_agree_rate']:.3f} "
+                            f"(ε={args.bootstrap_pick_epsilon} band → min bits)")
+                    else:
+                        pick_note = (
+                            f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})")
                     print(f"    bootstrap_pick [{label}]: {win['name']}  "
                           f"{pick_note}  "
                           f"[{summ}]",
