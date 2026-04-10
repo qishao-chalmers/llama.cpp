@@ -686,6 +686,11 @@ def main():
                         help="Bootstrap window size W_b (tokens): fp16 generates W_b tokens in "
                              "window 0, candidates verify all W_b for bootstrap pass/fail "
                              "(default: 32). Separate from --adaptive-window.")
+    parser.add_argument("--bootstrap-probe-windows", type=int, default=0,
+                        metavar="N",
+                        help="After bootstrap, run N rollout probe windows per candidate "
+                             "(default: 0 = disabled). When disabled, bootstrap_pick chooses "
+                             "the lowest-bit candidate that completed bootstrap.")
     parser.add_argument("--adaptive-verify-top-k", type=int, default=None, metavar="K",
                         help="For --adaptive-sim/--adaptive-gen: accept draft tokens that appear "
                              "in the verifier's top-K (per position). Mutually exclusive with "
@@ -1264,9 +1269,12 @@ def main():
 
         Bootstrap window (first segment): fp16 generates W_b tokens (kv_hook=None).
         Bootstrap candidate check uses the same windowed path as rollout: each chunk
-        passes iff window_ok (verifier accepts draft). On verify failure, bootstrap
+        passes iff window_ok (verifier accepts draft).         On verify failure, bootstrap
         steers back like rollout: restore the chunk boundary and regenerate that window
-        with fp16 (kv_hook=None), then continue. A solo int8/fp16 greedy string is still
+        with fp16 (kv_hook=None), then continue.  Logs report verifier–draft prefix length
+        within each failed chunk (verif-prefix + chunk-tail).  Post-bootstrap probe windows
+        are controlled by --bootstrap-probe-windows (default 0 = disabled; pick min bits).
+        A solo int8/fp16 greedy string is still
         computed only to print fp16-vs-int8 diagnostics — it is not required to match
         the draft (that extra check was stricter than rollout and misleading).
 
@@ -1307,6 +1315,33 @@ def main():
         av_p = args.adaptive_verify_top_p
         need_av = av_k is not None or av_p is not None
         qviz_legend_printed = False
+
+        def _verifier_prefix_len_on_fail(
+                draft_tokens, need_av_loc, v_logits, v_pred0, v_greedy, v_log_rows):
+            """Longest prefix where verifier accepts draft (reporting-only; failed chunk)."""
+            if len(draft_tokens) <= 1:
+                return 0
+            if need_av_loc:
+                if not strategies.adaptive_verify_accept(
+                        v_logits, draft_tokens[0], av_k, av_p):
+                    return 0
+                n = 1
+                for i in range(len(v_greedy)):
+                    if strategies.adaptive_verify_accept(
+                            v_log_rows[i], draft_tokens[i + 1], av_k, av_p):
+                        n += 1
+                    else:
+                        break
+                return n
+            if v_pred0 != draft_tokens[0]:
+                return 0
+            n = 1
+            for i in range(len(v_greedy)):
+                if v_greedy[i] == draft_tokens[i + 1]:
+                    n += 1
+                else:
+                    break
+            return n
 
         cand_specs = draft_quant_candidates if draft_quant_candidates is not None else [draft_quant_name]
         cand_specs = [c for c in cand_specs if c and c != "fp16"]
@@ -1486,6 +1521,8 @@ def main():
                 scored = []  # bootstrap+probe results per candidate (for final argmax)
                 failed = []  # candidates that failed bootstrap, with n_match score
                 tried = cand_specs or [draft_quant_name]
+                bootstrap_probe_disabled = max(0, args.bootstrap_probe_windows) == 0
+                probe_min_rate = 0.90
                 for cand in tried:
                     cand_k_names, cand_v_names = quant_mod.resolve_quant_layers(cand, n_layer)
                     cand_k_gs, cand_v_gs = get_kv_group_sizes(
@@ -1513,6 +1550,9 @@ def main():
                     bootstrap_steers = 0  # windows recovered with fp16 fallback (like rollout)
                     bootstrap_quant_toks = 0   # tokens from draft that passed verifier
                     bootstrap_fp16_toks = 0    # tokens from fp16 steer-back windows
+                    # Within failed chunks only (reporting): verifier–draft prefix, then tail
+                    bootstrap_prefix_ok_toks = 0
+                    bootstrap_mismatch_toks = 0
 
                     if not bootstrap_ref_tokens:
                         w0_ok = False
@@ -1620,6 +1660,15 @@ def main():
                         # (Do not also require draft == solo int8/fp16 teacher — int3 can agree
                         # with int8 verifier while differing from a separate int8 greedy run.)
                         if not window_ok:
+                            if len(draft_tokens) > 1:
+                                n_prefix_ok = _verifier_prefix_len_on_fail(
+                                    draft_tokens, need_av, v_logits,
+                                    (v_pred0 if not need_av else 0),
+                                    v_greedy, v_log_rows)
+                            else:
+                                n_prefix_ok = 0
+                            bootstrap_prefix_ok_toks += n_prefix_ok
+                            bootstrap_mismatch_toks += len(draft_tokens) - n_prefix_ok
                             # Steer back: same as quant rollout on reject — restore boundary,
                             # fp16-decodes prime, fp16-generates this window (no draft hook).
                             if off == 0:
@@ -1667,7 +1716,9 @@ def main():
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
                             print(f"      {cand}: bootstrap FAIL "
                                   f"(decode/empty at offset {n_match}/{len(bootstrap_ref_tokens)}) | "
-                                  f"tok {bootstrap_quant_toks} quant+{_ver_lbl} + "
+                                  f"tok {bootstrap_quant_toks} full+{_ver_lbl} + "
+                                  f"{bootstrap_prefix_ok_toks} verif-prefix + "
+                                  f"{bootstrap_mismatch_toks} chunk-tail + "
                                   f"{bootstrap_fp16_toks} fp16 steer "
                                   f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks",
                                   flush=True)
@@ -1685,9 +1736,11 @@ def main():
 
                     # Probe: estimate early acceptance rate over a few rollout windows.
                     # This avoids picking a low-bit quant that passes bootstrap but is
-                    # rejected frequently once rollout starts.
-                    probe_windows = 4
-                    probe_min_rate = 0.90
+                    # rejected frequently once rollout starts.  Default --bootstrap-probe-windows
+                    # is 0 (disabled); when disabled, bootstrap_pick uses lowest bits among
+                    # candidates that finished bootstrap.
+                    probe_windows = max(0, args.bootstrap_probe_windows)
+                    probe_disabled = bootstrap_probe_disabled
                     probe_ckpt = kv_boundary
                     probe_prime_tok = prime_tok
                     probe_prime_pos = prime_pos
@@ -1783,14 +1836,26 @@ def main():
                             probe_prime_tok = fb_toks[-1]
                             probe_prime_pos = probe_prime_pos + len(fb_toks)
 
-                    probe_rate = probe_accepted / max(probe_attempted, 1)
-                    probe_tag = "PASS" if probe_rate >= probe_min_rate else f"FAIL (<{probe_min_rate:.2f})"
+                    if probe_disabled:
+                        probe_rate = 1.0
+                        probe_tag = "disabled"
+                    else:
+                        probe_rate = probe_accepted / max(probe_attempted, 1)
+                        probe_tag = ("PASS" if probe_rate >= probe_min_rate
+                                     else f"FAIL (<{probe_min_rate:.2f})")
+                    probe_note = (
+                        "→ probe disabled"
+                        if probe_disabled else
+                        f"→ probe {probe_accepted}/{probe_attempted}="
+                        f"{probe_rate:.2f} {probe_tag}")
                     print(f"      {cand}: bootstrap OK "
                           f"| {off}/{len(bootstrap_ref_tokens)} tok: "
-                          f"{bootstrap_quant_toks} quant+{_ver_lbl} + "
+                          f"{bootstrap_quant_toks} full+{_ver_lbl} + "
+                          f"{bootstrap_prefix_ok_toks} verif-prefix + "
+                          f"{bootstrap_mismatch_toks} chunk-tail + "
                           f"{bootstrap_fp16_toks} fp16 steer "
                           f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks "
-                          f"→ probe {probe_accepted}/{probe_attempted}={probe_rate:.2f} {probe_tag}",
+                          f"{probe_note}",
                           flush=True)
                     scored.append({
                         "name":   cand,
@@ -1801,6 +1866,9 @@ def main():
                         "hook":   cand_hook,
                         "k_gs":   cand_k_gs,
                         "v_gs":   cand_v_gs,
+                        "bootstrap_prefix_ok_toks": bootstrap_prefix_ok_toks,
+                        "bootstrap_mismatch_toks":    bootstrap_mismatch_toks,
+                        "probe_disabled":             probe_disabled,
                     })
 
                 # Among candidates that pass the probe threshold, pick the most
@@ -1808,8 +1876,12 @@ def main():
                 # still meets the acceptance bar.  On a bits tie, prefer higher rate.
                 # If nothing clears the threshold, fall back to the highest-rate
                 # candidate (safest choice among those that were scored).
+                # When probe is disabled, all scored candidates are eligible (pick min bits).
                 if scored:
-                    eligible = [s for s in scored if s["rate"] >= probe_min_rate]
+                    if bootstrap_probe_disabled:
+                        eligible = scored
+                    else:
+                        eligible = [s for s in scored if s["rate"] >= probe_min_rate]
                     if eligible:
                         win = min(eligible, key=lambda s: (s["bits"], -s["rate"]))
                     else:
@@ -1818,8 +1890,12 @@ def main():
                     summ = ", ".join(
                         f"{s['name']}={s['rate']:.2f}({s['acc']}/{s['tot']})"
                         for s in sorted(scored, key=lambda s: (_quant_bits_estimate(s["name"]), s["name"])))
+                    pick_note = (
+                        f"probe disabled → min bits"
+                        if bootstrap_probe_disabled else
+                        f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})")
                     print(f"    bootstrap_pick [{label}]: {win['name']}  "
-                          f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})  "
+                          f"{pick_note}  "
                           f"[{summ}]",
                           flush=True)
                 elif failed:
