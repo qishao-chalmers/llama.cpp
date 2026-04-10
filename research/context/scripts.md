@@ -178,7 +178,8 @@ python3 research/scripts/run_sweep.py model.gguf data/gsm8k_test.jsonl \
 | `--adaptive-sim` | Window-wise draft vs fp16 reference (simulation). |
 | `--adaptive-gen` | Bootstrap window (fp16) + quant rollout windows + verifier replay; may fp16-fallback per window. |
 | `--adaptive-window W` | Tokens per bootstrap / quant rollout window. |
-| `--bootstrap-probe-windows N` | After per-candidate bootstrap, run `N` rollout probe windows (default **`0` = disabled**). When `0`, `bootstrap_pick` chooses **lowest-bit** quant among candidates that finished bootstrap. |
+| `--bootstrap-probe-windows N` | After per-candidate bootstrap, run `N` rollout probe windows (default **`0` = disabled**). |
+| `--bootstrap-pick-epsilon E` | With probe disabled: keep candidates within **E** of the best **bootstrap agree rate** (full + verif-prefix over ref length), then pick **lowest bits** in that band (default **0.02**). |
 | `--verifier-quant` | Verifier KV mode (`fp16` = batched fp16 replay where safe). |
 | `--adaptive-verify-top-k K` | Accept draft token if in verifier **top‑K** (mutually exclusive with top‑p). |
 | `--adaptive-verify-top-p P` | **Nucleus** acceptance on verifier logits `0<P≤1` (mutually exclusive with top‑k). |
@@ -186,7 +187,7 @@ python3 research/scripts/run_sweep.py model.gguf data/gsm8k_test.jsonl \
 | `--qviz-html FILE` | Write grayscale HTML segment qviz (tall=dark, short=light; int2→fp16). |
 | `--qviz-ansi` | Print qviz with ANSI 24-bit background colors instead of ASCII `:` rows. |
 
-**Bootstrap (candidates):** Verify is **token-level** (`window_ok`); on reject, **chunk-level** fp16 steer-back (same as rollout). Logs **full + verifier**, **verif-prefix** / **chunk-tail** within failed chunks (reporting only), **fp16 steer** totals, **Nq+Ms chunks**. Full detail: `context/adaptive_gen_bootstrap.md`.
+**Bootstrap (candidates):** Verify is **token-level** (`window_ok`); on reject, **chunk-level** fp16 steer-back (same as rollout). Logs **full + verifier**, **verif-prefix** / **chunk-tail** within failed chunks (reporting only), **fp16 steer** totals, **Nq+Ms chunks**. With `--bootstrap-probe-windows 0`, **`bootstrap_pick`** uses agree rate **(full + verif-prefix) / ref_len**, a **ε**-band (`--bootstrap-pick-epsilon`), then **min bits**. Full detail: `context/adaptive_gen_bootstrap.md`.
 
 **Hooks:** `--sink-tokens`, `--recent-tokens`, `--quant-sink`, `--quant-recent` apply to adaptive draft/verifier hooks. *Caveat:* three-zone hooks track a global decode counter that is **not** reset on KV restore — use `0/0` unless you accept that interaction.
 

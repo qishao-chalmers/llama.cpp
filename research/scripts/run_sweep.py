@@ -689,8 +689,14 @@ def main():
     parser.add_argument("--bootstrap-probe-windows", type=int, default=0,
                         metavar="N",
                         help="After bootstrap, run N rollout probe windows per candidate "
-                             "(default: 0 = disabled). When disabled, bootstrap_pick chooses "
-                             "the lowest-bit candidate that completed bootstrap.")
+                             "(default: 0 = disabled). When disabled, bootstrap_pick uses "
+                             "bootstrap agree-rate + --bootstrap-pick-epsilon (see there).")
+    parser.add_argument("--bootstrap-pick-epsilon", type=float, default=0.02,
+                        metavar="E",
+                        help="With --bootstrap-probe-windows 0: among candidates whose "
+                             "verifier-agree rate is within E of the best, pick the lowest-bit "
+                             "quant. Agree rate = (full-window + verif-prefix tokens) / bootstrap "
+                             "ref length. Default 0.02.")
     parser.add_argument("--adaptive-verify-top-k", type=int, default=None, metavar="K",
                         help="For --adaptive-sim/--adaptive-gen: accept draft tokens that appear "
                              "in the verifier's top-K (per position). Mutually exclusive with "
@@ -727,6 +733,8 @@ def main():
                              "Combined with --quant-k (defaults to fp16 if omitted).")
     args = parser.parse_args()
 
+    if args.bootstrap_pick_epsilon < 0:
+        parser.error("--bootstrap-pick-epsilon must be >= 0")
     if args.adaptive_verify_top_k is not None and args.adaptive_verify_top_k < 1:
         parser.error("--adaptive-verify-top-k must be >= 1")
     if args.adaptive_verify_top_p is not None:
@@ -1273,7 +1281,8 @@ def main():
         steers back like rollout: restore the chunk boundary and regenerate that window
         with fp16 (kv_hook=None), then continue.  Logs report verifier–draft prefix length
         within each failed chunk (verif-prefix + chunk-tail).  Post-bootstrap probe windows
-        are controlled by --bootstrap-probe-windows (default 0 = disabled; pick min bits).
+        are controlled by --bootstrap-probe-windows (default 0 = disabled) and
+        --bootstrap-pick-epsilon (best agree-rate band, then min bits).
         A solo int8/fp16 greedy string is still
         computed only to print fp16-vs-int8 diagnostics — it is not required to match
         the draft (that extra check was stricter than rollout and misleading).
@@ -1862,6 +1871,8 @@ def main():
                           f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks "
                           f"{probe_note}",
                           flush=True)
+                    _br_len = max(len(bootstrap_ref_tokens), 1)
+                    _agree_toks = bootstrap_quant_toks + bootstrap_prefix_ok_toks
                     scored.append({
                         "name":   cand,
                         "rate":   probe_rate,
@@ -1874,6 +1885,8 @@ def main():
                         "bootstrap_prefix_ok_toks": bootstrap_prefix_ok_toks,
                         "bootstrap_mismatch_toks":    bootstrap_mismatch_toks,
                         "probe_disabled":             probe_disabled,
+                        "bootstrap_agree_toks":       _agree_toks,
+                        "bootstrap_agree_rate":       _agree_toks / _br_len,
                     })
 
                 # Among candidates that pass the probe threshold, pick the most
@@ -1881,22 +1894,41 @@ def main():
                 # still meets the acceptance bar.  On a bits tie, prefer higher rate.
                 # If nothing clears the threshold, fall back to the highest-rate
                 # candidate (safest choice among those that were scored).
-                # When probe is disabled, all scored candidates are eligible (pick min bits).
+                # When probe is disabled: best bootstrap_agree_rate, then candidates
+                # within --bootstrap-pick-epsilon of that rate, then min bits in that band.
                 if scored:
                     if bootstrap_probe_disabled:
                         eligible = scored
                     else:
                         eligible = [s for s in scored if s["rate"] >= probe_min_rate]
                     if eligible:
-                        win = min(eligible, key=lambda s: (s["bits"], -s["rate"]))
+                        if bootstrap_probe_disabled:
+                            eps = float(args.bootstrap_pick_epsilon)
+                            best_ag = max(s["bootstrap_agree_rate"] for s in eligible)
+                            band = [
+                                s for s in eligible
+                                if best_ag - s["bootstrap_agree_rate"] <= eps + 1e-15]
+                            win = min(band, key=lambda s: s["bits"])
+                        else:
+                            win = min(eligible, key=lambda s: (s["bits"], -s["rate"]))
                     else:
                         win = max(scored, key=lambda s: (s["rate"], s["bits"]))
                     picked = (win["name"], win["hook"], win["k_gs"], win["v_gs"])
-                    summ = ", ".join(
-                        f"{s['name']}={s['rate']:.2f}({s['acc']}/{s['tot']})"
-                        for s in sorted(scored, key=lambda s: (_quant_bits_estimate(s["name"]), s["name"])))
+                    _br_show = len(bootstrap_ref_tokens)
+                    if bootstrap_probe_disabled:
+                        summ = ", ".join(
+                            f"{s['name']}=agree{s['bootstrap_agree_rate']:.3f}"
+                            f"({s['bootstrap_agree_toks']}/{_br_show})"
+                            for s in sorted(scored, key=lambda s: (
+                                _quant_bits_estimate(s["name"]), s["name"])))
+                    else:
+                        summ = ", ".join(
+                            f"{s['name']}={s['rate']:.2f}({s['acc']}/{s['tot']})"
+                            for s in sorted(scored, key=lambda s: (
+                                _quant_bits_estimate(s["name"]), s["name"])))
                     pick_note = (
-                        f"probe disabled → min bits"
+                        f"probe disabled → agree {win['bootstrap_agree_rate']:.3f} "
+                        f"(ε={args.bootstrap_pick_epsilon} band → min bits)"
                         if bootstrap_probe_disabled else
                         f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})")
                     print(f"    bootstrap_pick [{label}]: {win['name']}  "

@@ -54,11 +54,12 @@ After a candidate finishes the bootstrap walk, the script can run **probe window
 | CLI | Default | Effect |
 |-----|---------|--------|
 | `--bootstrap-probe-windows N` | **`0`** | Number of probe rollout windows. **`0` = disabled** (no probe loop; probe code remains in place). |
+| `--bootstrap-pick-epsilon E` | **`0.02`** | With probe disabled: from candidates within **E** of the best **agree rate**, pick **lowest bits** (see below). |
 
 When **disabled** (`N = 0`):
 
 - Log shows `→ probe disabled`.
-- **`bootstrap_pick`:** every candidate that **completed** bootstrap is eligible; the script picks **lowest bit width** among `--quants` candidates (`min(eligible, key = bits then −rate)`; with probe off, stored `rate` is neutral so **bits** dominate).
+- **`bootstrap_pick`:** **Agree rate** = `(full-window tokens + verif-prefix tokens) / bootstrap reference length`. Take the **best** agree rate among candidates; keep any candidate within **`--bootstrap-pick-epsilon`** of that best; among those, pick **lowest bit width**. If the best rate is unique (no one else within ε), that candidate wins; if several are close (e.g. 0.78 vs 0.80 with ε = 0.02), the band can include multiple quants and **min bits** breaks the tie toward a more aggressive quant.
 
 When **enabled** (`N > 0`, e.g. `4`):
 
