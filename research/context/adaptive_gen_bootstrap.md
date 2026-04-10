@@ -76,7 +76,9 @@ Example file `research/context/bootstrap_ms_quant_example.json`:
 }
 ```
 
-Placeholder numbers — **measure** on your setup. Keys under **`recover`** must include your **`--verifier-quant`** value (case-insensitive match allowed).
+Numbers are **illustrative only** — always **profile** `decode ms/token` on your GPU/CPU and model. The old example had int2 slower than int4 by mistake; there is no fixed rule: smaller KV can be faster (bandwidth) or slower (kernel path). The file now uses a simple **monotonic** draft order (int2 ≤ int3 ≤ int4 in ms) as one possible story, not a guarantee.
+
+Keys under **`recover`** must include your **`--verifier-quant`** value (case-insensitive match allowed).
 
 When **enabled** (`N > 0`, e.g. `4`):
 
