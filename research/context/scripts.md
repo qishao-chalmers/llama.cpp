@@ -181,9 +181,8 @@ python3 research/scripts/run_sweep.py model.gguf data/gsm8k_test.jsonl \
 | `--bootstrap-probe-windows N` | After per-candidate bootstrap, run `N` rollout probe windows (default **`0` = disabled**). |
 | `--bootstrap-pick-mode` | With probe disabled: **`agree-rate`** (ε + min bits) or **`cost`** (min expected ms/token; needs `--bootstrap-ms-*`). |
 | `--bootstrap-pick-epsilon E` | **`agree-rate` mode:** within **E** of best agree rate, then min bits (default **0.02**). |
-| `--bootstrap-ms-recover MS` | **`cost` mode:** ms/token recovery path (required). |
-| `--bootstrap-ms-quant-file FILE` | JSON map quant → ms/token on draft accept path. |
-| `--bootstrap-ms-quant-default MS` | **`cost` mode:** ms/token when quant missing from file. |
+| `--bootstrap-ms-quant-file FILE` | **`cost` mode:** JSON with **`recover`:** {`verifier-quant` → ms/token} (match `--verifier-quant`) + draft quants → ms/token. |
+| `--bootstrap-ms-quant-default MS` | **`cost` mode:** ms/token when draft quant missing from file. |
 | `--verifier-quant` | Verifier KV mode (`fp16` = batched fp16 replay where safe). |
 | `--adaptive-verify-top-k K` | Accept draft token if in verifier **top‑K** (mutually exclusive with top‑p). |
 | `--adaptive-verify-top-p P` | **Nucleus** acceptance on verifier logits `0<P≤1` (mutually exclusive with top‑k). |

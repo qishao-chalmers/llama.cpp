@@ -56,18 +56,27 @@ After a candidate finishes the bootstrap walk, the script can run **probe window
 | `--bootstrap-probe-windows N` | **`0`** | Number of probe rollout windows. **`0` = disabled** (no probe loop; probe code remains in place). |
 | `--bootstrap-pick-mode` | **`agree-rate`** | With probe disabled: **`agree-rate`** (ε band + min bits) or **`cost`** (expected ms/token; see below). |
 | `--bootstrap-pick-epsilon E` | **`0.02`** | With **`agree-rate`**: from candidates within **E** of the best **agree rate**, pick **lowest bits**. |
-| `--bootstrap-ms-recover MS` | — | **`cost` mode:** ms per token on **recovery** (fp16 / int8 steer path after reject). Required for cost. |
-| `--bootstrap-ms-quant-file FILE` | — | JSON object **`quant_name` → ms per token** on **accepted** draft path. Use with/without `--bootstrap-ms-quant-default`. |
-| `--bootstrap-ms-quant-default MS` | — | **`cost` mode:** ms/token for any quant **missing** from the JSON file. |
+| `--bootstrap-ms-quant-file FILE` | — | **`cost` mode (required):** JSON with **`recover`** and draft quants. See below. |
+| `--bootstrap-ms-quant-default MS` | — | **`cost` mode:** ms/token for any draft quant **missing** from the JSON file. |
 
 When **disabled** (`N = 0`):
 
 - Log shows `→ probe disabled`.
 - **`bootstrap_pick`** (two modes):
   - **`agree-rate` (default):** **Agree rate** = `(full-window + verif-prefix tokens) / ref length`. Take the **best** rate; keep candidates within **`--bootstrap-pick-epsilon`** of that best; among those, **lowest bit width**.
-  - **`cost`:** For each candidate, **a** = agree rate (same as above). **Expected ms/token** = **a · t_quant + (1−a) · t_recover**, where **t_recover** is `--bootstrap-ms-recover` and **t_quant** comes from the JSON file (per-quant) or `--bootstrap-ms-quant-default`. Pick **minimum** expected cost; **tie-break:** lower **bits**. Calibrate **t_quant** / **t_recover** from wall-clock or `--profile-kv` (per hardware).
+  - **`cost`:** For each candidate, **a** = agree rate (same as above). **Expected ms/token** = **a · t_quant + (1−a) · t_recover**. **t_quant** comes from the JSON file (per draft quant) or `--bootstrap-ms-quant-default`. **t_recover** is read from JSON **`recover`** using the key that matches **`--verifier-quant`** (e.g. `int8_ch`, `fp16`) — same string as the verifier you already pass on the CLI. Pick **minimum** expected cost; **tie-break:** lower **bits**.
 
-Example quant timing file: `research/context/bootstrap_ms_quant_example.json` (placeholder numbers — **measure** on your setup).
+Example file `research/context/bootstrap_ms_quant_example.json`:
+
+```json
+{
+  "recover": { "fp16": 0.09, "int8_ch": 0.075, "int8": 0.075 },
+  "int2_ch": 0.05,
+  "int4_ch": 0.045
+}
+```
+
+Placeholder numbers — **measure** on your setup. Keys under **`recover`** must include your **`--verifier-quant`** value (case-insensitive match allowed).
 
 When **enabled** (`N > 0`, e.g. `4`):
 

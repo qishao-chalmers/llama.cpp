@@ -245,6 +245,45 @@ def _bootstrap_quant_ms_lookup(name: str, ms_map: dict, default_ms) -> float:
     raise KeyError(name)
 
 
+def _recover_ms_lookup(recover_map: dict, verifier_quant_name: str) -> float:
+    """Ms/token for recovery path matching --verifier-quant (case-insensitive key match)."""
+    if verifier_quant_name in recover_map:
+        return float(recover_map[verifier_quant_name])
+    vlow = verifier_quant_name.lower()
+    for k, v in recover_map.items():
+        if str(k).lower() == vlow:
+            return float(v)
+    raise KeyError(
+        f"recover[{verifier_quant_name!r}] missing; JSON 'recover' has keys: "
+        f"{list(recover_map.keys())}")
+
+
+def _bootstrap_split_cost_json(raw: dict):
+    """Split bootstrap cost JSON into (recover_map, quant_ms_map).
+
+    Expected shape::
+        { "recover": { "fp16": ..., "int8_ch": ... }, "int2_ch": ..., ... }
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("bootstrap cost JSON must be a JSON object")
+    data = dict(raw)
+    recover = data.pop("recover", None)
+    if recover is None:
+        raise ValueError(
+            "bootstrap cost JSON must include a top-level \"recover\" object "
+            "with ms/token per verifier mode, e.g. "
+            '{"recover":{"fp16":0.09,"int8_ch":0.07},"int2_ch":0.05,...}')
+    if not isinstance(recover, dict):
+        raise ValueError('"recover" must be an object')
+    recover_map = {str(k): float(v) for k, v in recover.items()}
+    quant_map = {}
+    for k, v in data.items():
+        if not isinstance(v, (int, float)):
+            raise ValueError(f"quant {k!r}: expected number, got {type(v).__name__}")
+        quant_map[str(k)] = float(v)
+    return recover_map, quant_map
+
+
 def _make_cpu_zone_hook(lib, k_names, v_names, n_pos_per_embd, asym=False,
                         quant_fn_factory=None, profile=None):
     """Build a bare CPU hook (no window logic) for a specific quant type.
@@ -713,15 +752,12 @@ def main():
     parser.add_argument("--bootstrap-pick-mode", choices=("agree-rate", "cost"),
                         default="agree-rate",
                         help="When --bootstrap-probe-windows 0: agree-rate (ε band + min bits) or "
-                             "cost (min expected ms/token; requires --bootstrap-ms-recover and "
-                             "quant timings). Ignored when probe is enabled.")
-    parser.add_argument("--bootstrap-ms-recover", type=float, default=None,
-                        metavar="MS",
-                        help="For --bootstrap-pick-mode cost: ms per token on fp16/int8 recovery "
-                             "(reject path). Required for cost mode.")
+                             "cost (min expected ms/token; see --bootstrap-ms-quant-file). "
+                             "Ignored when probe is enabled.")
     parser.add_argument("--bootstrap-ms-quant-file", default=None, metavar="FILE",
-                        help="JSON object mapping quant name -> ms per token on accepted draft "
-                             "path. For cost mode: provide this and/or --bootstrap-ms-quant-default.")
+                        help="For --bootstrap-pick-mode cost: JSON with \"recover\" "
+                             "{verifier-quant -> ms/token} plus draft quant -> ms/token; "
+                             "recovery key must match --verifier-quant (e.g. int8_ch, fp16).")
     parser.add_argument("--bootstrap-ms-quant-default", type=float, default=None,
                         metavar="MS",
                         help="For cost mode: ms/token for any quant name missing in "
@@ -764,8 +800,6 @@ def main():
 
     if args.bootstrap_pick_epsilon < 0:
         parser.error("--bootstrap-pick-epsilon must be >= 0")
-    if args.bootstrap_ms_recover is not None and args.bootstrap_ms_recover < 0:
-        parser.error("--bootstrap-ms-recover must be >= 0")
     if args.bootstrap_ms_quant_default is not None and args.bootstrap_ms_quant_default < 0:
         parser.error("--bootstrap-ms-quant-default must be >= 0")
     if args.adaptive_verify_top_k is not None and args.adaptive_verify_top_k < 1:
@@ -1317,7 +1351,7 @@ def main():
         are controlled by --bootstrap-probe-windows (default 0 = disabled).
         When probe is off: --bootstrap-pick-mode agree-rate uses --bootstrap-pick-epsilon
         (band + min bits); cost mode minimizes a*t_quant+(1-a)*t_recover using
-        --bootstrap-ms-recover and --bootstrap-ms-quant-file / --bootstrap-ms-quant-default.
+        --bootstrap-ms-quant-file (recover + draft ms; recovery key matches verifier).
         A solo int8/fp16 greedy string is still
         computed only to print fp16-vs-int8 diagnostics — it is not required to match
         the draft (that extra check was stricter than rollout and misleading).
@@ -1578,21 +1612,25 @@ def main():
                 cost_ms_map = {}
                 cost_ms_default = None
                 if use_cost_pick:
-                    if args.bootstrap_ms_recover is None:
+                    if not args.bootstrap_ms_quant_file:
                         raise ValueError(
-                            "--bootstrap-pick-mode cost requires --bootstrap-ms-recover")
-                    cost_t_recover = float(args.bootstrap_ms_recover)
-                    if args.bootstrap_ms_quant_file:
-                        qpath = os.path.expanduser(args.bootstrap_ms_quant_file)
-                        with open(qpath, encoding="utf-8") as _cf:
-                            cost_ms_map = json.load(_cf)
-                        if not isinstance(cost_ms_map, dict):
-                            raise ValueError("--bootstrap-ms-quant-file must be a JSON object")
+                            "--bootstrap-pick-mode cost requires --bootstrap-ms-quant-file "
+                            "(JSON with \"recover\" and draft quant timings)")
+                    qpath = os.path.expanduser(args.bootstrap_ms_quant_file)
+                    with open(qpath, encoding="utf-8") as _cf:
+                        _raw_cost = json.load(_cf)
+                    cost_recover_map, cost_ms_map = _bootstrap_split_cost_json(_raw_cost)
+                    try:
+                        cost_t_recover = _recover_ms_lookup(
+                            cost_recover_map, verifier_quant_name)
+                    except KeyError as _e:
+                        raise ValueError(
+                            f"--bootstrap-ms-quant-file: {_e}") from _e
                     cost_ms_default = args.bootstrap_ms_quant_default
                     if not cost_ms_map and cost_ms_default is None:
                         raise ValueError(
-                            "--bootstrap-pick-mode cost requires --bootstrap-ms-quant-file "
-                            "and/or --bootstrap-ms-quant-default")
+                            "--bootstrap-pick-mode cost: add draft quant entries to the JSON "
+                            "and/or set --bootstrap-ms-quant-default")
                 for cand in tried:
                     cand_k_names, cand_v_names = quant_mod.resolve_quant_layers(cand, n_layer)
                     cand_k_gs, cand_v_gs = get_kv_group_sizes(
@@ -2011,7 +2049,7 @@ def main():
                     if bootstrap_probe_disabled and use_cost_pick:
                         pick_note = (
                             f"probe disabled → min cost {win['est_cost_ms_per_tok']:.5f} ms/tok "
-                            f"(a*t_q+(1-a)*t_rec)")
+                            f"(recover={verifier_quant_name} t_rec={cost_t_recover:.5f})")
                     elif bootstrap_probe_disabled:
                         pick_note = (
                             f"probe disabled → agree {win['bootstrap_agree_rate']:.3f} "
