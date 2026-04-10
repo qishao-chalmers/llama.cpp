@@ -13,6 +13,7 @@ Code: `research/scripts/` — Python ctypes wrapping `build_release/bin/libllama
 | `context/left_tasks.md` | Deferred ideas; glossary: **bootstrap window** vs **quant rollout window** |
 | `context/analysis.md` | Analysis tools: plot_entropy.py, analyze_alarms.py, plot_niah.py |
 | `context/scripts.md` | Core infrastructure: run_sweep.py CLI, adaptive sim/gen (top‑k/p, zones), quant types |
+| `context/adaptive_gen_bootstrap.md` | **Adaptive-gen bootstrap:** steer-back, token vs chunk metrics, `--bootstrap-probe-windows`, `bootstrap_pick` |
 | `context/strategies.md` | Quantization strategies, group-size semantics, three-zone KIVI |
 | `context/api.md` | ctypes bindings, struct layouts, state blob format, critical API pitfalls |
 | `context/results.md` | All experiment results tables and key findings |
