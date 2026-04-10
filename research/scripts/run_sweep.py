@@ -1318,10 +1318,14 @@ def main():
 
         def _verifier_prefix_len_on_fail(
                 draft_tokens, need_av_loc, v_logits, v_pred0, v_greedy, v_log_rows):
-            """Longest prefix where verifier accepts draft (reporting-only; failed chunk)."""
+            """Longest prefix where verifier accepts draft (reporting-only; failed chunk).
+
+            v_log_rows is only used when need_av_loc; pass None for greedy verify."""
             if len(draft_tokens) <= 1:
                 return 0
             if need_av_loc:
+                if v_log_rows is None:
+                    return 0
                 if not strategies.adaptive_verify_accept(
                         v_logits, draft_tokens[0], av_k, av_p):
                     return 0
@@ -1664,7 +1668,8 @@ def main():
                                 n_prefix_ok = _verifier_prefix_len_on_fail(
                                     draft_tokens, need_av, v_logits,
                                     (v_pred0 if not need_av else 0),
-                                    v_greedy, v_log_rows)
+                                    v_greedy,
+                                    v_log_rows if need_av else None)
                             else:
                                 n_prefix_ok = 0
                             bootstrap_prefix_ok_toks += n_prefix_ok
