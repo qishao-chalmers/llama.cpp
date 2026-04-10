@@ -1603,6 +1603,8 @@ def main():
                 scored = []  # bootstrap+probe results per candidate (for final argmax)
                 failed = []  # candidates that failed bootstrap, with n_match score
                 tried = cand_specs or [draft_quant_name]
+                _cand_w = max((len(c) for c in tried), default=8)
+                _cand_w = max(_cand_w, 10)
                 bootstrap_probe_disabled = max(0, args.bootstrap_probe_windows) == 0
                 probe_min_rate = 0.90
                 use_cost_pick = (
@@ -1823,7 +1825,7 @@ def main():
                     _ver_lbl = verifier_quant_name if ver_hook else "fp16"
                     if not w0_ok:
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
-                            print(f"      {cand}: bootstrap FAIL "
+                            print(f"      {cand:<{_cand_w}}  bootstrap FAIL "
                                   f"(decode/empty at offset {n_match}/{len(bootstrap_ref_tokens)}) | "
                                   f"tok {bootstrap_quant_toks} full+{_ver_lbl} + "
                                   f"{bootstrap_prefix_ok_toks} verif-prefix + "
@@ -1832,7 +1834,7 @@ def main():
                                   f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks",
                                   flush=True)
                         else:
-                            print(f"      {cand}: bootstrap FAIL", flush=True)
+                            print(f"      {cand:<{_cand_w}}  bootstrap FAIL", flush=True)
                         failed.append({
                             "name":  cand,
                             "match": n_match if len(bootstrap_ref_tokens) > 1 else -1,
@@ -1957,15 +1959,6 @@ def main():
                         if probe_disabled else
                         f"→ probe {probe_accepted}/{probe_attempted}="
                         f"{probe_rate:.2f} {probe_tag}")
-                    print(f"      {cand}: bootstrap OK "
-                          f"| {off}/{len(bootstrap_ref_tokens)} tok: "
-                          f"{bootstrap_quant_toks} full+{_ver_lbl} + "
-                          f"{bootstrap_prefix_ok_toks} verif-prefix + "
-                          f"{bootstrap_mismatch_toks} chunk-tail + "
-                          f"{bootstrap_fp16_toks} fp16 steer "
-                          f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks "
-                          f"{probe_note}",
-                          flush=True)
                     _br_len = max(len(bootstrap_ref_tokens), 1)
                     _agree_toks = bootstrap_quant_toks + bootstrap_prefix_ok_toks
                     _ar = _agree_toks / _br_len
@@ -1981,6 +1974,22 @@ def main():
                                 f"--bootstrap-ms-quant-default") from _e
                         _est_cost = _bootstrap_est_cost_ms_per_tok(
                             _ar, _tq, cost_t_recover)
+                        _metric_col = (
+                            f"cost {_est_cost:>8.5f} ms/tok  agree {_ar:>6.3f}  | ")
+                    elif bootstrap_probe_disabled:
+                        _metric_col = (
+                            f"agree {_ar:>6.3f} ({_agree_toks:>3}/{_br_len})  | ")
+                    else:
+                        _metric_col = ""
+                    print(f"      {cand:<{_cand_w}}  bootstrap OK  | {_metric_col}"
+                          f"{off}/{len(bootstrap_ref_tokens)} tok: "
+                          f"{bootstrap_quant_toks} full+{_ver_lbl} + "
+                          f"{bootstrap_prefix_ok_toks} verif-prefix + "
+                          f"{bootstrap_mismatch_toks} chunk-tail + "
+                          f"{bootstrap_fp16_toks} fp16 steer "
+                          f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks "
+                          f"{probe_note}",
+                          flush=True)
                     scored.append({
                         "name":   cand,
                         "rate":   probe_rate,
@@ -2028,13 +2037,13 @@ def main():
                         win = max(scored, key=lambda s: (s["rate"], s["bits"]))
                     picked = (win["name"], win["hook"], win["k_gs"], win["v_gs"])
                     _br_show = len(bootstrap_ref_tokens)
+                    _win_w = max(_cand_w, len(win["name"]))
                     if bootstrap_probe_disabled:
                         if use_cost_pick:
                             summ = ", ".join(
-                                f"{s['name']}=cost{s['est_cost_ms_per_tok']:.5f}"
-                                f"(agree{s['bootstrap_agree_rate']:.3f})"
-                                for s in sorted(scored, key=lambda s: (
-                                    _quant_bits_estimate(s["name"]), s["name"])))
+                                s["name"] for s in sorted(
+                                    scored, key=lambda s: (
+                                        _quant_bits_estimate(s["name"]), s["name"])))
                         else:
                             summ = ", ".join(
                                 f"{s['name']}=agree{s['bootstrap_agree_rate']:.3f}"
@@ -2057,10 +2066,17 @@ def main():
                     else:
                         pick_note = (
                             f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})")
-                    print(f"    bootstrap_pick [{label}]: {win['name']}  "
-                          f"{pick_note}  "
-                          f"[{summ}]",
-                          flush=True)
+                    if bootstrap_probe_disabled and use_cost_pick:
+                        print(f"    bootstrap_pick [{label}]: {win['name']:<{_win_w}}  "
+                              f"{pick_note}",
+                              flush=True)
+                        print(f"      candidates: {summ}",
+                              flush=True)
+                    else:
+                        print(f"    bootstrap_pick [{label}]: {win['name']:<{_win_w}}  "
+                              f"{pick_note}  "
+                              f"[{summ}]",
+                              flush=True)
                 elif failed:
                     # No candidate passed bootstrap+probe.
                     # Rank by n_match (most tokens matched = closest to teacher) then min
