@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "_comment": "Sim physics fit on kv_timing_h100.json rows for kv={f16,q8_0,q4_0}, B in {8,16,32}. kv_attn_byte_mode=fp16_equiv_dequant. attn_scale_by_batch applies to attn_core time only.",
+  "kv_attn_byte_mode": "fp16_equiv_dequant",
+  "attn_time_scale": 1.0,
+  "attn_time_scale_inv_batch": 0.0,
+  "attn_scale_by_batch": {
+    "8": 0.9954380580136377,
+    "16": 0.8062620429227477,
+    "32": 0.7032696051286489
+  }
+}

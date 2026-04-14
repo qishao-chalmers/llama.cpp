@@ -33,6 +33,7 @@ from layerwise_roofline_sim import (  # noqa: E402
     load_structure_catalog,
     predict_ms_per_token,
     resolve_kv_quant_key,
+    resolve_sim_physics,
     resolve_weight_bits,
     eta_to_dict,
 )
@@ -142,6 +143,18 @@ def main() -> None:
     ap.add_argument("--eta-max", type=float, default=1.0, help="Upper bound for each η")
     ap.add_argument("-o", "--out", required=True, help="Output JSON path")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--sim-physics-json",
+        default=None,
+        help="Optional sim physics (kv_attn_byte_mode, attn_time_scale, …)",
+    )
+    ap.add_argument(
+        "--kv-attn-byte-mode",
+        choices=["fp16_equiv_dequant", "storage"],
+        default=None,
+    )
+    ap.add_argument("--attn-time-scale", type=float, default=None)
+    ap.add_argument("--attn-time-scale-inv-batch", type=float, default=None)
     args = ap.parse_args()
 
     cat = load_structure_catalog(args.catalog)
@@ -155,6 +168,12 @@ def main() -> None:
         sys.exit(1)
 
     hw = args.hw
+    phys = resolve_sim_physics(
+        args.sim_physics_json,
+        kv_attn_byte_mode=args.kv_attn_byte_mode,
+        attn_time_scale=args.attn_time_scale,
+        attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
+    )
 
     def residuals(x: np.ndarray) -> np.ndarray:
         eta = unpack_eta(x)
@@ -172,6 +191,10 @@ def main() -> None:
                 weight_bits=wb,
                 norm_weight_bits=args.norm_weight_bits,
                 kv_quant_key=kv_key,
+                kv_attn_byte_mode=str(phys["kv_attn_byte_mode"]),
+                attn_time_scale=float(phys["attn_time_scale"]),
+                attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
+                attn_scale_by_batch=phys.get("attn_scale_by_batch"),
             )
             out.append(pred - row["measured_ms"])
         return np.array(out, dtype=float)
@@ -222,6 +245,7 @@ def main() -> None:
         "n_fit_rows": len(rows),
         "sources": list(dict.fromkeys(r["source"] for r in rows)),
         "preset_filter": args.preset,
+        "sim_physics": phys,
         "eta": eta_to_dict(eta_fit),
         "rmse_ms": round(rmse, 6),
         "mae_ms": round(mae, 6),

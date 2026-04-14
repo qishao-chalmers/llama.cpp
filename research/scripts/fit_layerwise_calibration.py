@@ -34,6 +34,7 @@ from layerwise_roofline_sim import (  # noqa: E402
     load_structure_catalog,
     predict_ms_per_token,
     resolve_kv_quant_key,
+    resolve_sim_physics,
     resolve_weight_bits,
 )
 
@@ -58,10 +59,24 @@ def main() -> None:
         help="η from fit_layerwise_eta.py (recommended)",
     )
     ap.add_argument("-o", "--out", required=True, help="Output calibration JSON")
+    ap.add_argument("--sim-physics-json", default=None)
+    ap.add_argument(
+        "--kv-attn-byte-mode",
+        choices=["fp16_equiv_dequant", "storage"],
+        default=None,
+    )
+    ap.add_argument("--attn-time-scale", type=float, default=None)
+    ap.add_argument("--attn-time-scale-inv-batch", type=float, default=None)
     args = ap.parse_args()
 
     cat = load_structure_catalog(args.catalog)
     eta = load_eta_json(args.eta_json) if args.eta_json else Eta()
+    phys = resolve_sim_physics(
+        args.sim_physics_json,
+        kv_attn_byte_mode=args.kv_attn_byte_mode,
+        attn_time_scale=args.attn_time_scale,
+        attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
+    )
 
     xs_inv_b: list[float] = []
     xs_lay: list[float] = []
@@ -94,6 +109,10 @@ def main() -> None:
                 weight_bits=wbits,
                 norm_weight_bits=16.0,
                 kv_quant_key=kv_key,
+                kv_attn_byte_mode=str(phys["kv_attn_byte_mode"]),
+                attn_time_scale=float(phys["attn_time_scale"]),
+                attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
+                attn_scale_by_batch=phys.get("attn_scale_by_batch"),
             )
             xs_inv_b.append(1.0 / B)
             xs_lay.append(lay)
@@ -130,6 +149,7 @@ def main() -> None:
             "Use with layerwise_roofline_sim.py --calibration-json."
         ),
         "schema_version": 1,
+        "sim_physics": phys,
         "hw": args.hw,
         "t_floor_ms": round(t_floor, 6),
         "scale": round(scale, 6),

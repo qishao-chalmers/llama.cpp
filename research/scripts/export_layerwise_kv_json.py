@@ -39,6 +39,7 @@ from layerwise_roofline_sim import (  # noqa: E402
     load_eta_json,
     load_structure_catalog,
     resolve_kv_quant_key,
+    resolve_sim_physics,
     resolve_weight_bits,
     simulate_decode_step,
 )
@@ -95,6 +96,14 @@ def main() -> None:
         action="store_true",
         help="With --attn-impl simple: add unfused logits/probs HBM traffic",
     )
+    ap.add_argument("--sim-physics-json", default=None, metavar="PATH")
+    ap.add_argument(
+        "--kv-attn-byte-mode",
+        choices=["fp16_equiv_dequant", "storage"],
+        default=None,
+    )
+    ap.add_argument("--attn-time-scale", type=float, default=None, metavar="F")
+    ap.add_argument("--attn-time-scale-inv-batch", type=float, default=None, metavar="F")
     args = ap.parse_args()
 
     tpl_path = os.path.abspath(os.path.expanduser(args.template_json))
@@ -111,6 +120,13 @@ def main() -> None:
     gguf_tb: Optional[dict[str, int]] = None
     if args.gguf:
         gguf_tb = load_gguf_tensor_n_bytes(os.path.expanduser(args.gguf))
+
+    phys = resolve_sim_physics(
+        args.sim_physics_json,
+        kv_attn_byte_mode=args.kv_attn_byte_mode,
+        attn_time_scale=args.attn_time_scale,
+        attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
+    )
 
     rows_in = data.get("rows", [])
     rows_out: list[dict[str, Any]] = []
@@ -142,6 +158,10 @@ def main() -> None:
             attn_impl=args.attn_impl,
             fa_bc=args.fa_bc,
             attn_naive_spill=args.attn_naive_spill,
+            kv_attn_byte_mode=str(phys["kv_attn_byte_mode"]),
+            attn_time_scale=float(phys["attn_time_scale"]),
+            attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
+            attn_scale_by_batch=phys.get("attn_scale_by_batch"),
         )
         lay_raw = total_s * 1000.0 / float(B)
         lay_cal: Optional[float] = None

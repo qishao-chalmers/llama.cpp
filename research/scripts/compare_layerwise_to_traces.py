@@ -22,6 +22,7 @@ from layerwise_roofline_sim import (  # noqa: E402
     load_eta_json,
     load_structure_catalog,
     resolve_kv_quant_key,
+    resolve_sim_physics,
     resolve_weight_bits,
     simulate_decode_step,
 )
@@ -83,6 +84,20 @@ def main() -> None:
         action="store_true",
         help="With --attn-impl simple: unfused logits/probs HBM traffic",
     )
+    ap.add_argument(
+        "--sim-physics-json",
+        default=None,
+        metavar="PATH",
+        help="layerwise_roofline_sim sim physics (kv_attn_byte_mode, attn scales)",
+    )
+    ap.add_argument(
+        "--kv-attn-byte-mode",
+        choices=["fp16_equiv_dequant", "storage"],
+        default=None,
+        help="Override attention KV byte model",
+    )
+    ap.add_argument("--attn-time-scale", type=float, default=None, metavar="F")
+    ap.add_argument("--attn-time-scale-inv-batch", type=float, default=None, metavar="F")
     args = ap.parse_args()
 
     if args.json_paths:
@@ -103,6 +118,13 @@ def main() -> None:
     gguf_tb = None
     if args.gguf:
         gguf_tb = load_gguf_tensor_n_bytes(os.path.expanduser(args.gguf))
+
+    phys = resolve_sim_physics(
+        args.sim_physics_json,
+        kv_attn_byte_mode=args.kv_attn_byte_mode,
+        attn_time_scale=args.attn_time_scale,
+        attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
+    )
 
     rows_out: list[dict] = []
 
@@ -140,6 +162,10 @@ def main() -> None:
                 attn_impl=args.attn_impl,
                 fa_bc=args.fa_bc,
                 attn_naive_spill=args.attn_naive_spill,
+                kv_attn_byte_mode=str(phys["kv_attn_byte_mode"]),
+                attn_time_scale=float(phys["attn_time_scale"]),
+                attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
+                attn_scale_by_batch=phys.get("attn_scale_by_batch"),
             )
             layer_ms = total_s * 1000.0 / float(B)
 
@@ -175,6 +201,7 @@ def main() -> None:
         f"layerwise_η={'fitted ' + repr(args.eta_json) if args.eta_json else 'defaults'}"
         + (f"  cal={args.calibration_json!r}" if args.calibration_json else "")
         + (f"  gguf={args.gguf!r}" if args.gguf else "")
+        + f"  sim_physics={phys!r}"
     )
     print()
     if calib is not None:

@@ -29,6 +29,16 @@ Does not modify perf_model.py; imports kv_bytes_per_token / QUANT_CONFIGS only.
 across ``flash_qk``, ``flash_softmax``, ``flash_pv`` (all still ``family=attn_core`` for
 aggregation). ``--fa-bc`` only sets ``kv_tiles_along_seq`` in JSON for now.
 
+**KV bytes in ``attn_core`` (native q8/q4):** storage bytes under-predict latency because
+CUDA dequant dominates BW savings (see ``benchmark_kv_timing.KV_DEQUANT_OVERHEAD``).
+Default ``--kv-attn-byte-mode fp16_equiv_dequant`` uses **fp16 KV bytes × overhead** for
+the attention **read** path for ``int8_ch`` / ``int4_ch``; use ``storage`` for the legacy
+bytes-only model.
+
+**Overlap / serial-sum error:** optional ``--attn-time-scale`` and
+``--attn-time-scale-inv-batch`` multiply **only** ``attn_core`` time by
+``attn_time_scale + attn_time_scale_inv_batch / B`` (β_attn-style correction).
+
 Example::
 
     python3 layerwise_roofline_sim.py --preset qwen3-8b-q8_0 -B 8 --ctx-len 4096 --hw h100-sxm \\
@@ -132,6 +142,129 @@ def resolve_kv_quant_key(cli: str) -> str:
         f"Unknown kv-type {cli!r}. Try: {sorted(KV_QUANT_ALIASES.keys())} "
         f"or: {list(QUANT_CONFIGS.keys())}"
     )
+
+
+# Native GPU KV (q8_0 / q4_0): attn read path effective bytes = fp16 bytes × mult
+# (aligned with research/scripts/benchmark_kv_timing.KV_DEQUANT_OVERHEAD).
+NATIVE_KV_ATTN_FP16_MULT: dict[str, float] = {
+    "int8_ch": 1.08,
+    "int4_ch": 1.08,
+}
+
+
+def kv_attn_read_bpt_layer(
+    kv_quant_key: str,
+    model: dict[str, Any],
+    n_layers: int,
+    *,
+    kv_group_size: Optional[int],
+    kv_asym: bool,
+    mode: str,
+) -> float:
+    """Bytes per layer for **attention KV read** roofline (one token row per layer).
+
+    mode:
+        ``storage`` — use ``kv_bytes_per_token(kv_quant_key) / n_layers`` (legacy).
+        ``fp16_equiv_dequant`` — for ``int8_ch`` / ``int4_ch``, use
+        ``kv_bytes_per_token('fp16')/n_layers × NATIVE_KV_ATTN_FP16_MULT``; else storage.
+    """
+
+    nl = float(n_layers)
+    kv_total = kv_bytes_per_token(
+        kv_quant_key,
+        dict(model),
+        kv_group_size,
+        kv_asym,
+    )
+    kv_layer = kv_total / nl
+    m = str(mode).strip().lower()
+    if m == "storage":
+        return float(kv_layer)
+    if m == "fp16_equiv_dequant":
+        if kv_quant_key not in NATIVE_KV_ATTN_FP16_MULT:
+            return float(kv_layer)
+        fp16_total = kv_bytes_per_token(
+            "fp16",
+            dict(model),
+            kv_group_size,
+            kv_asym,
+        )
+        return float(fp16_total) / nl * NATIVE_KV_ATTN_FP16_MULT[kv_quant_key]
+    raise ValueError(
+        f"Unknown kv_attn_byte_mode {mode!r}; use 'storage' or 'fp16_equiv_dequant'"
+    )
+
+
+def effective_attn_scale(
+    batch_size: int,
+    attn_time_scale: float,
+    attn_time_scale_inv_batch: float,
+    attn_scale_by_batch: Optional[dict[int, float]] = None,
+) -> float:
+    """Return attention time multiplier.
+
+    Priority:
+      1) If ``attn_scale_by_batch`` has an entry for B, use it.
+      2) Else use ``attn_time_scale + attn_time_scale_inv_batch / B``.
+    """
+
+    B = float(batch_size)
+    if B < 1.0:
+        raise ValueError("batch_size must be >= 1")
+    if attn_scale_by_batch:
+        v = attn_scale_by_batch.get(int(batch_size))
+        if v is not None:
+            return float(v)
+    return float(attn_time_scale) + float(attn_time_scale_inv_batch) / B
+
+
+def load_sim_physics_json(path: Optional[str]) -> dict[str, Any]:
+    """Optional JSON with keys: kv_attn_byte_mode, attn_time_scale, attn_time_scale_inv_batch, attn_scale_by_batch."""
+
+    if not path:
+        return {
+            "kv_attn_byte_mode": "fp16_equiv_dequant",
+            "attn_time_scale": 1.0,
+            "attn_time_scale_inv_batch": 0.0,
+            "attn_scale_by_batch": {},
+        }
+    data = _load_json(os.path.expanduser(path))
+    base = load_sim_physics_json(None)
+    for k in base:
+        if k in data and data[k] is not None:
+            base[k] = data[k]
+    return base
+
+
+def resolve_sim_physics(
+    sim_physics_json: Optional[str],
+    kv_attn_byte_mode: Optional[str] = None,
+    attn_time_scale: Optional[float] = None,
+    attn_time_scale_inv_batch: Optional[float] = None,
+) -> dict[str, Any]:
+    """Merge ``load_sim_physics_json`` with optional CLI overrides."""
+
+    phys = load_sim_physics_json(sim_physics_json)
+    if kv_attn_byte_mode is not None:
+        phys["kv_attn_byte_mode"] = str(kv_attn_byte_mode)
+    if attn_time_scale is not None:
+        phys["attn_time_scale"] = float(attn_time_scale)
+    if attn_time_scale_inv_batch is not None:
+        phys["attn_time_scale_inv_batch"] = float(attn_time_scale_inv_batch)
+    if "attn_scale_by_batch" not in phys or phys["attn_scale_by_batch"] is None:
+        phys["attn_scale_by_batch"] = {}
+    # Normalize keys to int, values to float if provided as JSON.
+    if isinstance(phys["attn_scale_by_batch"], dict):
+        norm: dict[int, float] = {}
+        for k, v in phys["attn_scale_by_batch"].items():
+            try:
+                kk = int(k)
+                vv = float(v)
+            except Exception:
+                continue
+            norm[kk] = vv
+        phys["attn_scale_by_batch"] = norm
+    return phys
 
 
 def tag_to_weight_bits(tag: str) -> float:
@@ -401,6 +534,10 @@ def simulate_decode_step(
     attn_impl: str = "simple",
     fa_bc: int = 128,
     attn_naive_spill: bool = False,
+    kv_attn_byte_mode: str = "fp16_equiv_dequant",
+    attn_time_scale: float = 1.0,
+    attn_time_scale_inv_batch: float = 0.0,
+    attn_scale_by_batch: Optional[dict[int, float]] = None,
 ) -> tuple[float, list[SimEvent]]:
     """One token step for B parallel sequences; return (total_seconds, events).
 
@@ -418,6 +555,12 @@ def simulate_decode_step(
       O(L²) tile — decode is O(L)); emits ``flash_qk``, ``flash_softmax``, ``flash_pv``
       (same ``family`` = ``attn_core`` so aggregates match). ``fa_bc`` is used only to
       report ``ceil(ctx_len / fa_bc)`` KV tiles (metadata for scripts / JSON).
+
+    **kv_attn_byte_mode:** ``storage`` (legacy) or ``fp16_equiv_dequant`` (default) —
+    see ``kv_attn_read_bpt_layer``.
+
+    **attn_time_scale / attn_time_scale_inv_batch:** multiply only ``attn_core`` time by
+    ``attn_time_scale + attn_time_scale_inv_batch / batch_size``.
     """
 
     B = int(batch_size)
@@ -452,6 +595,20 @@ def simulate_decode_step(
         kv_asym,
     )
     kv_bpt_layer = kv_bpt_total / float(nl)
+    kv_attn_bpt_layer = kv_attn_read_bpt_layer(
+        kv_quant_key,
+        m,
+        nl,
+        kv_group_size=kv_group_size,
+        kv_asym=kv_asym,
+        mode=kv_attn_byte_mode,
+    )
+    attn_scale_eff = effective_attn_scale(
+        B,
+        attn_time_scale,
+        attn_time_scale_inv_batch,
+        attn_scale_by_batch,
+    )
 
     events: list[SimEvent] = []
     total_s = 0.0
@@ -465,9 +622,11 @@ def simulate_decode_step(
         scaling: str,
         eta_c: float,
         eta_b: float,
+        *,
+        time_scale: float = 1.0,
     ) -> None:
         nonlocal total_s
-        t = roofline_seconds(flops, bmov, hw, eta_c, eta_b)
+        t = roofline_seconds(flops, bmov, hw, eta_c, eta_b) * float(time_scale)
         events.append(
             SimEvent(
                 layer=layer,
@@ -553,8 +712,8 @@ def simulate_decode_step(
         )
 
         # --- Attention (simple = legacy single roofline; flash = fused + split sub-events) ---
-        # kv_bpt_layer = bytes for this layer's K+V for one token (from total KV / n_layers)
-        kv_read_bytes = kv_bpt_layer * float(ctx) * float(B)
+        # kv_attn_bpt_layer: may use fp16-equiv dequant model for native int8/int4 KV (attn read only)
+        kv_read_bytes = kv_attn_bpt_layer * float(ctx) * float(B)
         flops_qk = 2.0 * B * nh * ctx * hd
         flops_pv = 2.0 * B * nh * ctx * hd
         # Softmax over L positions per head (exp / sum / normalize): ~5 FLOPs per logit (tunable)
@@ -575,6 +734,7 @@ def simulate_decode_step(
                 "linear_B",
                 eta.attn_comp,
                 eta.attn_bw,
+                time_scale=attn_scale_eff,
             )
         else:
             # FlashAttention-style decode: fused kernel keeps softmax on-chip; count Q read + KV read.
@@ -603,7 +763,7 @@ def simulate_decode_step(
                     fl,
                     bmov,
                     "linear_B",
-                    sec,
+                    sec * attn_scale_eff,
                 )
 
         o_w = wb_map["o"] if wb_map is not None else nh * hd * d * bpe
@@ -685,6 +845,10 @@ def predict_ms_per_token(
     attn_impl: str = "simple",
     fa_bc: int = 128,
     attn_naive_spill: bool = False,
+    kv_attn_byte_mode: str = "fp16_equiv_dequant",
+    attn_time_scale: float = 1.0,
+    attn_time_scale_inv_batch: float = 0.0,
+    attn_scale_by_batch: Optional[dict[int, float]] = None,
 ) -> float:
     """Layerwise decode-step prediction: wall ms divided by batch (ms/tok)."""
 
@@ -706,6 +870,10 @@ def predict_ms_per_token(
         attn_impl=attn_impl,
         fa_bc=fa_bc,
         attn_naive_spill=attn_naive_spill,
+        kv_attn_byte_mode=kv_attn_byte_mode,
+        attn_time_scale=attn_time_scale,
+        attn_time_scale_inv_batch=attn_time_scale_inv_batch,
+        attn_scale_by_batch=attn_scale_by_batch,
     )
     return total_s * 1000.0 / float(batch_size)
 
@@ -950,6 +1118,32 @@ def main() -> None:
         help="From fit_layerwise_calibration.py: "
           "ms/tok = t_floor_ms/B + scale × raw layerwise ms/tok",
     )
+    p.add_argument(
+        "--sim-physics-json",
+        default=None,
+        metavar="PATH",
+        help="Optional JSON with kv_attn_byte_mode, attn_time_scale, attn_time_scale_inv_batch",
+    )
+    p.add_argument(
+        "--kv-attn-byte-mode",
+        choices=["fp16_equiv_dequant", "storage"],
+        default=None,
+        help="Attention KV read bytes model (default: fp16_equiv_dequant; storage = legacy)",
+    )
+    p.add_argument(
+        "--attn-time-scale",
+        type=float,
+        default=None,
+        metavar="F",
+        help="Multiply attn_core time by (F + attn_time_scale_inv_batch / B); default 1",
+    )
+    p.add_argument(
+        "--attn-time-scale-inv-batch",
+        type=float,
+        default=None,
+        metavar="F",
+        help="Added to attn scale as F/B (overlap / large-B correction); default 0",
+    )
     p.add_argument("--json-out", default=None, help="Write full result JSON to path")
     p.add_argument("--verbose", "-v", action="store_true", help="Print per-event lines")
     args = p.parse_args()
@@ -996,6 +1190,13 @@ def main() -> None:
         kv_bw=args.eta_kv_bw if args.eta_kv_bw is not None else eta_base.kv_bw,
     )
 
+    phys = resolve_sim_physics(
+        args.sim_physics_json,
+        kv_attn_byte_mode=args.kv_attn_byte_mode,
+        attn_time_scale=args.attn_time_scale,
+        attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
+    )
+
     total_s, events = simulate_decode_step(
         model,
         batch_size=args.batch_size,
@@ -1011,6 +1212,10 @@ def main() -> None:
         attn_impl=args.attn_impl,
         fa_bc=args.fa_bc,
         attn_naive_spill=args.attn_naive_spill,
+        kv_attn_byte_mode=str(phys["kv_attn_byte_mode"]),
+        attn_time_scale=float(phys["attn_time_scale"]),
+        attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
+        attn_scale_by_batch=phys.get("attn_scale_by_batch"),
     )
 
     ms_step = total_s * 1000.0
@@ -1046,6 +1251,15 @@ def main() -> None:
     print(f"layers={model['n_layers']}  d_model={model['d_model']}  ffn_dim={model['ffn_dim']}")
     if cal is not None:
         print(f"  calibration: {args.calibration_json!r}  (t_floor_ms={cal['t_floor_ms']}, scale={cal['scale']})")
+    if phys.get("attn_scale_by_batch") and int(args.batch_size) in phys["attn_scale_by_batch"]:
+        psc = float(phys["attn_scale_by_batch"][int(args.batch_size)])
+    else:
+        psc = float(phys["attn_time_scale"]) + float(phys["attn_time_scale_inv_batch"]) / float(args.batch_size)
+    print(
+        f"  sim_physics: kv_attn_byte_mode={phys['kv_attn_byte_mode']!r}  "
+        f"attn_scale={phys['attn_time_scale']!r}+inv_B*{phys['attn_time_scale_inv_batch']!r} "
+        f"→ effective={psc:.4f} @ B={args.batch_size}"
+    )
     print()
     print(f"  total_time (one decode step, all layers): {ms_step:.4f} ms")
     print(f"  ms/token (layerwise raw, wall / B):        {ms_per_tok_raw:.4f} ms/tok")
@@ -1084,6 +1298,8 @@ def main() -> None:
         "attn_impl": args.attn_impl,
         "fa_bc": int(args.fa_bc),
         "attn_naive_spill": bool(args.attn_naive_spill),
+        "sim_physics": dict(phys),
+        "attn_time_scale_effective": round(psc, 6),
         "kv_tiles_along_seq": (int(args.ctx_len) + int(args.fa_bc) - 1) // int(args.fa_bc),
         "total_ms_per_step": round(ms_step, 6),
         "ms_per_token_raw_layerwise": round(ms_per_tok_raw, 6),

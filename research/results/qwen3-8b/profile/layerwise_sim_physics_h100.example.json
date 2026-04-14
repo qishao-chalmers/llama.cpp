@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "_comment": "Optional --sim-physics-json for layerwise_roofline_sim / fit_layerwise_eta. kv_attn_byte_mode fp16_equiv_dequant matches benchmark_kv_timing KV dequant model for native q8/q4. attn_time_scale + attn_time_scale_inv_batch/B multiplies attn_core time only (overlap / beta_attn). Example overlap-ish: attn_time_scale 0.484, attn_time_scale_inv_batch 0.516 → scale ~1 @ B=1, ~0.51 @ B=32.",
+  "kv_attn_byte_mode": "fp16_equiv_dequant",
+  "attn_time_scale": 1.0,
+  "attn_time_scale_inv_batch": 0.0
+}
