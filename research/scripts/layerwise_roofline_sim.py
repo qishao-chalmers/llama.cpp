@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -61,7 +62,7 @@ _DEFAULT_STRUCT = os.path.join(_SCRIPT_DIR, "model_structures.json")
 
 # Read-only use of perf_model KV accounting
 sys.path.insert(0, _SCRIPT_DIR)
-from perf_model import QUANT_CONFIGS, kv_bytes_per_token  # noqa: E402
+from perf_model import QUANT_CONFIGS, kv_bytes_per_token, prefill_time  # noqa: E402
 from gguf_layerwise_weights import (  # noqa: E402
     load_gguf_tensor_n_bytes,
     resolve_layer_weight_bytes_from_gguf,
@@ -219,7 +220,12 @@ def effective_attn_scale(
 
 
 def load_sim_physics_json(path: Optional[str]) -> dict[str, Any]:
-    """Optional JSON with keys: kv_attn_byte_mode, attn_time_scale, attn_time_scale_inv_batch, attn_scale_by_batch."""
+    """Optional JSON with keys:
+
+    - kv_attn_byte_mode
+    - attn_time_scale, attn_time_scale_inv_batch, attn_scale_by_batch
+    - weight_time_scale_by_tag: map weight_tag -> multiplier (scales GEMM family only)
+    """
 
     if not path:
         return {
@@ -227,6 +233,7 @@ def load_sim_physics_json(path: Optional[str]) -> dict[str, Any]:
             "attn_time_scale": 1.0,
             "attn_time_scale_inv_batch": 0.0,
             "attn_scale_by_batch": {},
+            "weight_time_scale_by_tag": {},
         }
     data = _load_json(os.path.expanduser(path))
     base = load_sim_physics_json(None)
@@ -264,6 +271,19 @@ def resolve_sim_physics(
                 continue
             norm[kk] = vv
         phys["attn_scale_by_batch"] = norm
+
+    if "weight_time_scale_by_tag" not in phys or phys["weight_time_scale_by_tag"] is None:
+        phys["weight_time_scale_by_tag"] = {}
+    if isinstance(phys["weight_time_scale_by_tag"], dict):
+        wnorm: dict[str, float] = {}
+        for k, v in phys["weight_time_scale_by_tag"].items():
+            try:
+                kk = str(k)
+                vv = float(v)
+            except Exception:
+                continue
+            wnorm[kk] = vv
+        phys["weight_time_scale_by_tag"] = wnorm
     return phys
 
 
@@ -538,6 +558,8 @@ def simulate_decode_step(
     attn_time_scale: float = 1.0,
     attn_time_scale_inv_batch: float = 0.0,
     attn_scale_by_batch: Optional[dict[int, float]] = None,
+    weight_tag: Optional[str] = None,
+    weight_time_scale_by_tag: Optional[dict[str, float]] = None,
 ) -> tuple[float, list[SimEvent]]:
     """One token step for B parallel sequences; return (total_seconds, events).
 
@@ -609,6 +631,10 @@ def simulate_decode_step(
         attn_time_scale_inv_batch,
         attn_scale_by_batch,
     )
+
+    wt_scale = 1.0
+    if weight_tag and weight_time_scale_by_tag and isinstance(weight_time_scale_by_tag, dict):
+        wt_scale = float(weight_time_scale_by_tag.get(str(weight_tag), 1.0))
 
     events: list[SimEvent] = []
     total_s = 0.0
@@ -686,17 +712,17 @@ def simulate_decode_step(
         q_w = wb_map["q"] if wb_map is not None else d * nh * hd * bpe
         q_flops = 2.0 * B * d * nh * hd
         q_act = bytes_fp16_activations(B * d + B * nh * hd)
-        emit(layer, "q_proj", "gemm", q_flops, q_w + q_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
+        emit(layer, "q_proj", "gemm", q_flops, q_w + q_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
 
         k_w = wb_map["k"] if wb_map is not None else d * nkv * hd * bpe
         k_flops = 2.0 * B * d * nkv * hd
         k_act = bytes_fp16_activations(B * d + B * nkv * hd)
-        emit(layer, "k_proj", "gemm", k_flops, k_w + k_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
+        emit(layer, "k_proj", "gemm", k_flops, k_w + k_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
 
         v_w = wb_map["v"] if wb_map is not None else d * nkv * hd * bpe
         v_flops = 2.0 * B * d * nkv * hd
         v_act = bytes_fp16_activations(B * d + B * nkv * hd)
-        emit(layer, "v_proj", "gemm", v_flops, v_w + v_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
+        emit(layer, "v_proj", "gemm", v_flops, v_w + v_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
 
         # KV write: one new token row (K+V) for this layer, B sequences
         kv_write_b = kv_bpt_layer * B
@@ -769,7 +795,7 @@ def simulate_decode_step(
         o_w = wb_map["o"] if wb_map is not None else nh * hd * d * bpe
         o_flops = 2.0 * B * nh * hd * d
         o_act = bytes_fp16_activations(B * nh * hd + B * d)
-        emit(layer, "o_proj", "gemm", o_flops, o_w + o_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
+        emit(layer, "o_proj", "gemm", o_flops, o_w + o_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
 
         emit(
             layer,
@@ -804,16 +830,16 @@ def simulate_decode_step(
             g_act = bytes_fp16_activations(B * d + B * ffn)
             u_act = bytes_fp16_activations(B * d + B * ffn)
             d_act = bytes_fp16_activations(B * ffn + B * d)
-            emit(layer, "ffn_gate", "gemm", g_flops, gate_w + g_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
-            emit(layer, "ffn_up", "gemm", u_flops, up_w + u_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
-            emit(layer, "ffn_down", "gemm", d_flops, down_w + d_act, "linear_B", eta.gemm_comp, eta.gemm_bw)
+            emit(layer, "ffn_gate", "gemm", g_flops, gate_w + g_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
+            emit(layer, "ffn_up", "gemm", u_flops, up_w + u_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
+            emit(layer, "ffn_down", "gemm", d_flops, down_w + d_act, "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
         else:
             up_w = wb_map["up"] if wb_map is not None else d * ffn * bpe
             down_w = wb_map["down"] if wb_map is not None else ffn * d * bpe
             u_flops = 2.0 * B * d * ffn
             d_flops = 2.0 * B * ffn * d
-            emit(layer, "ffn_up", "gemm", u_flops, up_w + bytes_fp16_activations(B * d + B * ffn), "linear_B", eta.gemm_comp, eta.gemm_bw)
-            emit(layer, "ffn_down", "gemm", d_flops, down_w + bytes_fp16_activations(B * ffn + B * d), "linear_B", eta.gemm_comp, eta.gemm_bw)
+            emit(layer, "ffn_up", "gemm", u_flops, up_w + bytes_fp16_activations(B * d + B * ffn), "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
+            emit(layer, "ffn_down", "gemm", d_flops, down_w + bytes_fp16_activations(B * ffn + B * d), "linear_B", eta.gemm_comp, eta.gemm_bw, time_scale=wt_scale)
 
         emit(
             layer,
@@ -849,6 +875,8 @@ def predict_ms_per_token(
     attn_time_scale: float = 1.0,
     attn_time_scale_inv_batch: float = 0.0,
     attn_scale_by_batch: Optional[dict[int, float]] = None,
+    weight_tag: Optional[str] = None,
+    weight_time_scale_by_tag: Optional[dict[str, float]] = None,
 ) -> float:
     """Layerwise decode-step prediction: wall ms divided by batch (ms/tok)."""
 
@@ -874,6 +902,8 @@ def predict_ms_per_token(
         attn_time_scale=attn_time_scale,
         attn_time_scale_inv_batch=attn_time_scale_inv_batch,
         attn_scale_by_batch=attn_scale_by_batch,
+        weight_tag=weight_tag,
+        weight_time_scale_by_tag=weight_time_scale_by_tag,
     )
     return total_s * 1000.0 / float(batch_size)
 
@@ -1013,6 +1043,64 @@ def predict_ms_per_token_pipeline(
     return step_ms / float(batch_size)
 
 
+def predict_verify_step_ms(
+    model: dict[str, Any],
+    *,
+    n_draft_tokens: int,
+    ctx_len: int,
+    hw_name: str,
+    eta_wt: float,
+    eta_kv: float,
+    t_floor_ms: float,
+    weight_bits: float,
+    norm_weight_bits: float = 16.0,
+    kv_quant_key: str,
+    kv_group_size: Optional[int] = None,
+    kv_asym: bool = False,
+    gguf_tensor_bytes: Optional[dict[str, int]] = None,
+) -> float:
+    """Total wall-clock ms to verify n_draft_tokens in one parallel forward pass.
+
+    In speculative decoding the verifier processes all K draft tokens in a single
+    batched forward pass (K tokens attend to the shared KV cache in parallel).
+    The roofline analysis is identical to a batch_size=K decode step:
+
+        verify_step_ms = T_floor + wt_bytes/eff_BW_wt + K×ctx×kv_bpt/eff_BW_kv
+
+    Weight bytes are read **once** regardless of K (amortized across all tokens),
+    while KV attention bytes scale linearly with K.  The compute ceiling
+    (weight GEMMs flip from memory-bound to compute-bound) is reached only at
+    K ≳ peak_TFLOPS / peak_BW × bpe / 2; for Q8_0 on H100-SXM this is ~140 tokens,
+    well above typical speculative-decoding draft lengths of 4–16.
+
+    Returns the **total step time in ms** (NOT ms/tok).  The effective throughput
+    rate for the verifier is verify_step_ms / n_accepted_tokens, where
+    n_accepted_tokens ≤ n_draft_tokens + 1 (including the bonus token).
+
+    For the bootstrap cost model, compare:
+        draft_k_ms   = k × draft_decode_ms        (K sequential single-token steps)
+        verify_ms    = predict_verify_step_ms(K)   (one parallel verify pass)
+    Both produce up to K+1 accepted tokens; verify_ms is cheaper because the
+    verifier's weight cost is shared across all K tokens.
+    """
+    ms_per_tok = predict_ms_per_token_pipeline(
+        model,
+        batch_size=n_draft_tokens,
+        ctx_len=ctx_len,
+        hw_name=hw_name,
+        eta_wt=eta_wt,
+        eta_kv=eta_kv,
+        t_floor_ms=t_floor_ms,
+        weight_bits=weight_bits,
+        norm_weight_bits=norm_weight_bits,
+        kv_quant_key=kv_quant_key,
+        kv_group_size=kv_group_size,
+        kv_asym=kv_asym,
+        gguf_tensor_bytes=gguf_tensor_bytes,
+    )
+    return ms_per_tok * float(n_draft_tokens)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--preset", default=None, help="Key in model_structures.json")
@@ -1028,6 +1116,34 @@ def main() -> None:
     )
     p.add_argument("--batch-size", "-B", type=int, default=1)
     p.add_argument("--ctx-len", type=int, default=4096, help="KV context length for decode step")
+    p.add_argument(
+        "--sample-ctx",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If N>0, override the context length used for the decode-step sim (takes precedence over --ctx-len and derived mid_ctx).",
+    )
+    p.add_argument(
+        "--prompt-len",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If N>0 and --decode-len>0, derive mid_ctx = prompt_len + decode_len//2 for decode sim",
+    )
+    p.add_argument(
+        "--decode-len",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If N>0 and --prompt-len>0, derive mid_ctx for decode sim and print end-to-end tok/s",
+    )
+    p.add_argument(
+        "--prefill-len",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Override prefill length for the prefill estimate block. If 0, uses --prompt-len (if set).",
+    )
     p.add_argument(
         "--attn-impl",
         default="simple",
@@ -1197,10 +1313,22 @@ def main() -> None:
         attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
     )
 
+    prompt_len = int(args.prompt_len)
+    decode_len = int(args.decode_len)
+    mid_ctx = None
+    if prompt_len > 0 and decode_len > 0:
+        mid_ctx = prompt_len + decode_len // 2
+
+    ctx_len_used = int(args.ctx_len)
+    if mid_ctx is not None:
+        ctx_len_used = int(mid_ctx)
+    if int(args.sample_ctx) > 0:
+        ctx_len_used = int(args.sample_ctx)
+
     total_s, events = simulate_decode_step(
         model,
         batch_size=args.batch_size,
-        ctx_len=args.ctx_len,
+        ctx_len=ctx_len_used,
         hw=hw,
         eta=eta,
         weight_bpe=wbpe,
@@ -1216,6 +1344,8 @@ def main() -> None:
         attn_time_scale=float(phys["attn_time_scale"]),
         attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
         attn_scale_by_batch=phys.get("attn_scale_by_batch"),
+        weight_tag=w_tag_resolved,
+        weight_time_scale_by_tag=phys.get("weight_time_scale_by_tag"),
     )
 
     ms_step = total_s * 1000.0
@@ -1238,6 +1368,12 @@ def main() -> None:
         f"preset={pid!r}  hw={args.hw!r}  B={args.batch_size}  ctx_len={args.ctx_len}  "
         f"kv={args.kv_type!r}→{kv_key!r}"
     )
+    if mid_ctx is not None:
+        print(f"  prompt_len={prompt_len}  decode_len={decode_len}  mid_ctx={mid_ctx}")
+    if int(args.sample_ctx) > 0:
+        print(f"  sample_ctx={int(args.sample_ctx)}")
+    if ctx_len_used != int(args.ctx_len):
+        print(f"  ctx_len_used={ctx_len_used}")
     wtag_line = f"weight_bits={w_bits:.2f}"
     if w_tag_resolved:
         wtag_line += f"  (tag={w_tag_resolved!r})"
@@ -1280,11 +1416,57 @@ def main() -> None:
         for e in events:
             print(f"    L{e.layer:3d}  {e.name:20s}  {e.seconds*1000.0:10.6f} ms  [{e.family}]")
 
+    # ─── Prefill estimate (perf_model) ────────────────────────────────────────
+    # prompt_len == prefill_len in meaning; keep --prefill-len as an override.
+    prefill_n = int(args.prefill_len) if int(args.prefill_len) > 0 else int(prompt_len)
+    prefill_s_seq: Optional[float] = None
+    prefill_s_step: Optional[float] = None
+    prefill_tok_s: Optional[float] = None
+    if prefill_n > 0:
+        prefill_s_seq = float(prefill_time(prefill_n, model, hw))
+        # Approximation: prefill flops scale with number of sequences in the batch.
+        prefill_s_step = prefill_s_seq * float(args.batch_size)
+        prefill_tok_s = (float(prefill_n) * float(args.batch_size)) / prefill_s_step if prefill_s_step > 0 else None
+        print()
+        print("  Prefill estimate (compute-bound, perf_model):")
+        print(f"    prompt_len:                     {prefill_n}")
+        print(f"    prefill_time per sequence:      {prefill_s_seq*1000.0:.3f} ms")
+        print(f"    prefill_time (B sequences):     {prefill_s_step*1000.0:.3f} ms")
+        if prefill_tok_s is not None:
+            print(f"    prefill throughput (tok/s):     {prefill_tok_s:.1f}")
+
+    # ─── End-to-end throughput for (prompt_len, decode_len) ───────────────────
+    # Uses:
+    #   - prefill_time() (compute-bound) for prompt_len tokens
+    #   - layerwise decode step time at mid_ctx (wall per step = ms_step)
+    # Total tokens processed = (prompt_len + decode_len) * B
+    # Total wall time ≈ prefill_time(prompt_len)*B + decode_len * ms_step
+    if prompt_len > 0 and decode_len > 0:
+        t_pref_seq = float(prefill_time(prompt_len, model, hw))
+        t_pref = t_pref_seq * float(args.batch_size)
+        t_dec = float(decode_len) * (ms_step / 1000.0)
+        t_tot = t_pref + t_dec
+        toks = float(prompt_len + decode_len) * float(args.batch_size)
+        sys_tps = toks / t_tot if t_tot > 0 else float("nan")
+        print()
+        print("  End-to-end estimate (prefill + decode):")
+        print(f"    prompt_len:                     {prompt_len}")
+        print(f"    decode_len:                      {decode_len}")
+        print(f"    prefill_time (B sequences):     {t_pref*1000.0:.3f} ms")
+        print(f"    decode_time (B sequences):      {t_dec*1000.0:.3f} ms")
+        print(f"    total_time (B sequences):       {t_tot*1000.0:.3f} ms")
+        print(f"    throughput (tok/s, prompt+dec): {sys_tps:.1f}")
+
     out: dict[str, Any] = {
         "preset": pid,
         "hardware": args.hw,
         "batch_size": args.batch_size,
-        "ctx_len": args.ctx_len,
+        "ctx_len": int(args.ctx_len),
+        "prompt_len": int(prompt_len),
+        "decode_len": int(decode_len),
+        "mid_ctx": int(mid_ctx) if mid_ctx is not None else None,
+        "sample_ctx": int(args.sample_ctx) if int(args.sample_ctx) > 0 else None,
+        "ctx_len_used": int(ctx_len_used),
         "kv_type_cli": args.kv_type,
         "kv_quant_key": kv_key,
         "kv_group_size": args.kv_group_size,
@@ -1305,6 +1487,11 @@ def main() -> None:
         "ms_per_token_raw_layerwise": round(ms_per_tok_raw, 6),
         "ms_per_token": round(ms_per_tok, 6),
         "tok_per_s": round(tps, 4),
+        "prefill_len": int(prefill_n),
+        "prefill_time_s_per_seq": round(prefill_s_seq, 9) if prefill_s_seq is not None else None,
+        "prefill_time_s_for_batch": round(prefill_s_step, 9) if prefill_s_step is not None else None,
+        "prefill_tok_per_s": round(prefill_tok_s, 6) if prefill_tok_s is not None else None,
+        "system_tok_per_s_prompt_plus_decode": round(sys_tps, 6) if (prompt_len > 0 and decode_len > 0 and not math.isnan(sys_tps)) else None,
         "seconds_by_family": {k: round(v, 9) for k, v in by_fam.items()},
         "events": [
             {

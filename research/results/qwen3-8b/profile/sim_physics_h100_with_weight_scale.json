@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "_comment": "Sim physics with fitted weight_time_scale_by_tag for layerwise_roofline_sim. weight_time_scale_by_tag scales GEMM family only. Fit objective per row: measured_step_ms - other_ms \u2248 gemm_ms * scale(tag).",
+  "kv_attn_byte_mode": "fp16_equiv_dequant",
+  "attn_time_scale": 1.0,
+  "attn_time_scale_inv_batch": 0.0,
+  "attn_scale_by_batch": {
+    "8": 0.9954380580136377,
+    "16": 0.8062620429227477,
+    "32": 0.7032696051286489
+  },
+  "weight_time_scale_by_tag": {
+    "Q2_K": 2.3120218041288085,
+    "Q4_K_M": 1.444469210753524,
+    "Q8_0": 1.0
+  },
+  "_fit": {
+    "hw": "h100-sxm",
+    "eta_json": "../results/qwen3-8b/profile/layerwise_eta_h100.json",
+    "sources": [
+      "/home/qshao/Project/Fun/llama.cpp/research/results/qwen3-8b/profile/kv_timing_h100.json",
+      "/home/qshao/Project/Fun/llama.cpp/research/results/qwen3-8b-q4km/profile/kv_timing_h100.json",
+      "/home/qshao/Project/Fun/llama.cpp/research/results/qwen3-8b-q2k/profile/kv_timing_h100.json"
+    ],
+    "filters": {
+      "preset": null,
+      "kv_types": [
+        "f16",
+        "q8_0",
+        "q4_0"
+      ],
+      "batch_sizes": [
+        1,
+        4,
+        8,
+        16,
+        32
+      ],
+      "min_scale": 1.0
+    },
+    "fit_meta": {
+      "Q2_K": {
+        "n_rows": 15,
+        "rmse_ms_on_(meas_step-other)_vs_gemm": 1.40416,
+        "mae_ms_on_(meas_step-other)_vs_gemm": 1.147206,
+        "scale": 2.312022
+      },
+      "Q4_K_M": {
+        "n_rows": 15,
+        "rmse_ms_on_(meas_step-other)_vs_gemm": 1.490442,
+        "mae_ms_on_(meas_step-other)_vs_gemm": 1.188319,
+        "scale": 1.444469
+      },
+      "Q8_0": {
+        "n_rows": 15,
+        "rmse_ms_on_(meas_step-other)_vs_gemm": 1.068928,
+        "mae_ms_on_(meas_step-other)_vs_gemm": 0.821239,
+        "scale": 1.0
+      }
+    }
+  }
+}
