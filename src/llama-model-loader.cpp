@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <array>
@@ -1230,8 +1231,31 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
-    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
-    ggml_set_name(tensor, ggml_get_name(cur));
+    struct ggml_tensor * tensor = nullptr;
+    bool use_split2 = false;
+    bool use_split2_draft = false;
+    if (const char * e = getenv("LLAMA_Q8_0_SPLIT2")) {
+        use_split2 = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_Q8_0_SPLIT2_DRAFT")) {
+        use_split2_draft = atoi(e) != 0;
+    }
+
+    if (use_split2 &&
+        cur->type == GGML_TYPE_Q8_0 &&
+        ggml_n_dims(cur) == 2) {
+        ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            const ggml_type dst_type = use_split2_draft ? GGML_TYPE_Q8_0_SPLIT2_DRAFT : GGML_TYPE_Q8_0_SPLIT2;
+            tensor = ggml_new_tensor_2d(ctx, dst_type, cur->ne[0], cur->ne[1]);
+            ggml_set_name(tensor, ggml_get_name(cur));
+        }
+    }
+
+    if (!tensor) {
+        tensor = ggml_dup_tensor(ctx, cur);
+        ggml_set_name(tensor, ggml_get_name(cur));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
@@ -1482,7 +1506,12 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        size_t n_size = ggml_nbytes(cur);
+        const size_t n_size     = ggml_nbytes(cur);
+        const size_t n_size_src = weight->nbytes_src;
+
+        const bool is_q8_0_split2 =
+            cur->type == GGML_TYPE_Q8_0_SPLIT2 ||
+            cur->type == GGML_TYPE_Q8_0_SPLIT2_DRAFT;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1493,39 +1522,59 @@ bool llama_model_loader::load_all_data(
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
-                validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
-                    return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size_src, is_q8_0_split2] {
+                    if (is_q8_0_split2) {
+                        return std::make_pair(cur, ggml_validate_row_data(GGML_TYPE_Q8_0, data, n_size_src));
+                    }
+                    return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size_src));
                 }));
             }
 
-            GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            if (buf_mmap && cur->data == nullptr) {
-                ggml_backend_tensor_alloc(buf_mmap, cur, data);
-                if (lmlocks) {
-                    const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
-                }
-
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            if (is_q8_0_split2) {
+                std::vector<uint8_t> tmp_dst(n_size);
+                const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
+                transform_q8_0_to_split2((const block_q8_0 *) data, (block_q8_0_split2 *) tmp_dst.data(), n_blocks);
+                ggml_backend_tensor_set(cur, tmp_dst.data(), 0, n_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+                if (buf_mmap && cur->data == nullptr) {
+                    ggml_backend_tensor_alloc(buf_mmap, cur, data);
+                    if (lmlocks) {
+                        const auto & lmlock = lmlocks->at(weight->idx);
+                        lmlock->grow_to(weight->offs + n_size_src);
+                    }
+
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + n_size_src);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size_src);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                if (is_q8_0_split2) {
+                    std::vector<uint8_t> tmp_src(n_size_src);
+                    file->read_raw(tmp_src.data(), n_size_src);
+                    const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
+                    transform_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), (block_q8_0_split2 *) cur->data, n_blocks);
+                } else {
+                    file->read_raw(cur->data, n_size_src);
+                }
                 if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size_src, is_q8_0_split2] {
+                        if (is_q8_0_split2) {
+                            return std::make_pair(cur, ggml_validate_row_data(GGML_TYPE_Q8_0, cur->data, n_size_src));
+                        }
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size_src));
                     }));
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (upload_backend && !is_q8_0_split2) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1534,7 +1583,7 @@ bool llama_model_loader::load_all_data(
 
                     // Calculate aligned read boundaries
                     size_t read_start = aligned_offset;
-                    size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+                    size_t read_end = (offset + n_size_src + alignment - 1) & ~(alignment - 1);
 
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
@@ -1562,8 +1611,8 @@ bool llama_model_loader::load_all_data(
                         }
 
                         // Trim alignment padding at end of last chunk
-                        if (aligned_offset + bytes_read + read_size > offset + n_size) {
-                            data_to_copy -= (read_end - (offset + n_size));
+                        if (aligned_offset + bytes_read + read_size > offset + n_size_src) {
+                            data_to_copy -= (read_end - (offset + n_size_src));
                         }
 
                         // Async upload actual data to GPU
@@ -1578,18 +1627,31 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    read_buf.resize(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    if (is_q8_0_split2) {
+                        std::vector<uint8_t> tmp_src(n_size_src);
+                        std::vector<uint8_t> tmp_dst(n_size);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(tmp_src.data(), n_size_src);
+                        const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
+                        transform_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), (block_q8_0_split2 *) tmp_dst.data(), n_blocks);
+                        ggml_backend_tensor_set(cur, tmp_dst.data(), 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(GGML_TYPE_Q8_0, tmp_src.data(), n_size_src)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                    } else {
+                        read_buf.resize(n_size_src);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size_src);
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size_src);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size_src)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
                     }
                 }
             }
         }
 
-        size_done += n_size;
+        size_done += n_size_src;
     }
 
     // free temporary resources used for async uploads

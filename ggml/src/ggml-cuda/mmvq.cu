@@ -2,6 +2,8 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq_nib.cuh"
+#include "mmvq_split2.cuh"
 
 #include <cstdint>
 
@@ -14,6 +16,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_Q8_0_NIB:return vec_dot_q8_0_nib_q8_1;
+        case GGML_TYPE_Q8_0_SPLIT2_DRAFT: return vec_dot_q8_0_split2_draft_q8_1;
+        case GGML_TYPE_Q8_0_SPLIT2:       return vec_dot_q8_0_split2_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -40,6 +45,9 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0_NIB:return VDR_Q8_0_NIB_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0_SPLIT2_DRAFT: return VDR_Q8_0_SPLIT2_DRAFT_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0_SPLIT2:       return VDR_Q8_0_SPLIT2_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;

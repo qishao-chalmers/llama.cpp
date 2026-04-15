@@ -427,7 +427,10 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_COUNT   = 40,
+        GGML_TYPE_Q8_0_NIB = 40, // Q8_0 upper-nibble draft (experimental)
+        GGML_TYPE_Q8_0_SPLIT2_DRAFT = 41, // Q8_0 single-buffer split (A=upper nibble, B=lower nibble), draft view
+        GGML_TYPE_Q8_0_SPLIT2       = 42, // Q8_0 single-buffer split (A+B), full-precision view
+        GGML_TYPE_COUNT    = 43,
     };
 
     // precision

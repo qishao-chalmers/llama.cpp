@@ -414,6 +414,124 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void dequantize_row_q8_0_nib(const block_q8_0_nib * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK8_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t packed = x[i].ra[j];
+            const int n0u = packed >> 4;
+            const int n1u = packed & 0x0F;
+            const int n0 = (n0u ^ 8) - 8;
+            const int n1 = (n1u ^ 8) - 8;
+
+            y[i*qk + 2*j + 0] = (float) n0 * d;
+            y[i*qk + 2*j + 1] = (float) n1 * d;
+        }
+    }
+}
+
+void dequantize_row_q8_0_split2(const block_q8_0_split2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK8_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d_full);
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t a = x[i].ra[j];
+            const uint8_t b = x[i].rb[j];
+
+            const int hi0 = (int) (a >> 4);
+            const int lo0 = (int) (b >> 4);
+            const int hi1 = (int) (a & 0x0F);
+            const int lo1 = (int) (b & 0x0F);
+
+            const int q0 = ((hi0 << 4) | lo0);
+            const int q1 = ((hi1 << 4) | lo1);
+
+            y[i*qk + 2*j + 0] = (float) (int8_t) q0 * d;
+            y[i*qk + 2*j + 1] = (float) (int8_t) q1 * d;
+        }
+    }
+}
+
+void dequantize_row_q8_0_split2_draft(const block_q8_0_split2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK8_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d_draft);
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t packed = x[i].ra[j];
+            const int n0u = packed >> 4;
+            const int n1u = packed & 0x0F;
+            const int n0 = (n0u ^ 8) - 8;
+            const int n1 = (n1u ^ 8) - 8;
+
+            y[i*qk + 2*j + 0] = (float) n0 * d;
+            y[i*qk + 2*j + 1] = (float) n1 * d;
+        }
+    }
+}
+
+size_t transform_q8_0_to_nib(
+    const block_q8_0 * src,
+    block_q8_0_nib   * dst,
+    int                n_blocks) {
+    for (int bi = 0; bi < n_blocks; ++bi) {
+        const block_q8_0 * s = src + bi;
+        block_q8_0_nib   * d = dst + bi;
+
+        // draft scale = full scale * 16
+        d->d = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(s->d) * 16.0f);
+
+        for (int j = 0; j < QK8_0/2; ++j) {
+            const uint8_t q0 = (uint8_t) s->qs[2*j + 0];
+            const uint8_t q1 = (uint8_t) s->qs[2*j + 1];
+            d->ra[j] = (q0 & 0xF0) | (q1 >> 4);
+        }
+    }
+
+    return (size_t) n_blocks * sizeof(block_q8_0_nib);
+}
+
+size_t transform_q8_0_to_split2(
+    const block_q8_0      * src,
+    block_q8_0_split2     * dst,
+    int                    n_blocks) {
+    for (int bi = 0; bi < n_blocks; ++bi) {
+        const block_q8_0      * s = src + bi;
+        block_q8_0_split2     * d = dst + bi;
+
+        d->d_full  = s->d;
+        d->d_draft = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(s->d) * 16.0f);
+
+        for (int j = 0; j < QK8_0/2; ++j) {
+            const uint8_t q0 = (uint8_t) s->qs[2*j + 0];
+            const uint8_t q1 = (uint8_t) s->qs[2*j + 1];
+
+            d->ra[j] = (q0 & 0xF0) | (q1 >> 4);
+            d->rb[j] = ((q0 << 4) & 0xF0) | (q1 & 0x0F);
+        }
+    }
+
+    return (size_t) n_blocks * sizeof(block_q8_0_split2);
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 

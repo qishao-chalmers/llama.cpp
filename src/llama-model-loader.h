@@ -33,6 +33,8 @@ struct llama_model_loader {
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
+        size_t   nbytes_src; // bytes in source file (GGUF tensor size)
+        ggml_type type_src;  // source GGUF tensor type
 
         ggml_tensor * tensor;
 
@@ -43,7 +45,10 @@ struct llama_model_loader {
             }
 
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            nbytes_src = gguf_get_tensor_size(gguf_ctx, tensor_idx);
+            type_src   = gguf_get_tensor_type(gguf_ctx, tensor_idx);
+
+            if (offs + nbytes_src < offs || offs + nbytes_src > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }

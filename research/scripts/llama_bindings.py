@@ -219,6 +219,8 @@ def setup_lib(lib):
     # GGML tensor helpers for cb_eval callbacks (symbols exported from libllama.so)
     lib.ggml_get_name.restype   = ctypes.c_char_p
     lib.ggml_get_name.argtypes  = [ctypes.c_void_p]
+    lib.ggml_time_us.restype    = ctypes.c_int64
+    lib.ggml_time_us.argtypes   = []
     lib.ggml_nbytes.restype     = ctypes.c_size_t
     lib.ggml_nbytes.argtypes    = [ctypes.c_void_p]
     lib.ggml_nelements.restype  = ctypes.c_int64
@@ -253,7 +255,10 @@ def load_lib(path=None):
     import sys
     def _log_cb(level, text, user_data):
         s = text.decode("utf-8", errors="replace")
-        if "state_read_meta" in s or "CUDA graph" in s or "create_tensor" in s:
+        sl = s.lower()
+        # Drop noisy DEBUG lines (GGML CUDA graph warmup, per-step KV meta, etc.)
+        if ("state_read_meta" in s or "create_tensor" in s
+                or "cuda graph" in sl or "ggml_backend_cuda_graph" in sl):
             return
         sys.stderr.write(s)
     lib._log_cb = _LOG_CB_TYPE(_log_cb)  # keep reference to prevent GC

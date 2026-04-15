@@ -45,7 +45,22 @@ GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q8_0_nib(const block_q8_0_nib * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q8_0_split2(const block_q8_0_split2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q8_0_split2_draft(const block_q8_0_split2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 //GGML_API void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+// Experimental transforms used by split-weight prototypes.
+// dst must have room for n_blocks elements.
+GGML_API size_t transform_q8_0_to_nib(
+    const block_q8_0 * src,
+    block_q8_0_nib   * dst,
+    int                n_blocks);
+
+GGML_API size_t transform_q8_0_to_split2(
+    const block_q8_0      * src,
+    block_q8_0_split2     * dst,
+    int                    n_blocks);
 
 GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 

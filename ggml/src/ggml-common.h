@@ -223,6 +223,28 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
+// Q8_0 upper-nibble-only draft block (experimental).
+// Stores 4-bit signed nibbles (upper 4 bits of each Q8_0 element) packed 2-per-byte.
+// Dequant: x_i ≈ (scale*16) * sign_ext4(nibble_i), where sign_ext4(n) = (n^8)-8.
+typedef struct {
+    ggml_half d;              // draft_scale = q8_0.d * 16
+    uint8_t   ra[QK8_0 / 2];  // packed upper nibbles (2 per byte), 16 bytes
+} block_q8_0_nib;
+static_assert(sizeof(block_q8_0_nib) == sizeof(ggml_half) + QK8_0 / 2, "wrong q8_0_nib block size/padding");
+
+// Q8_0 split2 single-buffer block (experimental).
+// Stores A=upper nibbles and B=lower nibbles in separate regions, plus both scales:
+//  - d_full  : same as block_q8_0.d
+//  - d_draft : d_full * 16 (matches q8_0_nib scaling convention)
+// Layout is 4B-aligned so CUDA can load int32 from ra/rb.
+typedef struct {
+    ggml_half d_full;           // full scale (same as q8_0.d)
+    ggml_half d_draft;          // draft scale (d_full * 16)
+    uint8_t   ra[QK8_0 / 2];    // A region: packed upper nibbles (2 per byte), 16 bytes
+    uint8_t   rb[QK8_0 / 2];    // B region: packed lower  nibbles (2 per byte), 16 bytes
+} block_q8_0_split2;
+static_assert(sizeof(block_q8_0_split2) == 2*sizeof(ggml_half) + QK8_0, "wrong q8_0_split2 block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {
