@@ -382,6 +382,10 @@ extern "C" {
         // Applied before the first sched_reserve() so buffer reservation matches llama_decode.
         // llama_set_split2_mode() can still change mode later (e.g. switch contexts).
         int32_t                           split2_mode_init;
+
+        // [EXPERIMENTAL] Q4_K_RES (packed base+res) on CUDA MMVQ: 0 = verify (base+res dot), 1 = draft (base only).
+        // Applied before the first sched_reserve(). llama_set_q4_k_res_mode() can change mode later.
+        int32_t                           q4_k_res_mode_init;
     };
 
     // model quantization parameters
@@ -1004,6 +1008,11 @@ extern "C" {
     // For mode during the first graph reserve, set llama_context_params.split2_mode_init (see struct).
     LLAMA_API void llama_set_split2_mode(struct llama_context * ctx, int32_t mode);
     LLAMA_API int32_t llama_get_split2_mode(struct llama_context * ctx);
+
+    // Experimental: Q4_K_RES (packed base+res) on CUDA MMVQ. mode = 0 verify (base+res dot), mode = 1 draft (base only).
+    // For mode during the first graph reserve, set llama_context_params.q4_k_res_mode_init (see struct).
+    LLAMA_API void llama_set_q4_k_res_mode(struct llama_context * ctx, int32_t mode);
+    LLAMA_API int32_t llama_get_q4_k_res_mode(struct llama_context * ctx);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

@@ -781,10 +781,11 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
 }
 
-static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
-
-    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+// Inner product of one Q4_K sub-block with q8_1 activations (shared by Q4_K and Q4_K_RES base/res).
+static __device__ __forceinline__ float vec_dot_q4_K_block_q8_1_inner(
+    const block_q4_K * __restrict__ bq4_K,
+    const block_q8_1 * __restrict__ bq8_1,
+    const int & iqs) {
 
     int    v[2];
     int    u[2*QR4_K];
@@ -792,11 +793,6 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
-
-    // iqs = 0....3 -> bq8_offset = 0, want q4_offset = 0, 4, 8, 12
-    // iqs = 4....7 -> bq8_offset = 2, want q4_offset = 32, 36, 40, 44
-    // iqs = 8...11 -> bq8_offset = 4, want q4_offset = 64, 68, 72, 76
-    // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
 
     const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
     v[0] = q4[0];
@@ -825,6 +821,29 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     }
 
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+    return vec_dot_q4_K_block_q8_1_inner(bq4_K, bq8_1, iqs);
+}
+
+// Draft path: base block only (same as Q4_K on base weights).
+static __device__ __forceinline__ float vec_dot_q4_k_res_draft_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_k_res * br = (const block_q4_k_res *) vbq + kbx;
+    return vec_dot_q4_K_block_q8_1_inner(&br->base, bq8_1, iqs);
+}
+
+// Verify path: dequant(base) + dequant(res) in the dot domain.
+static __device__ __forceinline__ float vec_dot_q4_k_res_verify_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_k_res * br = (const block_q4_k_res *) vbq + kbx;
+    return vec_dot_q4_K_block_q8_1_inner(&br->base, bq8_1, iqs) + vec_dot_q4_K_block_q8_1_inner(&br->res, bq8_1, iqs);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(

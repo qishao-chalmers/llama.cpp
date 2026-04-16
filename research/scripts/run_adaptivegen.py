@@ -7,8 +7,9 @@ Three modes (--mode):
   draft  : single context, nibble-only GEMV (split2_mode=1). Upper-bound speedup.
   switch : one model, two contexts. Bootstrap with verifier to estimate draft
            agree-rate, then rollout: draft generates a window, verifier
-           teacher-forces it and accepts the prefix that matches. Measures real
-           adaptive-gen throughput.
+           teacher-forces it and accepts the prefix that matches. After commit,
+           draft_ctx KV is copied from verifier so the next draft step reuses
+           verifier-quality cache. Measures real adaptive-gen throughput.
 
 Load the Q8_0 model in split2 layout by setting:
   LLAMA_Q8_0_SPLIT2=1  python3 run_adaptivegen.py model_q8_0.gguf data.jsonl ...
@@ -52,7 +53,10 @@ def _load_examples(path: str, lib, vocab, args) -> list[list[int]]:
         all_tokens = _tokenize(lib, vocab, text)
         print(f"Flat mode: {len(all_tokens)} tokens total from {path}", flush=True)
 
-        chunk_size = args.n_ctx
+        # A chunk of length n_ctx fills the KV cache; the next decode has no free cell
+        # (llama_kv_cache::find_slot → FAILED_PREPARE). Reserve space for bootstrap + rollout.
+        reserve = max(8, args.bootstrap_window + args.max_gen_tokens + args.adaptive_window + 8)
+        chunk_size = max(1, args.n_ctx - reserve)
         n_available = max(1, (len(all_tokens) - chunk_size) // chunk_size + 1)
         n_want = min(limit, n_available) if limit else n_available
         stride = max(chunk_size, len(all_tokens) // n_want) if n_want > 1 else chunk_size
@@ -64,7 +68,7 @@ def _load_examples(path: str, lib, vocab, args) -> list[list[int]]:
             if end > len(all_tokens):
                 break
             examples.append(all_tokens[start:end])
-        print(f"  {len(examples)} chunk(s) of {chunk_size} tokens", flush=True)
+        print(f"  {len(examples)} chunk(s) of {chunk_size} tokens (n_ctx={args.n_ctx}, reserved {reserve} for gen)", flush=True)
         return examples
 
     # Structured .jsonl mode
@@ -91,9 +95,12 @@ def _load_examples(path: str, lib, vocab, args) -> list[list[int]]:
 
         tokens = _tokenize(lib, vocab,
                            args.prompt_prefix + prompt_text + args.prompt_suffix)
-        if len(tokens) > args.n_ctx - 4:
+        # Same headroom as flat .txt chunks (KV must not be full after prefill).
+        reserve = max(8, args.bootstrap_window + args.max_gen_tokens + args.adaptive_window + 8)
+        max_prompt = max(1, args.n_ctx - reserve)
+        if len(tokens) > max_prompt:
             # Truncate from the left (keep most recent context), leave room for generation
-            tokens = tokens[-(args.n_ctx - 4):]
+            tokens = tokens[-max_prompt:]
         if not tokens:
             skipped += 1
             continue
@@ -112,7 +119,8 @@ def _make_ctx(lib, model, args, split2_mode_init: int = 0):
     cparams.n_threads      = args.n_threads
     cparams.n_threads_batch = args.n_threads
     cparams.flash_attn_type = 1 if args.flash_attn else 0
-    cparams.split2_mode_init = int(split2_mode_init)
+    cparams.split2_mode_init   = int(split2_mode_init)
+    cparams.q4_k_res_mode_init = int(split2_mode_init)  # 0=verify (base+res), 1=draft (base only)
     ctx = lib.llama_init_from_model(model, cparams)
     if not ctx:
         raise RuntimeError("llama_init_from_model failed")
@@ -120,17 +128,26 @@ def _make_ctx(lib, model, args, split2_mode_init: int = 0):
 
 
 def _set_mode(lib, ctx, mode: int):
-    """Set split2 mode: 0=full verify, 1=nibble draft. No-op if API absent."""
-    if not hasattr(lib, "llama_set_split2_mode"):
-        return
-    lib.llama_set_split2_mode(ctx, mode)
-    if hasattr(lib, "llama_get_split2_mode"):
-        got = int(lib.llama_get_split2_mode(ctx))
-        if got != mode:
-            print(
-                f"WARNING: llama_get_split2_mode()={got} after llama_set_split2_mode({mode})",
-                file=sys.stderr,
-            )
+    """Set draft/verify mode: 0=full verify, 1=draft (base only).
+    Calls both split2 and q4_k_res APIs — whichever applies to the loaded model."""
+    if hasattr(lib, "llama_set_split2_mode"):
+        lib.llama_set_split2_mode(ctx, mode)
+        if hasattr(lib, "llama_get_split2_mode"):
+            got = int(lib.llama_get_split2_mode(ctx))
+            if got != mode:
+                print(
+                    f"WARNING: llama_get_split2_mode()={got} after llama_set_split2_mode({mode})",
+                    file=sys.stderr,
+                )
+    if hasattr(lib, "llama_set_q4_k_res_mode"):
+        lib.llama_set_q4_k_res_mode(ctx, mode)
+        if hasattr(lib, "llama_get_q4_k_res_mode"):
+            got = int(lib.llama_get_q4_k_res_mode(ctx))
+            if got != mode:
+                print(
+                    f"WARNING: llama_get_q4_k_res_mode()={got} after llama_set_q4_k_res_mode({mode})",
+                    file=sys.stderr,
+                )
 
 
 def _prefill(lib, ctx, n_vocab: int, prompt_tokens: list[int]) -> np.ndarray:
@@ -154,6 +171,15 @@ def _accept_prefix(v_logits_rows, draft_tokens, top_k, top_p) -> int:
                 v_logits_rows[i], draft_tokens[i + 1], top_k=top_k, top_p=top_p):
             return i
     return L
+
+
+def _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx, seq_id: int = 0) -> None:
+    """Copy sequence KV (and bundled seq state) from verifier into draft.
+
+    After verifier commits tokens, draft must not rebuild KV via the draft GEMV path;
+    the next draft window should continue from verifier-quality KV."""
+    blob = strategies.save_kv_state(lib, verifier_ctx, seq_id=seq_id)
+    strategies.restore_kv_state(lib, draft_ctx, blob, seq_id=seq_id)
 
 
 # ── mode: verify or draft (single context) ────────────────────────────────────
@@ -225,9 +251,9 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
         - draft_ctx generates adaptive_window tokens
         - verifier_ctx teacher-forces them, returns per-step logits
         - accept the longest prefix that passes adaptive_verify_accept
-        - commit accepted tokens to both contexts by replaying
+        - commit by replaying on verifier only, then copy KV verifier → draft
       Else:
-        - verifier-only greedy decode (one token at a time)
+        - verifier-only greedy decode (one token at a time); sync draft KV from verifier
     """
     verifier_ctx = _make_ctx(lib, model, args, split2_mode_init=0)
     draft_ctx    = _make_ctx(lib, model, args, split2_mode_init=1)
@@ -256,13 +282,24 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
     )
     t_boot = time.perf_counter() - t0
 
-    # Estimate agree-rate: teacher-force boot_tokens through draft
+    # Estimate agree-rate: teacher-force boot_tokens through draft via MMVQ path.
+    # Must use _single_decode (n_tokens=1) so the CUDA dispatch goes through MMVQ
+    # and respects split2_draft=True. verify_window is batched (cuBLAS) and always
+    # dequantizes full Q8_0 regardless of split2_draft, giving a misleading 100% rate.
     strategies.restore_kv_state(lib, draft_ctx, d_kv0)
-    d_preds = strategies.verify_window(
-        lib, draft_ctx, n_vocab, boot_tokens, pos_start=pos0, kv_hook=None,
-    )
     denom = max(0, len(boot_tokens) - 1)
-    agree = sum(int(d_preds[i]) == int(boot_tokens[i + 1]) for i in range(denom))
+    agree = 0
+    tok = boot_tokens[0]
+    for i in range(denom):
+        ret = strategies._single_decode(lib, draft_ctx, tok, pos0 + i)
+        if ret != 0:
+            break
+        ptr    = lib.llama_get_logits_ith(draft_ctx, 0)
+        logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
+        pred   = int(np.argmax(logits))
+        if pred == boot_tokens[i + 1]:
+            agree += 1
+        tok = boot_tokens[i + 1]  # teacher-force: feed correct token as next input
     agree_rate = agree / denom if denom > 0 else 0.0
 
     # Reset both to post-prefill KV for rollout
@@ -284,10 +321,11 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
             break
 
         if agree_rate < args.min_agree_rate:
-            # Verifier-only fallback: one greedy step
+            # Verifier-only fallback: one greedy step; draft mirrors verifier KV
             ret = strategies._single_decode(lib, verifier_ctx, token, pos)
             if ret != 0:
                 break
+            _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
             ptr    = lib.llama_get_logits_ith(verifier_ctx, 0)
             logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
             token  = int(np.argmax(logits))
@@ -320,30 +358,29 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
                                  top_k=args.verify_top_k, top_p=args.verify_top_p)
 
         if acc_len == 0:
-            # Full rejection: commit `token` at `pos` to both KVs (same as acceptance
-            # path replay), then take verifier's greedy choice as the next token.
+            # Full rejection: commit `token` at `pos` on verifier, then mirror KV to draft.
             # v_logits_rows[0] = logits after feeding draft_tokens[0] (==token) at pos,
             # so argmax gives the correct next token from the verifier's perspective.
             next_tok = int(np.argmax(v_logits_rows[0]))
             strategies.restore_kv_state(lib, verifier_ctx, v_blob)
             strategies.restore_kv_state(lib, draft_ctx,    d_blob)
             strategies._single_decode(lib, verifier_ctx, token, pos)
-            strategies._single_decode(lib, draft_ctx,    token, pos)
+            _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
             token = next_tok
             generated.append(token)
             pos += 1
             continue
 
-        # Commit accepted tokens into both contexts by replaying
+        # Commit accepted tokens on verifier, then copy KV to draft once (no draft-path replay).
         accepted = draft_tokens[1:1 + acc_len]
         strategies.restore_kv_state(lib, verifier_ctx, v_blob)
         strategies.restore_kv_state(lib, draft_ctx,    d_blob)
         for t_acc in accepted:
             strategies._single_decode(lib, verifier_ctx, token, pos)
-            strategies._single_decode(lib, draft_ctx,    token, pos)
             token = int(t_acc)
             generated.append(token)
             pos += 1
+        _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
         n_accept += acc_len
 
     t_rollout = time.perf_counter() - t_roll
@@ -376,8 +413,11 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Split2 adaptive-gen benchmark: draft / verify / switch modes.")
-    ap.add_argument("model",   help="Q8_0 GGUF (use LLAMA_Q8_0_SPLIT2=1 to load as split2).")
+        description="Adaptive-gen benchmark: draft / verify / switch modes. "
+                    "Supports split2 (Q8_0 GGUF + LLAMA_Q8_0_SPLIT2=1) and "
+                    "Q4_K_RES (q4k_res GGUF, no env var needed).")
+    ap.add_argument("model",   help="GGUF model path. For split2: Q8_0 GGUF + LLAMA_Q8_0_SPLIT2=1. "
+                                    "For Q4_K_RES: pass the _q4k_res.gguf directly.")
     ap.add_argument("dataset", help=".jsonl (structured: {'prompt':...}) or .txt (flat: chunked).")
     ap.add_argument("--mode", choices=["draft", "verify", "switch"], default="switch",
                     help="draft=nibble-only, verify=full Q8_0, switch=adaptive.")
@@ -423,25 +463,25 @@ def main():
         sys.exit("no examples loaded")
 
     if args.mode in ("draft", "verify", "switch"):
+        has_split2   = hasattr(lib, "llama_set_split2_mode")
+        has_q4k_res  = hasattr(lib, "llama_set_q4_k_res_mode")
         print(
-            "[split2] "
-            f"LLAMA_Q8_0_SPLIT2={os.environ.get('LLAMA_Q8_0_SPLIT2', '')!r}  "
-            f"LLAMA_Q8_0_SPLIT2_DEBUG_PRINT={os.environ.get('LLAMA_Q8_0_SPLIT2_DEBUG_PRINT', '')!r}  "
-            f"GGML_CUDA_SPLIT2_DEBUG={os.environ.get('GGML_CUDA_SPLIT2_DEBUG', '')!r}  "
+            "[adaptivegen] "
             f"n_gpu_layers={args.n_gpu_layers}  "
-            f"llama_set_split2_mode={'ok' if hasattr(lib, 'llama_set_split2_mode') else 'MISSING — rebuild libllama'}  "
-            f"llama_get_split2_mode={'ok' if hasattr(lib, 'llama_get_split2_mode') else 'missing'}",
+            f"split2={'ok' if has_split2 else 'missing'}  "
+            f"q4_k_res={'ok' if has_q4k_res else 'missing (rebuild libllama)'}  "
+            f"LLAMA_Q8_0_SPLIT2={os.environ.get('LLAMA_Q8_0_SPLIT2', '')!r}",
             file=sys.stderr,
         )
-        if str(os.environ.get("LLAMA_Q8_0_SPLIT2", "")).strip().lower() not in ("1", "true", "yes"):
+        if not has_split2 and not has_q4k_res:
             print(
-                "[split2] WARNING: this benchmark expects split2 layout; "
-                "set LLAMA_Q8_0_SPLIT2=1 when loading (plain Q8_0 GGUF ignores split2 mode).",
+                "[adaptivegen] WARNING: neither llama_set_split2_mode nor llama_set_q4_k_res_mode "
+                "found — draft/verify switching will be a no-op. Rebuild libllama.",
                 file=sys.stderr,
             )
         if args.n_gpu_layers <= 0:
             print(
-                "[split2] WARNING: n_gpu_layers=0 — split2 draft/verify CUDA paths only "
+                "[adaptivegen] WARNING: n_gpu_layers=0 — draft/verify CUDA MMVQ paths only "
                 "apply to GPU-offloaded weights; CPU will use generic paths.",
                 file=sys.stderr,
             )

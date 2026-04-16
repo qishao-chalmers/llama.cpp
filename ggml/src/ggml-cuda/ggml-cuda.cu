@@ -2206,6 +2206,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
 
+    if ((src0->type == GGML_TYPE_Q4_K_RES || src0->type == GGML_TYPE_Q4_K_RES_DRAFT)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        GGML_ASSERT(!bad_padding_clear && "GGML CUDA: Q4_K_RES + padded compute buffer view is unsupported; use dense weights");
+        // batch > MMVQ_MAX_BATCH_SIZE (prefill): falls through to the cuBLAS dequant path via
+        // ggml_cuda_op_mul_mat_cublas → get_to_fp16_cuda → dequantize_row_q4_k_res[_draft]_cuda.
+        // The cuBLAS path always uses verify dequant (base+res) regardless of q4_k_res_draft;
+        // draft mode only applies to the MMVQ decode path (batch=1).
+    }
+
     bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
@@ -2292,6 +2301,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (src0->type == GGML_TYPE_Q4_K_RES || src0->type == GGML_TYPE_Q4_K_RES_DRAFT) {
+        if (ne2 > MMVQ_MMID_MAX_BATCH_SIZE) {
+            GGML_ABORT("%s: Q4_K_RES mul_mat_id uses MMVQ only (ne2=%" PRId64 " > MMVQ_MMID_MAX_BATCH_SIZE=%d)",
+                __func__, (int64_t) ne2, MMVQ_MMID_MAX_BATCH_SIZE);
+        }
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
@@ -3007,6 +3023,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // If split2_draft changed since the graph was captured, force recapture.
     if (graph->split2_draft_captured != cuda_ctx->split2_draft) {
+        res = true;
+    }
+
+    // Same for Q4_K_RES draft vs verify (packed type 46).
+    if (graph->q4_k_res_draft_captured != cuda_ctx->q4_k_res_draft) {
         res = true;
     }
 
@@ -4021,6 +4042,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->split2_draft_captured = cuda_ctx->split2_draft; // record mode at capture time
+            graph->q4_k_res_draft_captured = cuda_ctx->q4_k_res_draft;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4763,6 +4785,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q4_K_RES_DRAFT:
+                    case GGML_TYPE_Q4_K_RES:
                     case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
                     case GGML_TYPE_Q8_K:
@@ -5190,6 +5214,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 // Forward declaration for split2 draft mode toggle (defined below).
 static void ggml_backend_cuda_set_split2_draft_impl(ggml_backend_t backend, bool enabled);
+static void ggml_backend_cuda_set_q4_k_res_draft_impl(ggml_backend_t backend, bool enabled);
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -5207,6 +5232,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_split2_draft") == 0) {
         return (void *)ggml_backend_cuda_set_split2_draft_impl;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_q4_k_res_draft") == 0) {
+        return (void *)ggml_backend_cuda_set_q4_k_res_draft_impl;
     }
     return nullptr;
 }
@@ -5299,6 +5327,18 @@ static void ggml_backend_cuda_set_split2_draft_impl(ggml_backend_t backend, bool
 // Public C export so Python ctypes can call it directly as well.
 extern "C" GGML_API void ggml_backend_cuda_set_split2_draft(ggml_backend_t backend, bool enabled) {
     ggml_backend_cuda_set_split2_draft_impl(backend, enabled);
+}
+
+static void ggml_backend_cuda_set_q4_k_res_draft_impl(ggml_backend_t backend, bool enabled) {
+    if (!backend || !backend->context) {
+        return;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->q4_k_res_draft = enabled;
+}
+
+extern "C" GGML_API void ggml_backend_cuda_set_q4_k_res_draft(ggml_backend_t backend, bool enabled) {
+    ggml_backend_cuda_set_q4_k_res_draft_impl(backend, enabled);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

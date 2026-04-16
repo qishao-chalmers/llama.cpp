@@ -1629,6 +1629,29 @@ void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void dequantize_row_q4_k_res_draft(const block_q4_k_res * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_q4_K(&x[i].base, y + (int64_t)i * QK_K, QK_K);
+    }
+}
+
+void dequantize_row_q4_k_res(const block_q4_k_res * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        float tmp[QK_K];
+        dequantize_row_q4_K(&x[i].base, y + (int64_t)i * QK_K, QK_K);
+        dequantize_row_q4_K(&x[i].res, tmp, QK_K);
+        for (int j = 0; j < QK_K; ++j) {
+            y[(int64_t)i * QK_K + j] += tmp[j];
+        }
+    }
+}
+
 static void quantize_row_q4_K_impl(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
     assert(n_per_row % QK_K == 0);
     const int64_t nb = n_per_row / QK_K;
@@ -5589,6 +5612,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_Q4_K_RES_DRAFT:
+        case GGML_TYPE_Q4_K_RES:
+            {
+                const block_q4_k_res * q = (const block_q4_k_res *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].base.d, i) || !validate_fp16(q[i].base.dmin, i)) {
+                        return false;
+                    }
+                    if (!validate_fp16(q[i].res.d, i) || !validate_fp16(q[i].res.dmin, i)) {
+                        return false;
+                    }
+                }
+            } break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);

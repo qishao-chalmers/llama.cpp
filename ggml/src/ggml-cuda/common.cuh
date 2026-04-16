@@ -988,6 +988,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_K> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_K_RES_DRAFT> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_K;
+    static constexpr int qi = QI4_K;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_K_RES> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_K;
+    static constexpr int qi = QI4_K;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q5_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR5_K;
@@ -1186,6 +1200,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     bool split2_draft_captured = false;  // value of split2_draft when this graph was last captured
+    bool q4_k_res_draft_captured = false;  // value of q4_k_res_draft when this graph was last captured (type Q4_K_RES)
     std::vector<ggml_cuda_graph_node_properties> props;
 
     // these are extra tensors (inputs) that participate in the ggml graph but are not nodes
@@ -1357,6 +1372,8 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
     bool split2_draft = false;
+    // When true, MMVQ uses base-only draft dot for GGML_TYPE_Q4_K_RES (packed verify layout).
+    bool q4_k_res_draft = false;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
@@ -1456,6 +1473,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
     bool split2_draft = false;
+    bool q4_k_res_draft = false;
     // When true (e.g. GGML_CUDA_SPLIT2_DEBUG=1 or LLAMA_Q8_0_SPLIT2_DEBUG_PRINT=1), first MMVQ split2 launch prints first block.
     bool split2_debug_print = false;
 };
@@ -1465,5 +1483,6 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
     bool split2_draft = false;
+    bool q4_k_res_draft = false;
     bool split2_debug_print = false;
 };

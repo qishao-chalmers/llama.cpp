@@ -257,6 +257,12 @@ llama_context::llama_context(
                 if (ggml_backend_cuda_set_split2_draft_fn) {
                     set_split2_draft_fns.emplace_back(backend.get(), ggml_backend_cuda_set_split2_draft_fn);
                 }
+
+                auto ggml_backend_cuda_set_q4_k_res_draft_fn =
+                    (ggml_backend_cuda_set_q4_k_res_draft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_q4_k_res_draft");
+                if (ggml_backend_cuda_set_q4_k_res_draft_fn) {
+                    set_q4_k_res_draft_fns.emplace_back(backend.get(), ggml_backend_cuda_set_q4_k_res_draft_fn);
+                }
             }
         }
 
@@ -352,6 +358,11 @@ llama_context::llama_context(
         // Apply requested mode here so the first CUDA MMVQ uses the same split2_draft as decode.
         if (params.split2_mode_init == 0 || params.split2_mode_init == 1) {
             set_split2_mode(params.split2_mode_init);
+        }
+
+        // Q4_K_RES: same idea — CUDA graph capture must see the intended draft flag.
+        if (params.q4_k_res_mode_init == 0 || params.q4_k_res_mode_init == 1) {
+            set_q4_k_res_mode(params.q4_k_res_mode_init);
         }
 
         sched_reserve();
@@ -984,6 +995,21 @@ void llama_context::set_split2_mode(int32_t mode) {
 
     const bool enabled = split2_mode == 1;
     for (const auto & fn : set_split2_draft_fns) {
+        fn.second(fn.first, enabled);
+    }
+}
+
+void llama_context::set_q4_k_res_mode(int32_t mode) {
+    if (mode != 0 && mode != 1) {
+        mode = 0;
+    }
+    if (q4_k_res_mode == mode) {
+        return;
+    }
+    q4_k_res_mode = mode;
+
+    const bool enabled = q4_k_res_mode == 1;
+    for (const auto & fn : set_q4_k_res_draft_fns) {
         fn.second(fn.first, enabled);
     }
 }
@@ -2874,6 +2900,7 @@ llama_context_params llama_context_default_params() {
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.split2_mode_init            =*/ 0,
+        /*.q4_k_res_mode_init          =*/ 0,
     };
 
     return result;
@@ -3006,6 +3033,14 @@ void llama_set_split2_mode(llama_context * ctx, int32_t mode) {
 
 int32_t llama_get_split2_mode(llama_context * ctx) {
     return ctx->get_split2_mode();
+}
+
+void llama_set_q4_k_res_mode(llama_context * ctx, int32_t mode) {
+    ctx->set_q4_k_res_mode(mode);
+}
+
+int32_t llama_get_q4_k_res_mode(llama_context * ctx) {
+    return ctx->get_q4_k_res_mode();
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

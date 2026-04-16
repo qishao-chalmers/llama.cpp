@@ -76,6 +76,7 @@ class LlamaContextParams(ctypes.Structure):
         ("samplers",             ctypes.c_void_p),
         ("n_samplers",           ctypes.c_size_t),
         ("split2_mode_init",     ctypes.c_int32),  # 0=verify 1=draft; must set before init for split2 MMVQ debug
+        ("q4_k_res_mode_init",   ctypes.c_int32),  # 0=verify 1=draft; Q4_K_RES CUDA MMVQ
     ]
 
 
@@ -191,6 +192,12 @@ def setup_lib(lib):
     if hasattr(lib, "llama_get_split2_mode"):
         lib.llama_get_split2_mode.restype  = ctypes.c_int32
         lib.llama_get_split2_mode.argtypes = [ContextPtr]
+    if hasattr(lib, "llama_set_q4_k_res_mode"):
+        lib.llama_set_q4_k_res_mode.restype  = None
+        lib.llama_set_q4_k_res_mode.argtypes = [ContextPtr, ctypes.c_int32]
+    if hasattr(lib, "llama_get_q4_k_res_mode"):
+        lib.llama_get_q4_k_res_mode.restype  = ctypes.c_int32
+        lib.llama_get_q4_k_res_mode.argtypes = [ContextPtr]
 
     # Batch / decode
     lib.llama_batch_init.restype  = LlamaBatch

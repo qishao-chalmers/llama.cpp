@@ -336,6 +336,13 @@ typedef struct {
 } block_q4_K;
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2, "wrong q4_K block size/padding");
 
+// Q4_K + Q4_K residual (experimental). Same total elements as one Q4_K block; residual is a second full Q4_K block.
+typedef struct {
+    block_q4_K base;
+    block_q4_K res;
+} block_q4_k_res;
+static_assert(sizeof(block_q4_k_res) == 2 * sizeof(block_q4_K), "wrong q4_k_res block size/padding");
+
 // 5-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b

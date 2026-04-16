@@ -738,6 +738,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_split2_62,
     },
+    [GGML_TYPE_Q4_K_RES_DRAFT] = {
+        .type_name                = "q4_K_res_draft",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_k_res),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_k_res_draft,
+    },
+    [GGML_TYPE_Q4_K_RES] = {
+        .type_name                = "q4_K_res",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_k_res),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_k_res,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
@@ -7710,6 +7724,9 @@ size_t ggml_quantize_chunk(
                 result = n * elemsize;
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
             } break;
+        case GGML_TYPE_Q4_K_RES_DRAFT:
+        case GGML_TYPE_Q4_K_RES:
+            GGML_ABORT("%s: Q4_K_RES types are packed offline (base + residual); use a custom quantizer\n", __func__);
         default:
             assert(false);
     }

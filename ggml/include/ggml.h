@@ -432,7 +432,9 @@ extern "C" {
         GGML_TYPE_Q8_0_SPLIT2       = 42, // Q8_0 single-buffer split (A+B), full-precision view
         GGML_TYPE_Q8_0_SPLIT2_62_DRAFT = 43, // Q8_0 split A=6 MSBs, B=2 LSBs (draft: A only)
         GGML_TYPE_Q8_0_SPLIT2_62       = 44, // Q8_0 split 6+2 full int8 reconstruction
-        GGML_TYPE_COUNT    = 45,
+        GGML_TYPE_Q4_K_RES_DRAFT       = 45, // two Q4_K blocks: base + residual (draft: base only)
+        GGML_TYPE_Q4_K_RES             = 46, // two Q4_K blocks: base + residual (verify: base + dequant(res))
+        GGML_TYPE_COUNT    = 47,
     };
 
     // precision

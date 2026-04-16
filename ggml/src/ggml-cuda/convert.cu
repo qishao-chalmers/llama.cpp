@@ -232,6 +232,78 @@ static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_q4_k_res_draft(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q4_k_res * br = (const block_q4_k_res *) vx;
+
+    const int64_t bi = blockIdx.x;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid/8;
+    const int64_t ir  = tid%8;
+    const int64_t is  = 2*il;
+    const int64_t n   = 4;
+
+    const block_q4_K * xi = &br[bi].base;
+
+    dst_t * y = yy + bi*QK_K + 64*il + n*ir;
+
+    const float dall = __low2half(xi->dm);
+    const float dmin = __high2half(xi->dm);
+
+    const uint8_t * q = xi->qs + 32*il + n*ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, xi->scales, sc, m);
+    const float d1 = dall * sc; const float m1 = dmin * m;
+    get_scale_min_k4(is + 1, xi->scales, sc, m);
+    const float d2 = dall * sc; const float m2 = dmin * m;
+    for (int l = 0; l < n; ++l) {
+        y[l + 0] = d1 * (q[l] & 0xF) - m1;
+        y[l +32] = d2 * (q[l] >>  4) - m2;
+    }
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q4_k_res_add(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q4_k_res * br = (const block_q4_k_res *) vx;
+
+    const int64_t bi = blockIdx.x;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid/8;
+    const int64_t ir  = tid%8;
+    const int64_t is  = 2*il;
+    const int64_t n   = 4;
+
+    dst_t * y = yy + bi*QK_K + 64*il + n*ir;
+
+    const block_q4_K * pb = &br[bi].base;
+    const block_q4_K * pr = &br[bi].res;
+
+    const float dall_b = __low2half(pb->dm);
+    const float dmin_b = __high2half(pb->dm);
+    const float dall_r = __low2half(pr->dm);
+    const float dmin_r = __high2half(pr->dm);
+
+    const uint8_t * qb = pb->qs + 32*il + n*ir;
+    const uint8_t * qr = pr->qs + 32*il + n*ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, pb->scales, sc, m);
+    const float d1b = dall_b * sc; const float m1b = dmin_b * m;
+    get_scale_min_k4(is + 1, pb->scales, sc, m);
+    const float d2b = dall_b * sc; const float m2b = dmin_b * m;
+    get_scale_min_k4(is + 0, pr->scales, sc, m);
+    const float d1r = dall_r * sc; const float m1r = dmin_r * m;
+    get_scale_min_k4(is + 1, pr->scales, sc, m);
+    const float d2r = dall_r * sc; const float m2r = dmin_r * m;
+    for (int l = 0; l < n; ++l) {
+        y[l + 0] = d1b * (qb[l] & 0xF) - m1b + (d1r * (qr[l] & 0xF) - m1r);
+        y[l +32] = d2b * (qb[l] >>  4) - m2b + (d2r * (qr[l] >>  4) - m2r);
+    }
+}
+
+template<typename dst_t>
 static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const block_q5_K * x = (const block_q5_K *) vx;
 
@@ -546,6 +618,18 @@ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k
 }
 
 template<typename dst_t>
+static void dequantize_row_q4_k_res_draft_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_q4_k_res_draft<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_q4_k_res_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_q4_k_res_add<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -699,6 +783,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_Q4_K_RES_DRAFT:
+            return dequantize_row_q4_k_res_draft_cuda;
+        case GGML_TYPE_Q4_K_RES:
+            return dequantize_row_q4_k_res_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
@@ -758,6 +846,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_Q4_K_RES_DRAFT:
+            return dequantize_row_q4_k_res_draft_cuda;
+        case GGML_TYPE_Q4_K_RES:
+            return dequantize_row_q4_k_res_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
