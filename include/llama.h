@@ -377,6 +377,11 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // [EXPERIMENTAL] Q8_0_SPLIT2 CUDA: 0 = full verify, 1 = draft (nibble) path.
+        // Applied before the first sched_reserve() so buffer reservation matches llama_decode.
+        // llama_set_split2_mode() can still change mode later (e.g. switch contexts).
+        int32_t                           split2_mode_init;
     };
 
     // model quantization parameters
@@ -479,6 +484,12 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    // Debug: zero rb (lower-nibble region) in Q8_0_SPLIT2 / SPLIT2_DRAFT weight tensors on host.
+    // enable=true walks tensors and zeros rb; enable=false is a no-op (reload model to restore weights).
+    // At load time, set env LLAMA_Q8_0_SPLIT2_DEBUG_ZERO_RB=1 to zero rb before upload.
+    // CUDA MMVQ: set LLAMA_Q8_0_SPLIT2_DEBUG_PRINT=1 (or GGML_CUDA_SPLIT2_DEBUG=1) to print first split2 block once.
+    LLAMA_API void llama_model_split2_debug_zero_rb(struct llama_model * model, bool enable);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
@@ -987,6 +998,12 @@ extern "C" {
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+
+    // Experimental: set split2 draft mode for Q8_0 split2 weights on CUDA backends.
+    // mode = 0 (verify / full), mode = 1 (draft / upper-nibble only).
+    // For mode during the first graph reserve, set llama_context_params.split2_mode_init (see struct).
+    LLAMA_API void llama_set_split2_mode(struct llama_context * ctx, int32_t mode);
+    LLAMA_API int32_t llama_get_split2_mode(struct llama_context * ctx);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

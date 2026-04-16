@@ -9,10 +9,12 @@
 #define QK8_0_SPLIT2 32
 #define QI8_0_SPLIT2 4   // ra/rb are 16B each -> 4 int32
 
-// Draft consumes one int32 from ra per vec_dot call.
+// Both draft and verify consume one int32 from ra per vec_dot call.
+// Draft: reads ra[iqs] only.
+// Verify: reads ra[iqs] + rb[iqs] and reconstructs full int8.
+// In both cases iqs ∈ {0,1,2,3} (4 int32s × 8 elements = 32 elements/block).
 #define VDR_Q8_0_SPLIT2_DRAFT_Q8_1_MMVQ 1
-// Verify reconstructs full int8 and consumes two int32 packs (like Q8_0).
-#define VDR_Q8_0_SPLIT2_Q8_1_MMVQ 2
+#define VDR_Q8_0_SPLIT2_Q8_1_MMVQ       1
 
 static_assert(sizeof(block_q8_0_split2) == 2*sizeof(ggml_half) + QK8_0_SPLIT2, "block_q8_0_split2 size mismatch");
 

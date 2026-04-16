@@ -99,6 +99,9 @@ struct llama_context {
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
+    void set_split2_mode(int32_t mode);
+    int32_t get_split2_mode() const { return split2_mode; }
+
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
@@ -326,6 +329,10 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+
+    using ggml_backend_cuda_set_split2_draft_t = void (*)(ggml_backend_t backend, bool enabled);
+    std::vector<std::pair<ggml_backend_t, ggml_backend_cuda_set_split2_draft_t>> set_split2_draft_fns;
+    int32_t split2_mode = 0; // 0=verify, 1=draft
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

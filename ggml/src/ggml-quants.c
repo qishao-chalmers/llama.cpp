@@ -532,6 +532,18 @@ size_t transform_q8_0_to_split2(
     return (size_t) n_blocks * sizeof(block_q8_0_split2);
 }
 
+void ggml_split2_debug_zero_rb(void * data, size_t nbytes) {
+    const size_t block_sz = sizeof(block_q8_0_split2);
+    if (data == NULL || nbytes == 0 || nbytes % block_sz != 0) {
+        return;
+    }
+    block_q8_0_split2 * p = (block_q8_0_split2 *) data;
+    const size_t n_blocks = nbytes / block_sz;
+    for (size_t i = 0; i < n_blocks; ++i) {
+        memset(p[i].rb, 0, sizeof(p[i].rb));
+    }
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 

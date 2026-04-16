@@ -3005,6 +3005,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // If split2_draft changed since the graph was captured, force recapture.
+    if (graph->split2_draft_captured != cuda_ctx->split2_draft) {
+        res = true;
+    }
+
     // Check if the graph size has changed
     if (graph->props.size() != (size_t)cgraph->n_nodes) {
         res = true;
@@ -4015,6 +4020,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->split2_draft_captured = cuda_ctx->split2_draft; // record mode at capture time
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4748,6 +4754,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q8_0_NIB:
+                    case GGML_TYPE_Q8_0_SPLIT2_DRAFT:
+                    case GGML_TYPE_Q8_0_SPLIT2:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
@@ -5177,6 +5186,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Forward declaration for split2 draft mode toggle (defined below).
+static void ggml_backend_cuda_set_split2_draft_impl(ggml_backend_t backend, bool enabled);
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
@@ -5190,6 +5202,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_split2_draft") == 0) {
+        return (void *)ggml_backend_cuda_set_split2_draft_impl;
     }
     return nullptr;
 }
@@ -5268,6 +5283,20 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     };
 
     return cuda_backend;
+}
+
+// Internal implementation, registered via ggml_backend_cuda_reg_get_proc_address().
+static void ggml_backend_cuda_set_split2_draft_impl(ggml_backend_t backend, bool enabled) {
+    if (!backend || !backend->context) {
+        return;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->split2_draft = enabled;
+}
+
+// Public C export so Python ctypes can call it directly as well.
+extern "C" GGML_API void ggml_backend_cuda_set_split2_draft(ggml_backend_t backend, bool enabled) {
+    ggml_backend_cuda_set_split2_draft_impl(backend, enabled);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

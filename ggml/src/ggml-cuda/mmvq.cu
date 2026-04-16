@@ -6,8 +6,88 @@
 #include "mmvq_split2.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+// Debug: MMVQ split2 block0 diagnostics when GGML_CUDA_SPLIT2_DEBUG or LLAMA_Q8_0_SPLIT2_DEBUG_PRINT is set.
+// Two separate one-shots: draft vs verify kernels. Context init runs sched_reserve() before llama_set_split2_mode,
+// so the first verify one-shot often fires during buffer reservation; the first draft one-shot fires on real decode.
+// Draft: 32 unsigned nibbles from ra, then 32 floats after draft dequant ("after").
+// Verify: 32 nibbles from ra, 32 from rb, then 32 recovered floats (d_full).
+static __device__ int g_split2_mmvq_debug_print_draft  = 0;
+static __device__ int g_split2_mmvq_debug_print_verify = 0;
+
+static bool split2_mmvq_debug_print_enabled_from_env(void) {
+    static const char * const k_names[] = {
+        "GGML_CUDA_SPLIT2_DEBUG",
+        "LLAMA_Q8_0_SPLIT2_DEBUG_PRINT",
+    };
+    for (const char * name : k_names) {
+        const char * e = getenv(name);
+        if (e && e[0] != '\0' && e[0] != '0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static __device__ void split2_debug_print_first_block_mmvq(const block_q8_0_split2 * b, const bool split2_draft) {
+    int ra_nib[32];
+    int rb_nib[32];
+    for (int j = 0; j < 16; ++j) {
+        const uint8_t a  = b->ra[j];
+        const uint8_t br = b->rb[j];
+        ra_nib[2*j + 0] = (int)((a  >> 4) & 0x0F);
+        ra_nib[2*j + 1] = (int)(a  & 0x0F);
+        rb_nib[2*j + 0] = (int)((br >> 4) & 0x0F);
+        rb_nib[2*j + 1] = (int)(br & 0x0F);
+    }
+
+    if (split2_draft) {
+        printf("[split2 MMVQ debug] DRAFT before (32 unsigned nibbles 0..15 from ra bytes):");
+        for (int i = 0; i < 32; ++i) {
+            printf(" %d", ra_nib[i]);
+        }
+        const float dd = __half2float(b->d_draft);
+        printf("\n[split2 MMVQ debug] DRAFT after (float = sign_ext4(nibble)*d_draft, d_draft=%.6g):", dd);
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t packed = b->ra[j];
+            const int n0u = packed >> 4;
+            const int n1u = packed & 0x0F;
+            const int n0 = (n0u ^ 8) - 8;
+            const int n1 = (n1u ^ 8) - 8;
+            printf(" %.6g %.6g", (float) n0 * dd, (float) n1 * dd);
+        }
+        printf("\n");
+    } else {
+        const float df = __half2float(b->d_full);
+        printf("[split2 MMVQ debug] VERIFY region A ra (32 nibbles 0..15):");
+        for (int i = 0; i < 32; ++i) {
+            printf(" %d", ra_nib[i]);
+        }
+        printf("\n[split2 MMVQ debug] VERIFY region B rb (32 nibbles 0..15):");
+        for (int i = 0; i < 32; ++i) {
+            printf(" %d", rb_nib[i]);
+        }
+        printf("\n[split2 MMVQ debug] VERIFY recovered (int8 from ra|rb, * d_full, d_full=%.6g):", df);
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t a = b->ra[j];
+            const uint8_t br = b->rb[j];
+            const int hi0 = (int)(a >> 4);
+            const int lo0 = (int)(br >> 4);
+            const int hi1 = (int)(a & 0x0F);
+            const int lo1 = (int)(br & 0x0F);
+            const int q0 = (hi0 << 4) | lo0;
+            const int q1 = (hi1 << 4) | lo1;
+            printf(" %.6g %.6g",
+                   (float)((int8_t) q0) * df,
+                   (float)((int8_t) q1) * df);
+        }
+        printf("\n");
+    }
+}
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
@@ -168,7 +248,17 @@ static __global__ void mul_mat_vec_q(
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    int vdr_local = vdr;
+    vec_dot_q_cuda_t vec_dot_local = vec_dot_q_cuda;
+    if constexpr (type == GGML_TYPE_Q8_0_SPLIT2) {
+        if (fusion.split2_draft) {
+            vdr_local = VDR_Q8_0_SPLIT2_DRAFT_Q8_1_MMVQ;
+            vec_dot_local = vec_dot_q8_0_split2_draft_q8_1;
+        }
+    }
+
+    const int blocks_per_iter = vdr_local * nwarps*warp_size / qi;
 
     const uint32_t channel_dst = blockIdx.y;
 
@@ -249,21 +339,39 @@ static __global__ void mul_mat_vec_q(
     }
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    if constexpr (type == GGML_TYPE_Q8_0_SPLIT2 || type == GGML_TYPE_Q8_0_SPLIT2_DRAFT) {
+        if (fusion.split2_debug_print) {
+            const bool dbg_draft = (type == GGML_TYPE_Q8_0_SPLIT2_DRAFT) ? true : fusion.split2_draft;
+            const int tid_dbg = warp_size*threadIdx.y + threadIdx.x;
+            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tid_dbg == 0) {
+                if (dbg_draft) {
+                    if (atomicAdd(&g_split2_mmvq_debug_print_draft, 1) == 0) {
+                        split2_debug_print_first_block_mmvq((const block_q8_0_split2 *) vx, true);
+                    }
+                } else {
+                    if (atomicAdd(&g_split2_mmvq_debug_print_verify, 1) == 0) {
+                        split2_debug_print_first_block_mmvq((const block_q8_0_split2 *) vx, false);
+                    }
+                }
+            }
+        }
+    }
+
+    for (int kbx = tid / (qi/vdr_local); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+        const int kqs = vdr_local * (tid % (qi/vdr_local));
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
+                tmp[j][i] += vec_dot_local(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
+                        tmp_gate[j][i] += vec_dot_local(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
@@ -547,6 +655,24 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_Q8_0_NIB:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_NIB>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q8_0_SPLIT2_DRAFT:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_SPLIT2_DRAFT>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q8_0_SPLIT2:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_SPLIT2>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         case GGML_TYPE_MXFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -670,6 +796,7 @@ void ggml_cuda_mul_mat_vec_q(
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    fusion_local.split2_draft = ctx.split2_draft;
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
@@ -692,6 +819,13 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        // split2_draft comes only from ctx (llama_set_split2_mode → ggml_backend_cuda_set_split2_draft).
+        // ggml_cuda_mm_fusion_args_host::split2_draft is never set by fusion setup and defaults to false;
+        // overwriting ctx here forced VERIFY kernels on fused MMVQ even in draft mode.
+        fusion_local.split2_debug_print = fusion->split2_debug_print;
+    }
+    if (split2_mmvq_debug_print_enabled_from_env()) {
+        fusion_local.split2_debug_print = true;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
@@ -767,6 +901,10 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int stride_col_y = src1_padded_row_size / QK8_1;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    fusion_local.split2_draft = ctx.split2_draft;
+    if (split2_mmvq_debug_print_enabled_from_env()) {
+        fusion_local.split2_debug_print = true;
+    }
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);

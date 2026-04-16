@@ -251,6 +251,12 @@ llama_context::llama_context(
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
+
+                auto ggml_backend_cuda_set_split2_draft_fn =
+                    (ggml_backend_cuda_set_split2_draft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_split2_draft");
+                if (ggml_backend_cuda_set_split2_draft_fn) {
+                    set_split2_draft_fns.emplace_back(backend.get(), ggml_backend_cuda_set_split2_draft_fn);
+                }
             }
         }
 
@@ -340,6 +346,12 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        // Q8_0_SPLIT2: sched_reserve() runs a worst-case graph before Python can call llama_set_split2_mode().
+        // Apply requested mode here so the first CUDA MMVQ uses the same split2_draft as decode.
+        if (params.split2_mode_init == 0 || params.split2_mode_init == 1) {
+            set_split2_mode(params.split2_mode_init);
         }
 
         sched_reserve();
@@ -959,6 +971,21 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
 
     cparams.n_threads       = n_threads;
     cparams.n_threads_batch = n_threads_batch;
+}
+
+void llama_context::set_split2_mode(int32_t mode) {
+    if (mode != 0 && mode != 1) {
+        mode = 0;
+    }
+    if (split2_mode == mode) {
+        return;
+    }
+    split2_mode = mode;
+
+    const bool enabled = split2_mode == 1;
+    for (const auto & fn : set_split2_draft_fns) {
+        fn.second(fn.first, enabled);
+    }
 }
 
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
@@ -2844,8 +2871,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.samplers                    =*/ nullptr,
+        /*.n_samplers                  =*/ 0,
+        /*.split2_mode_init            =*/ 0,
     };
 
     return result;
@@ -2970,6 +2998,14 @@ void llama_detach_threadpool(llama_context * ctx) {
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
+}
+
+void llama_set_split2_mode(llama_context * ctx, int32_t mode) {
+    ctx->set_split2_mode(mode);
+}
+
+int32_t llama_get_split2_mode(llama_context * ctx) {
+    return ctx->get_split2_mode();
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

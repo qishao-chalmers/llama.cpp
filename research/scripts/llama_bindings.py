@@ -75,6 +75,7 @@ class LlamaContextParams(ctypes.Structure):
         ("kv_unified",           ctypes.c_bool),
         ("samplers",             ctypes.c_void_p),
         ("n_samplers",           ctypes.c_size_t),
+        ("split2_mode_init",     ctypes.c_int32),  # 0=verify 1=draft; must set before init for split2 MMVQ debug
     ]
 
 
@@ -182,6 +183,14 @@ def setup_lib(lib):
     lib.llama_init_from_model.argtypes = [ModelPtr, LlamaContextParams]
     lib.llama_free.restype  = None
     lib.llama_free.argtypes = [ContextPtr]
+
+    # Experimental split2 mode switch (0=verify, 1=draft)
+    if hasattr(lib, "llama_set_split2_mode"):
+        lib.llama_set_split2_mode.restype  = None
+        lib.llama_set_split2_mode.argtypes = [ContextPtr, ctypes.c_int32]
+    if hasattr(lib, "llama_get_split2_mode"):
+        lib.llama_get_split2_mode.restype  = ctypes.c_int32
+        lib.llama_get_split2_mode.argtypes = [ContextPtr]
 
     # Batch / decode
     lib.llama_batch_init.restype  = LlamaBatch

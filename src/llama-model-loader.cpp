@@ -13,6 +13,12 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <cstdlib>
+
+static bool llama_split2_debug_zero_rb_enabled(void) {
+    const char * e = getenv("LLAMA_Q8_0_SPLIT2_DEBUG_ZERO_RB");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1534,6 +1540,9 @@ bool llama_model_loader::load_all_data(
                 std::vector<uint8_t> tmp_dst(n_size);
                 const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
                 transform_q8_0_to_split2((const block_q8_0 *) data, (block_q8_0_split2 *) tmp_dst.data(), n_blocks);
+                if (llama_split2_debug_zero_rb_enabled()) {
+                    ggml_split2_debug_zero_rb(tmp_dst.data(), n_size);
+                }
                 ggml_backend_tensor_set(cur, tmp_dst.data(), 0, n_size);
             } else {
                 GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
@@ -1561,6 +1570,9 @@ bool llama_model_loader::load_all_data(
                     file->read_raw(tmp_src.data(), n_size_src);
                     const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
                     transform_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), (block_q8_0_split2 *) cur->data, n_blocks);
+                    if (llama_split2_debug_zero_rb_enabled()) {
+                        ggml_split2_debug_zero_rb(cur->data, n_size);
+                    }
                 } else {
                     file->read_raw(cur->data, n_size_src);
                 }
@@ -1634,6 +1646,9 @@ bool llama_model_loader::load_all_data(
                         file->read_raw(tmp_src.data(), n_size_src);
                         const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
                         transform_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), (block_q8_0_split2 *) tmp_dst.data(), n_blocks);
+                        if (llama_split2_debug_zero_rb_enabled()) {
+                            ggml_split2_debug_zero_rb(tmp_dst.data(), n_size);
+                        }
                         ggml_backend_tensor_set(cur, tmp_dst.data(), 0, n_size);
                         if (check_tensors && !ggml_validate_row_data(GGML_TYPE_Q8_0, tmp_src.data(), n_size_src)) {
                             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));

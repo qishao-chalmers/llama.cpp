@@ -62,6 +62,9 @@ GGML_API size_t transform_q8_0_to_split2(
     block_q8_0_split2     * dst,
     int                    n_blocks);
 
+// Debug: zero rb[] (lower-nibble region B) in each split2 block. Draft path ignores rb; verify uses it.
+GGML_API void ggml_split2_debug_zero_rb(void * data, size_t nbytes);
+
 GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

@@ -75,3 +75,42 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+// block_q8_0_split2: full dequant (reconstruct int8 from upper/lower nibbles, scale by d_full)
+static __device__ __forceinline__ void dequantize_q8_0_split2(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q8_0_split2 * x = (const block_q8_0_split2 *) vx;
+
+    const float d = x[ib].d_full;
+    const int j = iqs / 2;
+
+    const uint8_t a = x[ib].ra[j];
+    const uint8_t b = x[ib].rb[j];
+
+    const int hi0 = (int) (a >> 4);
+    const int lo0 = (int) (b >> 4);
+    const int hi1 = (int) (a & 0x0F);
+    const int lo1 = (int) (b & 0x0F);
+
+    const int q0 = (hi0 << 4) | lo0;
+    const int q1 = (hi1 << 4) | lo1;
+
+    v.x = (float) ((int8_t) q0) * d;
+    v.y = (float) ((int8_t) q1) * d;
+}
+
+// block_q8_0_split2: draft path (upper nibbles only, d_draft scale)
+static __device__ __forceinline__ void dequantize_q8_0_split2_draft(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q8_0_split2 * x = (const block_q8_0_split2 *) vx;
+
+    const float d = x[ib].d_draft;
+    const int j = iqs / 2;
+
+    const uint8_t packed = x[ib].ra[j];
+    const int n0u = packed >> 4;
+    const int n1u = packed & 0x0F;
+    const int n0 = (n0u ^ 8) - 8;
+    const int n1 = (n1u ^ 8) - 8;
+
+    v.x = (float) n0 * d;
+    v.y = (float) n1 * d;
+}

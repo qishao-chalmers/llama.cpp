@@ -14,6 +14,9 @@
 
 #include "ggml-cpp.h"
 
+#include "ggml-backend.h"
+#include "../ggml/src/ggml-quants.h"
+
 #include "models/models.h"
 
 #include <algorithm>
@@ -27,6 +30,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -7639,6 +7643,26 @@ uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
 
+void llama_model::split2_debug_zero_rb(const bool enable) {
+    if (!enable) {
+        return;
+    }
+    for (const auto & kv : tensors_by_name) {
+        struct ggml_tensor * t = kv.second;
+        if (t == nullptr) {
+            continue;
+        }
+        if (t->type != GGML_TYPE_Q8_0_SPLIT2 && t->type != GGML_TYPE_Q8_0_SPLIT2_DRAFT) {
+            continue;
+        }
+        const size_t nbytes = ggml_nbytes(t);
+        std::vector<uint8_t> buf(nbytes);
+        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+        ggml_split2_debug_zero_rb(buf.data(), nbytes);
+        ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+    }
+}
+
 void llama_model::print_info() const {
     const std::string rope_scaling_type = llama_rope_scaling_type_name(hparams.rope_scaling_type_train);
 
@@ -8640,6 +8664,13 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
     delete model;
+}
+
+void llama_model_split2_debug_zero_rb(struct llama_model * model, bool enable) {
+    if (!model) {
+        return;
+    }
+    model->split2_debug_zero_rb(enable);
 }
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {

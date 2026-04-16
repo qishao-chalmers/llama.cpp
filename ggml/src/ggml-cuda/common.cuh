@@ -925,17 +925,24 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_NIB> {
+    static constexpr int qk = QK8_0;
+    static constexpr int qr = QR8_0;
+    static constexpr int qi = 4; // ra is 16 bytes = 4 int32s; iqs ∈ {0,1,2,3}
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_SPLIT2_DRAFT> {
     static constexpr int qk = QK8_0;
     static constexpr int qr = QR8_0;
-    static constexpr int qi = QI8_0;
+    static constexpr int qi = 4; // ra is 16 bytes = 4 int32s; iqs ∈ {0,1,2,3}
 };
 
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_SPLIT2> {
     static constexpr int qk = QK8_0;
     static constexpr int qr = QR8_0;
-    static constexpr int qi = QI8_0;
+    static constexpr int qi = 4; // ra/rb are 16 bytes each = 4 int32s; iqs ∈ {0,1,2,3}
 };
 
 template<>
@@ -1164,6 +1171,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    bool split2_draft_captured = false;  // value of split2_draft when this graph was last captured
     std::vector<ggml_cuda_graph_node_properties> props;
 
     // these are extra tensors (inputs) that participate in the ggml graph but are not nodes
@@ -1334,6 +1342,7 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    bool split2_draft = false;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
@@ -1432,10 +1441,15 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    bool split2_draft = false;
+    // When true (e.g. GGML_CUDA_SPLIT2_DEBUG=1 or LLAMA_Q8_0_SPLIT2_DEBUG_PRINT=1), first MMVQ split2 launch prints first block.
+    bool split2_debug_print = false;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    bool split2_draft = false;
+    bool split2_debug_print = false;
 };

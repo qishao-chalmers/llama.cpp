@@ -540,6 +540,10 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // Experimental: if enable, zero rb[] in every Q8_0_SPLIT2 / SPLIT2_DRAFT tensor (debug; draft ignores rb).
+    // If enable is false, no-op (reload model to restore weights).
+    void split2_debug_zero_rb(bool enable);
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 
