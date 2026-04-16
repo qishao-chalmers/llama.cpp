@@ -245,6 +245,15 @@ typedef struct {
 } block_q8_0_split2;
 static_assert(sizeof(block_q8_0_split2) == 2*sizeof(ggml_half) + QK8_0, "wrong q8_0_split2 block size/padding");
 
+// Q8_0 split2 (6+2 bits): A = top 6 bits of each int8, B = bottom 2 bits. Same total bytes as block_q8_0_split2.
+typedef struct {
+    ggml_half d_full;
+    ggml_half d_draft;          // draft scale (d_full * 4) — 6-bit coarse vs 8-bit full
+    uint8_t   ra[(QK8_0 * 6 + 7) / 8]; // 32*6 bits = 24 bytes
+    uint8_t   rb[(QK8_0 * 2 + 7) / 8]; // 32*2 bits = 8 bytes
+} block_q8_0_split2_62;
+static_assert(sizeof(block_q8_0_split2_62) == sizeof(block_q8_0_split2), "q8_0_split2 vs split2_62 block size mismatch");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {

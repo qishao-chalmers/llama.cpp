@@ -114,3 +114,62 @@ static __device__ __forceinline__ void dequantize_q8_0_split2_draft(const void *
     v.x = (float) n0 * d;
     v.y = (float) n1 * d;
 }
+
+// block_q8_0_split2_62: bit layout matches ggml-quants.c (LSB-first 6-bit stream for ra; 2 bits/weight in rb).
+static __device__ __forceinline__ uint8_t q8_0_split2_62_get_hi6(const uint8_t * ra, int idx) {
+    uint64_t bit = (uint64_t) idx * 6;
+    uint32_t v = 0;
+#pragma unroll
+    for (int b = 0; b < 6; ++b) {
+        if (ra[bit / 8] & (1u << (bit % 8))) {
+            v |= (1u << b);
+        }
+        bit++;
+    }
+    return (uint8_t)(v & 0x3F);
+}
+
+static __device__ __forceinline__ uint8_t q8_0_split2_62_get_lo2(const uint8_t * rb, int idx) {
+    return (rb[idx / 4] >> ((idx % 4) * 2)) & 3;
+}
+
+static __device__ __forceinline__ int q8_0_sign_ext6_dev(uint32_t h) {
+    h &= 0x3F;
+    if (h & 0x20) {
+        return (int) h - 64;
+    }
+    return (int) h;
+}
+
+static __device__ __forceinline__ void dequantize_q8_0_split2_62(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q8_0_split2_62 * x = (const block_q8_0_split2_62 *) vx;
+
+    const float d = x[ib].d_full;
+    const int i0 = iqs;
+    const int i1 = iqs + 1;
+
+    const uint8_t h0 = q8_0_split2_62_get_hi6(x[ib].ra, i0);
+    const uint8_t h1 = q8_0_split2_62_get_hi6(x[ib].ra, i1);
+    const uint8_t lo0 = q8_0_split2_62_get_lo2(x[ib].rb, i0);
+    const uint8_t lo1 = q8_0_split2_62_get_lo2(x[ib].rb, i1);
+
+    const int q0 = (int) (((h0 & 0x3F) << 2) | (lo0 & 3));
+    const int q1 = (int) (((h1 & 0x3F) << 2) | (lo1 & 3));
+
+    v.x = (float) ((int8_t) (uint8_t) q0) * d;
+    v.y = (float) ((int8_t) (uint8_t) q1) * d;
+}
+
+static __device__ __forceinline__ void dequantize_q8_0_split2_62_draft(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q8_0_split2_62 * x = (const block_q8_0_split2_62 *) vx;
+
+    const float d = x[ib].d_draft;
+    const int i0 = iqs;
+    const int i1 = iqs + 1;
+
+    const uint8_t h0 = q8_0_split2_62_get_hi6(x[ib].ra, i0);
+    const uint8_t h1 = q8_0_split2_62_get_hi6(x[ib].ra, i1);
+
+    v.x = (float) q8_0_sign_ext6_dev(h0) * d;
+    v.y = (float) q8_0_sign_ext6_dev(h1) * d;
+}

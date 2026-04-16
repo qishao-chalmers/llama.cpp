@@ -946,6 +946,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_SPLIT2> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_SPLIT2_62_DRAFT> {
+    static constexpr int qk = QK8_0;
+    static constexpr int qr = QR8_0;
+    static constexpr int qi = 4; // 8 weights / group × 4 groups; iqs ∈ {0,1,2,3}
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_SPLIT2_62> {
+    static constexpr int qk = QK8_0;
+    static constexpr int qr = QR8_0;
+    static constexpr int qi = 4;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;

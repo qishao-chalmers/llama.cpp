@@ -1120,6 +1120,8 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q8_0_NIB:
         case GGML_TYPE_Q8_0_SPLIT2_DRAFT:
         case GGML_TYPE_Q8_0_SPLIT2:
+        case GGML_TYPE_Q8_0_SPLIT2_62_DRAFT:
+        case GGML_TYPE_Q8_0_SPLIT2_62:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q2_K:
@@ -1251,6 +1253,8 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q8_0_NIB:
         case GGML_TYPE_Q8_0_SPLIT2_DRAFT:
         case GGML_TYPE_Q8_0_SPLIT2:
+        case GGML_TYPE_Q8_0_SPLIT2_62_DRAFT:
+        case GGML_TYPE_Q8_0_SPLIT2_62:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q2_K:
@@ -5562,6 +5566,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_0_NIB:
         case GGML_TYPE_Q8_0_SPLIT2_DRAFT:
         case GGML_TYPE_Q8_0_SPLIT2:
+        case GGML_TYPE_Q8_0_SPLIT2_62_DRAFT:
+        case GGML_TYPE_Q8_0_SPLIT2_62:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q2_K:

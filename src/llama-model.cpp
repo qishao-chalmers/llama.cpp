@@ -7652,13 +7652,18 @@ void llama_model::split2_debug_zero_rb(const bool enable) {
         if (t == nullptr) {
             continue;
         }
-        if (t->type != GGML_TYPE_Q8_0_SPLIT2 && t->type != GGML_TYPE_Q8_0_SPLIT2_DRAFT) {
+        if (t->type != GGML_TYPE_Q8_0_SPLIT2 && t->type != GGML_TYPE_Q8_0_SPLIT2_DRAFT &&
+            t->type != GGML_TYPE_Q8_0_SPLIT2_62 && t->type != GGML_TYPE_Q8_0_SPLIT2_62_DRAFT) {
             continue;
         }
         const size_t nbytes = ggml_nbytes(t);
         std::vector<uint8_t> buf(nbytes);
         ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-        ggml_split2_debug_zero_rb(buf.data(), nbytes);
+        if (t->type == GGML_TYPE_Q8_0_SPLIT2_62 || t->type == GGML_TYPE_Q8_0_SPLIT2_62_DRAFT) {
+            ggml_split2_62_debug_zero_rb(buf.data(), nbytes);
+        } else {
+            ggml_split2_debug_zero_rb(buf.data(), nbytes);
+        }
         ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
     }
 }

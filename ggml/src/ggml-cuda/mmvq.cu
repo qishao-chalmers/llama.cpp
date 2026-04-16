@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 #include "mmvq_nib.cuh"
 #include "mmvq_split2.cuh"
+#include "mmvq_split2_62.cuh"
 
 #include <cstdint>
 #include <cstdlib>
@@ -99,6 +100,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q8_0_NIB:return vec_dot_q8_0_nib_q8_1;
         case GGML_TYPE_Q8_0_SPLIT2_DRAFT: return vec_dot_q8_0_split2_draft_q8_1;
         case GGML_TYPE_Q8_0_SPLIT2:       return vec_dot_q8_0_split2_q8_1;
+        case GGML_TYPE_Q8_0_SPLIT2_62_DRAFT: return vec_dot_q8_0_split2_62_draft_q8_1;
+        case GGML_TYPE_Q8_0_SPLIT2_62:       return vec_dot_q8_0_split2_62_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -128,6 +131,8 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q8_0_NIB:return VDR_Q8_0_NIB_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0_SPLIT2_DRAFT: return VDR_Q8_0_SPLIT2_DRAFT_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0_SPLIT2:       return VDR_Q8_0_SPLIT2_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0_SPLIT2_62_DRAFT: return VDR_Q8_0_SPLIT2_62_DRAFT_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0_SPLIT2_62:       return VDR_Q8_0_SPLIT2_62_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
@@ -255,6 +260,12 @@ static __global__ void mul_mat_vec_q(
         if (fusion.split2_draft) {
             vdr_local = VDR_Q8_0_SPLIT2_DRAFT_Q8_1_MMVQ;
             vec_dot_local = vec_dot_q8_0_split2_draft_q8_1;
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q8_0_SPLIT2_62) {
+        if (fusion.split2_draft) {
+            vdr_local = VDR_Q8_0_SPLIT2_62_DRAFT_Q8_1_MMVQ;
+            vec_dot_local = vec_dot_q8_0_split2_62_draft_q8_1;
         }
     }
 
@@ -669,6 +680,18 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q8_0_SPLIT2:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_SPLIT2>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q8_0_SPLIT2_62_DRAFT:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_SPLIT2_62_DRAFT>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q8_0_SPLIT2_62:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0_SPLIT2_62>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

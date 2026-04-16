@@ -48,6 +48,8 @@ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q8_0_nib(const block_q8_0_nib * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_0_split2(const block_q8_0_split2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_0_split2_draft(const block_q8_0_split2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q8_0_split2_62(const block_q8_0_split2_62 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q8_0_split2_62_draft(const block_q8_0_split2_62 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 //GGML_API void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 // Experimental transforms used by split-weight prototypes.
@@ -62,8 +64,15 @@ GGML_API size_t transform_q8_0_to_split2(
     block_q8_0_split2     * dst,
     int                    n_blocks);
 
+GGML_API size_t transform_q8_0_to_split2_62(
+    const block_q8_0         * src,
+    block_q8_0_split2_62     * dst,
+    int                        n_blocks);
+
 // Debug: zero rb[] (lower-nibble region B) in each split2 block. Draft path ignores rb; verify uses it.
 GGML_API void ggml_split2_debug_zero_rb(void * data, size_t nbytes);
+// Debug: zero rb[] (2 LSB bits per weight) in each split2_62 block.
+GGML_API void ggml_split2_62_debug_zero_rb(void * data, size_t nbytes);
 
 GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 

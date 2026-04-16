@@ -20,6 +20,26 @@ static bool llama_split2_debug_zero_rb_enabled(void) {
     return e != nullptr && e[0] != '\0' && e[0] != '0';
 }
 
+// On-disk GGUF weights are Q8_0; split2 tensors are transformed at load time.
+static void llama_load_q8_0_to_split2(
+        const block_q8_0 * src,
+        void             * dst,
+        int                n_blocks,
+        size_t             nbytes,
+        bool               is_split2_62) {
+    if (is_split2_62) {
+        transform_q8_0_to_split2_62(src, (block_q8_0_split2_62 *) dst, n_blocks);
+        if (llama_split2_debug_zero_rb_enabled()) {
+            ggml_split2_62_debug_zero_rb(dst, nbytes);
+        }
+    } else {
+        transform_q8_0_to_split2(src, (block_q8_0_split2 *) dst, n_blocks);
+        if (llama_split2_debug_zero_rb_enabled()) {
+            ggml_split2_debug_zero_rb(dst, nbytes);
+        }
+    }
+}
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1240,11 +1260,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     struct ggml_tensor * tensor = nullptr;
     bool use_split2 = false;
     bool use_split2_draft = false;
+    bool use_split2_62 = false;
     if (const char * e = getenv("LLAMA_Q8_0_SPLIT2")) {
         use_split2 = atoi(e) != 0;
     }
     if (const char * e = getenv("LLAMA_Q8_0_SPLIT2_DRAFT")) {
         use_split2_draft = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_Q8_0_SPLIT2_62")) {
+        use_split2_62 = atoi(e) != 0;
     }
 
     if (use_split2 &&
@@ -1252,7 +1276,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_n_dims(cur) == 2) {
         ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
         if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-            const ggml_type dst_type = use_split2_draft ? GGML_TYPE_Q8_0_SPLIT2_DRAFT : GGML_TYPE_Q8_0_SPLIT2;
+            const ggml_type dst_type = use_split2_draft
+                ? (use_split2_62 ? GGML_TYPE_Q8_0_SPLIT2_62_DRAFT : GGML_TYPE_Q8_0_SPLIT2_DRAFT)
+                : (use_split2_62 ? GGML_TYPE_Q8_0_SPLIT2_62       : GGML_TYPE_Q8_0_SPLIT2);
             tensor = ggml_new_tensor_2d(ctx, dst_type, cur->ne[0], cur->ne[1]);
             ggml_set_name(tensor, ggml_get_name(cur));
         }
@@ -1517,7 +1543,13 @@ bool llama_model_loader::load_all_data(
 
         const bool is_q8_0_split2 =
             cur->type == GGML_TYPE_Q8_0_SPLIT2 ||
-            cur->type == GGML_TYPE_Q8_0_SPLIT2_DRAFT;
+            cur->type == GGML_TYPE_Q8_0_SPLIT2_DRAFT ||
+            cur->type == GGML_TYPE_Q8_0_SPLIT2_62 ||
+            cur->type == GGML_TYPE_Q8_0_SPLIT2_62_DRAFT;
+
+        const bool is_q8_0_split2_62 =
+            cur->type == GGML_TYPE_Q8_0_SPLIT2_62 ||
+            cur->type == GGML_TYPE_Q8_0_SPLIT2_62_DRAFT;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1539,10 +1571,7 @@ bool llama_model_loader::load_all_data(
             if (is_q8_0_split2) {
                 std::vector<uint8_t> tmp_dst(n_size);
                 const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
-                transform_q8_0_to_split2((const block_q8_0 *) data, (block_q8_0_split2 *) tmp_dst.data(), n_blocks);
-                if (llama_split2_debug_zero_rb_enabled()) {
-                    ggml_split2_debug_zero_rb(tmp_dst.data(), n_size);
-                }
+                llama_load_q8_0_to_split2((const block_q8_0 *) data, tmp_dst.data(), n_blocks, n_size, is_q8_0_split2_62);
                 ggml_backend_tensor_set(cur, tmp_dst.data(), 0, n_size);
             } else {
                 GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
@@ -1569,10 +1598,7 @@ bool llama_model_loader::load_all_data(
                     std::vector<uint8_t> tmp_src(n_size_src);
                     file->read_raw(tmp_src.data(), n_size_src);
                     const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
-                    transform_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), (block_q8_0_split2 *) cur->data, n_blocks);
-                    if (llama_split2_debug_zero_rb_enabled()) {
-                        ggml_split2_debug_zero_rb(cur->data, n_size);
-                    }
+                    llama_load_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), cur->data, n_blocks, n_size, is_q8_0_split2_62);
                 } else {
                     file->read_raw(cur->data, n_size_src);
                 }
@@ -1645,10 +1671,7 @@ bool llama_model_loader::load_all_data(
                         file->seek(weight->offs, SEEK_SET);
                         file->read_raw(tmp_src.data(), n_size_src);
                         const int n_blocks = (int) (ggml_nelements(cur) / QK8_0);
-                        transform_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), (block_q8_0_split2 *) tmp_dst.data(), n_blocks);
-                        if (llama_split2_debug_zero_rb_enabled()) {
-                            ggml_split2_debug_zero_rb(tmp_dst.data(), n_size);
-                        }
+                        llama_load_q8_0_to_split2((const block_q8_0 *) tmp_src.data(), tmp_dst.data(), n_blocks, n_size, is_q8_0_split2_62);
                         ggml_backend_tensor_set(cur, tmp_dst.data(), 0, n_size);
                         if (check_tensors && !ggml_validate_row_data(GGML_TYPE_Q8_0, tmp_src.data(), n_size_src)) {
                             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));

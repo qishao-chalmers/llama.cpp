@@ -532,12 +532,138 @@ size_t transform_q8_0_to_split2(
     return (size_t) n_blocks * sizeof(block_q8_0_split2);
 }
 
+// Pack 32×6 bits into 24 bytes (LSB-first within each 6-bit value, stream order weight 0..31).
+static void q8_0_split2_62_pack_ra(const uint8_t hi6[32], uint8_t ra[24]) {
+    memset(ra, 0, 24);
+    uint64_t bit = 0;
+    for (int i = 0; i < 32; ++i) {
+        const uint64_t v = hi6[i] & 0x3F;
+        for (int b = 0; b < 6; ++b) {
+            if (v & (1u << b)) {
+                ra[bit / 8] |= (uint8_t)(1u << (bit % 8));
+            }
+            bit++;
+        }
+    }
+}
+
+static void q8_0_split2_62_pack_rb(const uint8_t lo2[32], uint8_t rb[8]) {
+    memset(rb, 0, 8);
+    for (int i = 0; i < 32; ++i) {
+        rb[i / 4] |= (uint8_t)((lo2[i] & 3) << ((i % 4) * 2));
+    }
+}
+
+static void q8_0_split2_62_unpack_ra(const uint8_t ra[24], uint8_t hi6[32]) {
+    uint64_t bit = 0;
+    for (int i = 0; i < 32; ++i) {
+        uint32_t v = 0;
+        for (int b = 0; b < 6; ++b) {
+            if (ra[bit / 8] & (1u << (bit % 8))) {
+                v |= (1u << b);
+            }
+            bit++;
+        }
+        hi6[i] = (uint8_t)(v & 0x3F);
+    }
+}
+
+static void q8_0_split2_62_unpack_rb(const uint8_t rb[8], uint8_t lo2[32]) {
+    for (int i = 0; i < 32; ++i) {
+        lo2[i] = (rb[i / 4] >> ((i % 4) * 2)) & 3;
+    }
+}
+
+static int q8_0_sign_ext6(uint32_t h) {
+    h &= 0x3F;
+    if (h & 0x20) {
+        return (int)h - 64;
+    }
+    return (int)h;
+}
+
+size_t transform_q8_0_to_split2_62(
+    const block_q8_0         * src,
+    block_q8_0_split2_62     * dst,
+    int                        n_blocks) {
+    for (int bi = 0; bi < n_blocks; ++bi) {
+        const block_q8_0         * s = src + bi;
+        block_q8_0_split2_62     * d = dst + bi;
+
+        d->d_full  = s->d;
+        d->d_draft = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(s->d) * 4.0f);
+
+        uint8_t hi6[32];
+        uint8_t lo2[32];
+        for (int j = 0; j < QK8_0; ++j) {
+            const uint8_t u = (uint8_t) s->qs[j];
+            hi6[j] = (u >> 2) & 0x3F;
+            lo2[j] = u & 0x03;
+        }
+        q8_0_split2_62_pack_ra(hi6, d->ra);
+        q8_0_split2_62_pack_rb(lo2, d->rb);
+    }
+
+    return (size_t) n_blocks * sizeof(block_q8_0_split2_62);
+}
+
+void dequantize_row_q8_0_split2_62(const block_q8_0_split2_62 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK8_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d_full);
+        uint8_t hi6[32];
+        uint8_t lo2[32];
+        q8_0_split2_62_unpack_ra(x[i].ra, hi6);
+        q8_0_split2_62_unpack_rb(x[i].rb, lo2);
+
+        for (int j = 0; j < qk; ++j) {
+            const uint8_t u = (uint8_t)(((hi6[j] & 0x3F) << 2) | (lo2[j] & 3));
+            y[i * qk + j] = (float)(int8_t) u * d;
+        }
+    }
+}
+
+void dequantize_row_q8_0_split2_62_draft(const block_q8_0_split2_62 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK8_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d_draft);
+        uint8_t hi6[32];
+        q8_0_split2_62_unpack_ra(x[i].ra, hi6);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i * qk + j] = (float) q8_0_sign_ext6(hi6[j]) * d;
+        }
+    }
+}
+
 void ggml_split2_debug_zero_rb(void * data, size_t nbytes) {
     const size_t block_sz = sizeof(block_q8_0_split2);
     if (data == NULL || nbytes == 0 || nbytes % block_sz != 0) {
         return;
     }
     block_q8_0_split2 * p = (block_q8_0_split2 *) data;
+    const size_t n_blocks = nbytes / block_sz;
+    for (size_t i = 0; i < n_blocks; ++i) {
+        memset(p[i].rb, 0, sizeof(p[i].rb));
+    }
+}
+
+void ggml_split2_62_debug_zero_rb(void * data, size_t nbytes) {
+    const size_t block_sz = sizeof(block_q8_0_split2_62);
+    if (data == NULL || nbytes == 0 || nbytes % block_sz != 0) {
+        return;
+    }
+    block_q8_0_split2_62 * p = (block_q8_0_split2_62 *) data;
     const size_t n_blocks = nbytes / block_sz;
     for (size_t i = 0; i < n_blocks; ++i) {
         memset(p[i].rb, 0, sizeof(p[i].rb));

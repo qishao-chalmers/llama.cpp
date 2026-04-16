@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_Q8_0_NIB = 40, // Q8_0 upper-nibble draft (experimental)
         GGML_TYPE_Q8_0_SPLIT2_DRAFT = 41, // Q8_0 single-buffer split (A=upper nibble, B=lower nibble), draft view
         GGML_TYPE_Q8_0_SPLIT2       = 42, // Q8_0 single-buffer split (A+B), full-precision view
-        GGML_TYPE_COUNT    = 43,
+        GGML_TYPE_Q8_0_SPLIT2_62_DRAFT = 43, // Q8_0 split A=6 MSBs, B=2 LSBs (draft: A only)
+        GGML_TYPE_Q8_0_SPLIT2_62       = 44, // Q8_0 split 6+2 full int8 reconstruction
+        GGML_TYPE_COUNT    = 45,
     };
 
     // precision

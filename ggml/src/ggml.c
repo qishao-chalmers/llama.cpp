@@ -724,6 +724,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_split2,
     },
+    [GGML_TYPE_Q8_0_SPLIT2_62_DRAFT] = {
+        .type_name                = "q8_0_split2_62_draft",
+        .blck_size                = QK8_0,
+        .type_size                = sizeof(block_q8_0_split2_62),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_split2_62_draft,
+    },
+    [GGML_TYPE_Q8_0_SPLIT2_62] = {
+        .type_name                = "q8_0_split2_62",
+        .blck_size                = QK8_0,
+        .type_size                = sizeof(block_q8_0_split2_62),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_split2_62,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
