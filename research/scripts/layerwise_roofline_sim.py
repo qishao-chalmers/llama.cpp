@@ -68,6 +68,17 @@ from gguf_layerwise_weights import (  # noqa: E402
     resolve_layer_weight_bytes_from_gguf,
 )
 
+
+def _fmt_bytes(n: float) -> str:
+    n = float(n)
+    if n < 1024:
+        return f"{n:.0f} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:.2f} {unit}"
+    return f"{n:.2f} PiB"
+
 # Duplicated hardware table (keep independent of edits to perf_model presets)
 HARDWARE_PRESETS: dict[str, dict[str, float]] = {
     "a100-80g": dict(
@@ -1262,6 +1273,13 @@ def main() -> None:
     )
     p.add_argument("--json-out", default=None, help="Write full result JSON to path")
     p.add_argument("--verbose", "-v", action="store_true", help="Print per-event lines")
+    p.add_argument(
+        "--measured-json",
+        default=None,
+        metavar="PATH",
+        help="Optional benchmark_kv_timing JSON (e.g. kv_timing_h100.json). "
+        "If provided, prints measured vs predicted ms/tok for the matching slice.",
+    )
     args = p.parse_args()
 
     if args.list_kv_types:
@@ -1324,6 +1342,48 @@ def main() -> None:
         ctx_len_used = int(mid_ctx)
     if int(args.sample_ctx) > 0:
         ctx_len_used = int(args.sample_ctx)
+
+    # ─── Footprint summary (model weights + KV cache) ─────────────────────────
+    kv_bpt_total = kv_bytes_per_token(
+        kv_key,
+        dict(model),
+        args.kv_group_size,
+        bool(args.kv_asymmetric),
+    )
+    if gguf_tb is not None:
+        model_bytes = float(sum(int(v) for v in gguf_tb.values()))
+        model_bytes_note = "GGUF sum(all tensors)"
+    else:
+        # Same synthetic accounting used by compute_step_bytes (weights touched in one decode step).
+        wt_step_bytes, _ = compute_step_bytes(
+            model,
+            batch_size=int(args.batch_size),
+            ctx_len=int(ctx_len_used),
+            kv_quant_key=kv_key,
+            weight_bpe=float(wbpe),
+            norm_bpe=float(norm_bpe),
+            kv_group_size=args.kv_group_size,
+            kv_asym=bool(args.kv_asymmetric),
+            gguf_tensor_bytes=None,
+        )
+        model_bytes = float(wt_step_bytes)
+        model_bytes_note = "synthetic decode-step weights"
+
+    print("  Footprint summary:", flush=True)
+    print(f"    model:     {_fmt_bytes(model_bytes)}  ({model_bytes_note})", flush=True)
+    print(f"    kv/token:  {_fmt_bytes(kv_bpt_total)}  (kv_type={args.kv_type!r})", flush=True)
+    if prompt_len > 0 and decode_len > 0:
+        kv_start = float(args.batch_size) * float(prompt_len) * float(kv_bpt_total)
+        kv_end = float(args.batch_size) * float(prompt_len + decode_len) * float(kv_bpt_total)
+        print(f"    kv start:  {_fmt_bytes(kv_start)}  (prompt_len={prompt_len})", flush=True)
+        print(f"    kv end:    {_fmt_bytes(kv_end)}  (prompt+decode={prompt_len + decode_len})", flush=True)
+    else:
+        kv_at_ctx = float(args.batch_size) * float(ctx_len_used) * float(kv_bpt_total)
+        print(
+            f"    kv @ctx:   {_fmt_bytes(kv_at_ctx)}  (ctx_len_used={ctx_len_used}; "
+            "pass --prompt-len and --decode-len for start/end)",
+            flush=True,
+        )
 
     total_s, events = simulate_decode_step(
         model,
@@ -1404,6 +1464,71 @@ def main() -> None:
     else:
         print(f"  ms/token (wall / B):                       {ms_per_tok:.4f} ms/tok")
     print(f"  tok/s (reported):                          {tps:.2f}")
+    # ─── Compare to measured (if provided) ────────────────────────────────────
+    if args.measured_json:
+        mpath = os.path.abspath(os.path.expanduser(args.measured_json))
+        try:
+            with open(mpath, encoding="utf-8") as f:
+                mdata = json.load(f)
+        except Exception as e:
+            print(f"  [measured] failed to read {mpath!r}: {e}", file=sys.stderr)
+            mdata = None
+        rows = []
+        if isinstance(mdata, list):
+            rows = mdata
+        elif isinstance(mdata, dict):
+            rows = mdata.get("rows", []) if isinstance(mdata.get("rows", []), list) else []
+        target_mid = int(mid_ctx) if mid_ctx is not None else int(ctx_len_used)
+        want_kv = str(args.kv_type)
+        want_wtag = str(args.weight_tag or "")
+        best = None
+        best_key = None
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("model_preset", "")) != str(pid):
+                continue
+            if int(r.get("batch_size", -1)) != int(args.batch_size):
+                continue
+            if str(r.get("kv_type", "")) != want_kv:
+                continue
+            if want_wtag and str(r.get("weight_tag", "")) != want_wtag:
+                continue
+            pl = int(r.get("prompt_len", 0))
+            dl = int(r.get("decode_len", 0))
+            r_mid = int(r.get("mid_ctx", pl + dl // 2))
+            dmid = abs(r_mid - target_mid)
+            key = (dmid, pl, dl)
+            if best is None or key < best_key:
+                best = r
+                best_key = key
+        if best is None:
+            print(
+                f"  [measured] no matching row found in {mpath!r} for "
+                f"preset={pid!r} kv_type={want_kv!r} weight_tag={want_wtag!r} "
+                f"B={args.batch_size} mid_ctx≈{target_mid}",
+                flush=True,
+            )
+        else:
+            meas = float(best.get("measured_ms", float("nan")))
+            pl = int(best.get("prompt_len", 0))
+            dl = int(best.get("decode_len", 0))
+            r_mid = int(best.get("mid_ctx", pl + dl // 2))
+            pred = float(ms_per_tok)
+            if not math.isnan(meas) and meas > 0:
+                ratio = pred / meas
+                err = pred - meas
+                print(
+                    f"  [measured] measured={meas:.4f} ms/tok  predicted={pred:.4f} ms/tok  "
+                    f"err={err:+.4f}  pred/meas={ratio:.3f}  (row mid_ctx={r_mid}, prompt_len={pl}, decode_len={dl})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  [measured] row found but measured_ms invalid: {best.get('measured_ms')!r}  "
+                    f"(row mid_ctx={r_mid}, prompt_len={pl}, decode_len={dl})",
+                    flush=True,
+                )
     print()
     print("  Time by op family (s, fraction of total):")
     for fam in sorted(by_fam.keys(), key=lambda k: -by_fam[k]):

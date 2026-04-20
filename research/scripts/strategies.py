@@ -245,9 +245,58 @@ def _verify_window_batched_fp16(lib, ctx, n_vocab, window_tokens, pos_start,
     return greedy
 
 
+class StopStringState:
+    """Mutable state for check_stop_strings (reasoning blocks span multiple tail windows)."""
+
+    __slots__ = ("in_think_block",)
+
+    def __init__(self):
+        self.in_think_block = False
+
+
+def check_stop_strings(lib, vocab, gen_ids: list, stop_strings, state: StopStringState,
+                       min_len: int = 4) -> bool:
+    """True if any stop string appears in the detokenized tail of gen_ids.
+
+    Mirrors run_sweep.py / run_generate: skip matching inside <redacted_thinking> /
+    analysis channel until the closing / final marker (same logic as strategies.run_generate).
+    """
+    if not stop_strings or len(gen_ids) < min_len:
+        return False
+    _stop_check_len = max((len(s) for s in stop_strings), default=0) * 3 + 32
+    tail = gen_ids[-_stop_check_len:] if _stop_check_len else gen_ids
+    tail_text = llama.detokenize(lib, vocab, tail, remove_special=False)
+    if "<redacted_thinking>" in tail_text or "<|channel|>analysis" in tail_text:
+        state.in_think_block = True
+    if "</redacted_thinking>" in tail_text or "<|channel|>final" in tail_text:
+        state.in_think_block = False
+    if state.in_think_block:
+        return False
+    return any(s in tail_text for s in stop_strings)
+
+
+def check_answer_regex(lib, vocab, gen_ids: list, answer_re, state: StopStringState,
+                       tail_tokens: int = 256) -> bool:
+    """True if answer_re matches the detokenized suffix (outside think/analysis blocks)."""
+    if answer_re is None or not gen_ids:
+        return False
+    tail = gen_ids[-tail_tokens:] if tail_tokens > 0 else gen_ids
+    tail_text = llama.detokenize(lib, vocab, tail, remove_special=False)
+    if "<think>" in tail_text or "<|channel|>analysis" in tail_text:
+        state.in_think_block = True
+    if "</think>" in tail_text or "<|channel|>final" in tail_text:
+        state.in_think_block = False
+    if state.in_think_block:
+        return False
+    return answer_re.search(tail_text) is not None
+
+
 def generate_window(lib, ctx, n_vocab, first_token, pos_start, W,
                     kv_hook=None, k_group_size=64, v_group_size=64,
-                    stop_fn=None):
+                    stop_fn=None,
+                    stop_strings=None, vocab=None, prefix_out_ids=None,
+                    stop_state: Optional[StopStringState] = None,
+                    answer_re=None):
     """Generate up to W tokens autoregressively starting from first_token.
 
     In run_adaptive_gen: used for the fp16 bootstrap window (kv_hook=None) and for
@@ -259,7 +308,15 @@ def generate_window(lib, ctx, n_vocab, first_token, pos_start, W,
 
     Returns list of up to W tokens (includes first_token).
     After return: KV has positions pos_start .. pos_start+len(output)-2 written.
+
+    If stop_strings is set, pass vocab and optional prefix_out_ids (tokens emitted
+    before this window). Pass a shared stop_state across windows so reasoning-block
+    tracking stays consistent.
     """
+    prefix_out_ids = prefix_out_ids or []
+    need_state = stop_strings is not None or answer_re is not None
+    st = stop_state if stop_state is not None else (StopStringState() if need_state else None)
+
     tokens = [first_token]
     token  = first_token
     n_pending_k = n_pending_v = 0
@@ -279,6 +336,12 @@ def generate_window(lib, ctx, n_vocab, first_token, pos_start, W,
         logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
         token  = int(np.argmax(logits))
         tokens.append(token)
+        if st is not None and vocab is not None:
+            combined = prefix_out_ids + tokens
+            if stop_strings is not None and check_stop_strings(lib, vocab, combined, stop_strings, st):
+                break
+            if answer_re is not None and check_answer_regex(lib, vocab, combined, answer_re, st):
+                break
 
     if kv_hook:
         _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v)
@@ -539,7 +602,11 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                  max_new_tokens=512, is_eog=None,
                  stop_strings=None,
                  k_group_size=64, v_group_size=64,
-                 return_diagnostics=False):
+                 return_diagnostics=False,
+                 stream_text=False,
+                 stream_text_stride=1,
+                 rep_rate_threshold=0.0,
+                 rep_rate_consecutive=5):
     """Greedy autoregressive generation after batch-prefilling the prompt.
 
     Applies the same KV hook as the PPL pass so the quantization conditions
@@ -549,6 +616,18 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     Stops at max_new_tokens, when is_eog(token) returns True, or when any
     string in stop_strings appears in the decoded suffix of the output.
     is_eog: callable(token_id) -> bool, typically lib.llama_vocab_is_eog(vocab, id).
+
+    When stream_text is True, prints each detokenized delta to stdout as tokens
+    are generated (full-string detokenize each step; avoids duplicate output
+    at the caller). stream_text_stride>1 prints every N tokens plus a final
+    flush (faster; slightly less "live").
+
+    When return_diagnostics is False, greedy decoding uses argmax on logits
+    directly (no log_softmax over the vocab) for speed.
+
+    rep_rate_threshold (0.0 = disabled): if the 3-gram repetition rate in the
+    last 20 tokens exceeds this value for rep_rate_consecutive steps in a row,
+    generation stops early (repetition loop detected).
     """
     n_prompt = len(prompt_tokens)
     mem = lib.llama_get_memory(ctx)
@@ -556,6 +635,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
 
     diag_lists = ({"H": [], "p_max": [], "self_surp": [], "rep_rate": []}
                   if return_diagnostics else None)
+    _rep_consec = 0   # consecutive steps above rep_rate_threshold
 
     # Batch prefill — request logits only for the last prompt token
     batch = lib.llama_batch_init(n_prompt, 0, 1)
@@ -579,13 +659,22 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     # Subsequent tokens come from single-token decode batches where index 0 is correct.
     ptr    = lib.llama_get_logits_ith(ctx, n_prompt - 1)
     logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-    log_q  = llama.log_softmax(logits.astype(np.float32))
-    token  = int(np.argmax(log_q))
+    if diag_lists is not None:
+        log_q  = llama.log_softmax(logits.astype(np.float32))
+        token  = int(np.argmax(log_q))
+    else:
+        log_q  = None  # unused; greedy uses raw logits
+        token  = int(np.argmax(logits.astype(np.float32)))
     generated   = [token]
     prev_top1   = token
     n_pending_k = 0
     n_pending_v = 0
     pos = n_prompt
+    prev_stream = ""
+    if stream_text:
+        full = llama.detokenize(lib, vocab, generated, remove_special=False)
+        print(full[len(prev_stream):], end="", flush=True)
+        prev_stream = full
     # For stop-string detection: keep a small rolling decode buffer
     _stop_check_len = max((len(s) for s in stop_strings), default=0) * 3 + 32 if stop_strings else 0
     _in_think_block = False
@@ -624,9 +713,20 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
 
         ptr    = lib.llama_get_logits_ith(ctx, 0)
         logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-        log_q  = llama.log_softmax(logits.astype(np.float32))
-        token  = int(np.argmax(log_q))
+        if diag_lists is not None:
+            log_q = llama.log_softmax(logits.astype(np.float32))
+            token = int(np.argmax(log_q))
+        else:
+            log_q = None
+            token = int(np.argmax(logits.astype(np.float32)))
         generated.append(token)
+
+        if stream_text:
+            n = len(generated)
+            if stream_text_stride <= 1 or n % stream_text_stride == 0:
+                full = llama.detokenize(lib, vocab, generated, remove_special=False)
+                print(full[len(prev_stream):], end="", flush=True)
+                prev_stream = full
 
         if diag_lists is not None:
             p     = np.exp(log_q)
@@ -637,6 +737,19 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
             diag_lists["self_surp"].append(ss)
             diag_lists["rep_rate"].append(_rep_rate(generated))
         prev_top1 = token
+
+        # Repetition early stop (works even without --save-diags).
+        if rep_rate_threshold > 0.0:
+            rr = _rep_rate(generated)
+            if rr >= rep_rate_threshold:
+                _rep_consec += 1
+                if _rep_consec >= rep_rate_consecutive:
+                    import sys
+                    print(f"\n[rep-stop] rep_rate={rr:.2f} for {_rep_consec} steps "
+                          f"at token {len(generated)} — stopping early", file=sys.stderr)
+                    break
+            else:
+                _rep_consec = 0
 
         if stop_strings and len(generated) >= 4:
             tail = generated[-_stop_check_len:] if _stop_check_len else generated
@@ -652,5 +765,9 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
 
     if kv_hook:
         _flush_hook(kv_hook, ctx, n_pending_k, n_pending_v)
+
+    if stream_text and stream_text_stride > 1 and len(generated) % stream_text_stride != 0:
+        full = llama.detokenize(lib, vocab, generated, remove_special=False)
+        print(full[len(prev_stream):], end="", flush=True)
 
     return generated, diag_lists
