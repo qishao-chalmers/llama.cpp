@@ -177,20 +177,15 @@ def iter_tok_s_rows(
                 attn_naive_spill=bool(attn_naive_spill),
                 kv_attn_byte_mode=str(cal.get("kv_attn_byte_mode", "fp16_equiv_dequant")),
             )
-            pred_ms = spm.predict_decode_ms_per_tok(
+            brk = spm.decode_stream_breakdown_s(
                 feats,
                 batch_size=bsz,
                 hw_name=str(hw_name),
                 kv_quant_key=str(kv_key),
                 cal=cal,
             )
-            dom = spm.dominant_stream(
-                feats,
-                batch_size=bsz,
-                hw_name=str(hw_name),
-                kv_quant_key=str(kv_key),
-                cal=cal,
-            )
+            pred_ms = float(brk["ms_per_tok"])
+            dom = str(brk["dominant"])
 
             meas_ts = _ms_per_tok_to_tok_s(meas_ms)
             pred_ts = _ms_per_tok_to_tok_s(pred_ms)
