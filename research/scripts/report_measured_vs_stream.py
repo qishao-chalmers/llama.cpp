@@ -58,11 +58,19 @@ def main() -> None:
     ap.add_argument("--only-kv", default=None)
     ap.add_argument("--summary-only", action="store_true")
     ap.add_argument(
+        "--diag-streams",
+        action="store_true",
+        help="With per-row output, append roofline stream times (ms per decode step: Tc,Tw,Tkv,max,overlap,step).",
+    )
+    ap.add_argument(
         "--unit",
         default="ms_per_tok",
         choices=["ms_per_tok", "tok_s"],
     )
     args = ap.parse_args()
+
+    if args.diag_streams and args.summary_only:
+        print("[warn] --diag-streams ignored with --summary-only", file=sys.stderr)
 
     paths: list[str] = []
     for p in args.measured_json:
@@ -113,10 +121,15 @@ def main() -> None:
     meas_lbl = "meas_tok/s" if args.unit == "tok_s" else "meas_ms"
     pred_lbl = "pred_tok/s" if args.unit == "tok_s" else "pred_ms"
     err_lbl = "err_tok/s" if args.unit == "tok_s" else "err_ms"
-    hdr = (
+    hdr_base = (
         f"{'preset':10s} {'wtag':8s} {'kv':6s} {'B':>3s} {'mid':>5s} "
         f"{meas_lbl:>9s} {pred_lbl:>9s} {err_lbl:>9s} {'pred/meas':>9s} {'dom':>8s}"
     )
+    hdr_diag = (
+        f" {'Tc_ms':>7} {'Tw_ms':>7} {'Tk_ms':>7} {'mx_ms':>7} "
+        f"{'wm_ol':>7} {'mk_ol':>7} {'step_ms':>8}"
+    )
+    hdr = hdr_base + (hdr_diag if args.diag_streams else "")
 
     all_errs: list[float] = []
     all_ratios: list[float] = []
@@ -197,20 +210,15 @@ def main() -> None:
                 attn_naive_spill=bool(args.attn_naive_spill),
                 kv_attn_byte_mode=str(cal.get("kv_attn_byte_mode", "fp16_equiv_dequant")),
             )
-            pred = spm.predict_decode_ms_per_tok(
+            brk = spm.decode_stream_breakdown_s(
                 feats,
                 batch_size=B,
                 hw_name=str(args.hw),
                 kv_quant_key=str(kv_key),
                 cal=cal,
             )
-            dom = spm.dominant_stream(
-                feats,
-                batch_size=B,
-                hw_name=str(args.hw),
-                kv_quant_key=str(kv_key),
-                cal=cal,
-            )
+            pred = float(brk["ms_per_tok"])
+            dom = str(brk["dominant"])
 
             if args.unit == "tok_s":
                 meas_u = _ms_per_tok_to_tok_s(meas)
@@ -223,10 +231,23 @@ def main() -> None:
             ratio = pred_u / meas_u if meas_u else float("nan")
 
             if not args.summary_only:
-                print(
+                line = (
                     f"{mp:10s} {wtag:8s} {kv_cli:6s} {B:3d} {mid:5d} "
                     f"{_fmt(meas_u)} {_fmt(pred_u)} {_fmt(err)} {ratio:9.3f} {dom:>8s}"
                 )
+                if args.diag_streams:
+                    tc = float(brk["tc_s"]) * 1000.0
+                    tw = float(brk["tw_s"]) * 1000.0
+                    tk = float(brk["tk_s"]) * 1000.0
+                    mx = float(brk["t_max_s"]) * 1000.0
+                    owm = float(brk["t_alpha_wm_s"]) * 1000.0
+                    omk = float(brk["t_alpha_mk_s"]) * 1000.0
+                    stp = float(brk["t_step_s"]) * 1000.0
+                    line += (
+                        f" {tc:7.3f} {tw:7.3f} {tk:7.3f} {mx:7.3f} "
+                        f"{owm:7.3f} {omk:7.3f} {stp:8.3f}"
+                    )
+                print(line)
 
             errs.append(err)
             ratios.append(ratio)

@@ -299,14 +299,20 @@ def _fixed_overhead_s(cal: dict[str, Any], batch_size: int) -> float:
     return float(v) / 1000.0
 
 
-def predict_decode_ms_per_tok(
+def decode_stream_breakdown_s(
     feats: dict[str, Any],
     *,
     batch_size: int,
     hw_name: str,
     kv_quant_key: str,
     cal: dict[str, Any],
-) -> float:
+) -> dict[str, Any]:
+    """Roofline stream times and predictor merge (seconds per decode **step**).
+
+    Returns tc_s, tw_s, tk_s (roofline-only), overlap terms, t_step_s, ms_per_tok,
+    and dominant label (argmax of tc/tw/tk using the same roofline rules as dominant_stream).
+    """
+
     hw = dict(sim.HARDWARE_PRESETS[str(hw_name)])
     peak_bw = float(hw["memory_bw_gbps"]) * 1e9 * float(hw["efficiency"])
     peak_flops = float(hw["compute_tflops"]) * 1e12 * float(hw["efficiency"])
@@ -326,19 +332,63 @@ def predict_decode_ms_per_tok(
     tk = (kv_b / (peak_bw * eta_kv)) if (peak_bw > 0 and eta_kv > 0) else float("inf")
     tc = (flops / (peak_flops * eta_c)) if (peak_flops > 0 and eta_c > 0) else 0.0
 
-    a = sorted([tc, tw, tk])
-    t_small, t_mid, t_large = float(a[0]), float(a[1]), float(a[2])
-    t_max = t_large
+    # Dominant label matches dominant_stream (-inf sinks invalid bandwidth streams).
+    tw_d = tw if math.isfinite(tw) else float("-inf")
+    tk_d = tk if math.isfinite(tk) else float("-inf")
+    m = max(tc, tw_d, tk_d)
+    if m == tc:
+        dom = "compute"
+    elif m == tw_d:
+        dom = "weight"
+    else:
+        dom = "kv"
+
+    t_max = max(tc, tw, tk)
     alpha_wm = float(cal.get("alpha_wm", 0.0))
     alpha_mk = float(cal.get("alpha_mk", 0.0))
-    t_step = (
-        _fixed_overhead_s(cal, int(batch_size))
-        + t_max
-        + alpha_wm * min(tc, tw)
-        + alpha_mk * min(max(tc, tw), tk)
-        + float(cal.get("tail_ms", 0.0)) / 1000.0
+    t_ol_wm = alpha_wm * min(tc, tw)
+    t_ol_mk = alpha_mk * min(max(tc, tw), tk)
+    t_fixed = _fixed_overhead_s(cal, int(batch_size))
+    t_tail = float(cal.get("tail_ms", 0.0)) / 1000.0
+    t_step = t_fixed + t_max + t_ol_wm + t_ol_mk + t_tail
+    bsz = float(batch_size)
+    return {
+        "tc_s": float(tc),
+        "tw_s": float(tw),
+        "tk_s": float(tk),
+        "t_max_s": float(t_max),
+        "t_fixed_s": float(t_fixed),
+        "t_tail_s": float(t_tail),
+        "t_alpha_wm_s": float(t_ol_wm),
+        "t_alpha_mk_s": float(t_ol_mk),
+        "t_step_s": float(t_step),
+        "ms_per_tok": float(t_step) * 1000.0 / bsz,
+        "dominant": dom,
+        "peak_bw_bps": float(peak_bw),
+        "peak_flops_s": float(peak_flops),
+        "eta_weight_bw": float(eta_w),
+        "eta_compute": float(eta_c),
+        "eta_kv_bw": float(eta_kv),
+    }
+
+
+def predict_decode_ms_per_tok(
+    feats: dict[str, Any],
+    *,
+    batch_size: int,
+    hw_name: str,
+    kv_quant_key: str,
+    cal: dict[str, Any],
+) -> float:
+    return float(
+        decode_stream_breakdown_s(
+            feats,
+            batch_size=int(batch_size),
+            hw_name=str(hw_name),
+            kv_quant_key=str(kv_quant_key),
+            cal=cal,
+        )["ms_per_tok"]
     )
-    return float(t_step) * 1000.0 / float(batch_size)
 
 
 def dominant_stream(
