@@ -125,6 +125,15 @@ def _acc_prefix(scores: list[float], n: int) -> tuple[float, int]:
     return correct / max(1, n), correct
 
 
+def run_short_tag(r: dict[str, Any], max_len: int = 32) -> str:
+    stem = os.path.basename(r["rel"])
+    for suf in (".log", "_per_example.json"):
+        if stem.endswith(suf):
+            stem = stem[: -len(suf)]
+            break
+    return stem[:max_len] if len(stem) > max_len else stem
+
+
 def resolve_run_from_log(log_path: str) -> dict[str, Any]:
     """Load per-example JSON if present; else parse log lines."""
 
@@ -280,14 +289,7 @@ def main() -> None:
     if args.show_diff:
         print()
         print("Per-question (common prefix only; Y=correct, N=wrong by score>=0.5):")
-        tags = []
-        for r in runs:
-            stem = os.path.basename(r["rel"])
-            for suf in (".log", "_per_example.json"):
-                if stem.endswith(suf):
-                    stem = stem[: -len(suf)]
-                    break
-            tags.append(stem[:28] if len(stem) > 28 else stem)
+        tags = [run_short_tag(r, max_len=28) for r in runs]
         # header
         widx, wgold = 4, 6
         col_w = max(3, max(len(t) for t in tags))
@@ -320,6 +322,15 @@ def main() -> None:
                 if len({runs[j]["scores"][i] >= 0.5 for j in range(len(runs))}) > 1
             )
             print(f"  ({n_shown} row(s) where runs disagree on correct/incorrect)")
+
+    print()
+    print(
+        f"Shared contiguous prefix accuracy (n={n_min}, aime#0 .. aime#{n_min - 1}):"
+    )
+    for r in runs:
+        acc, cor = _acc_prefix(r["scores"], n_min)
+        tag = run_short_tag(r)
+        print(f"  {tag}: {cor}/{n_min} correct = {acc:.6f} ({100.0 * acc:.2f}%)")
 
 
 if __name__ == "__main__":
