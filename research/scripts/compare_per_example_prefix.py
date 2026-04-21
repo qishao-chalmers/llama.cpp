@@ -13,7 +13,9 @@ only when both have ``aime#0``..``aime#19`` with no gap (``n = min`` contiguous 
 
 Optional:
   * ``--max-prefix N`` — cap after taking the common contiguous length.
-  * ``--strict-labels`` — reserved for JSON path (log path always uses labels from lines).
+  * ``--strict-labels`` — exit if gold strings differ on a compared index.
+  * ``--show-diff`` — table per question: gold, Y/N per run, ``acc_diff`` if runs disagree.
+  * ``--diff-only`` — with ``--show-diff``, only rows where Y/N differs across runs.
 """
 
 from __future__ import annotations
@@ -179,6 +181,16 @@ def main() -> None:
         action="store_true",
         help="Check gold strings match on compared indices (warn unless strict error desired).",
     )
+    ap.add_argument(
+        "--show-diff",
+        action="store_true",
+        help="Per-question table: gold, each run correct (Y/N), and whether accuracy differs across runs.",
+    )
+    ap.add_argument(
+        "--diff-only",
+        action="store_true",
+        help="With --show-diff, print only rows where runs disagree on correct/incorrect.",
+    )
     args = ap.parse_args()
 
     runs: list[dict[str, Any]] = []
@@ -264,6 +276,50 @@ def main() -> None:
                 f"  {runs[0]['rel'][:36]!r} vs {r['rel'][:36]!r}: "
                 f"both_ok={both} only_1st={only_a} only_2nd={only_b} both_bad={neither}"
             )
+
+    if args.show_diff:
+        print()
+        print("Per-question (common prefix only; Y=correct, N=wrong by score>=0.5):")
+        tags = []
+        for r in runs:
+            stem = os.path.basename(r["rel"])
+            for suf in (".log", "_per_example.json"):
+                if stem.endswith(suf):
+                    stem = stem[: -len(suf)]
+                    break
+            tags.append(stem[:28] if len(stem) > 28 else stem)
+        # header
+        widx, wgold = 4, 6
+        col_w = max(3, max(len(t) for t in tags))
+        hdr_parts = [f"{'i':>{widx}}", f"{'gold':>{wgold}}"]
+        for t in tags:
+            hdr_parts.append(f"{t:^{col_w}}")
+        hdr_parts.append("acc_diff")
+        line0 = " ".join(hdr_parts)
+        print("  " + line0)
+        print("  " + "-" * len(line0))
+        for i in range(n_min):
+            oks = [runs[j]["scores"][i] >= 0.5 for j in range(len(runs))]
+            acc_diff = len(set(oks)) > 1
+            if args.diff_only and not acc_diff:
+                continue
+            gold = runs[0]["golds_list"][i]
+            try:
+                gstr = str(int(gold)) if gold != "" and str(gold).isdigit() else str(gold)[:wgold]
+            except ValueError:
+                gstr = str(gold)[:wgold]
+            cells = [f"{i:>{widx}}", f"{gstr:>{wgold}}"]
+            for ok in oks:
+                cells.append(("Y" if ok else "N").center(col_w))
+            cells.append("yes" if acc_diff else "no")
+            print("  " + " ".join(cells))
+        if args.diff_only:
+            n_shown = sum(
+                1
+                for i in range(n_min)
+                if len({runs[j]["scores"][i] >= 0.5 for j in range(len(runs))}) > 1
+            )
+            print(f"  ({n_shown} row(s) where runs disagree on correct/incorrect)")
 
 
 if __name__ == "__main__":
