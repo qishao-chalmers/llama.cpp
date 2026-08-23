@@ -209,20 +209,29 @@ def kv_attn_read_bpt_layer(
 
 def effective_attn_scale(
     batch_size: int,
+    kv_quant_key: str,
     attn_time_scale: float,
     attn_time_scale_inv_batch: float,
     attn_scale_by_batch: Optional[dict[int, float]] = None,
+    attn_scale_by_batch_and_kv: Optional[dict[str, dict[int, float]]] = None,
 ) -> float:
     """Return attention time multiplier.
 
     Priority:
-      1) If ``attn_scale_by_batch`` has an entry for B, use it.
-      2) Else use ``attn_time_scale + attn_time_scale_inv_batch / B``.
+      1) If ``attn_scale_by_batch_and_kv`` has an entry for (kv_quant_key, B), use it.
+      2) Else if ``attn_scale_by_batch`` has an entry for B, use it.
+      3) Else use ``attn_time_scale + attn_time_scale_inv_batch / B``.
     """
 
     B = float(batch_size)
     if B < 1.0:
         raise ValueError("batch_size must be >= 1")
+    if attn_scale_by_batch_and_kv:
+        by_kv = attn_scale_by_batch_and_kv.get(str(kv_quant_key))
+        if by_kv:
+            v = by_kv.get(int(batch_size))
+            if v is not None:
+                return float(v)
     if attn_scale_by_batch:
         v = attn_scale_by_batch.get(int(batch_size))
         if v is not None:
@@ -234,7 +243,7 @@ def load_sim_physics_json(path: Optional[str]) -> dict[str, Any]:
     """Optional JSON with keys:
 
     - kv_attn_byte_mode
-    - attn_time_scale, attn_time_scale_inv_batch, attn_scale_by_batch
+    - attn_time_scale, attn_time_scale_inv_batch, attn_scale_by_batch, attn_scale_by_batch_and_kv
     - weight_time_scale_by_tag: map weight_tag -> multiplier (scales GEMM family only)
     """
 
@@ -244,6 +253,7 @@ def load_sim_physics_json(path: Optional[str]) -> dict[str, Any]:
             "attn_time_scale": 1.0,
             "attn_time_scale_inv_batch": 0.0,
             "attn_scale_by_batch": {},
+            "attn_scale_by_batch_and_kv": {},
             "weight_time_scale_by_tag": {},
         }
     data = _load_json(os.path.expanduser(path))
@@ -282,6 +292,29 @@ def resolve_sim_physics(
                 continue
             norm[kk] = vv
         phys["attn_scale_by_batch"] = norm
+
+    if "attn_scale_by_batch_and_kv" not in phys or phys["attn_scale_by_batch_and_kv"] is None:
+        phys["attn_scale_by_batch_and_kv"] = {}
+    if isinstance(phys["attn_scale_by_batch_and_kv"], dict):
+        norm2: dict[str, dict[int, float]] = {}
+        for kv_k, by_b in phys["attn_scale_by_batch_and_kv"].items():
+            if not isinstance(by_b, dict):
+                continue
+            try:
+                kv_key = resolve_kv_quant_key(str(kv_k))
+            except Exception:
+                kv_key = str(kv_k)
+            inner: dict[int, float] = {}
+            for bk, bv in by_b.items():
+                try:
+                    b_int = int(bk)
+                    s = float(bv)
+                except Exception:
+                    continue
+                inner[b_int] = s
+            if inner:
+                norm2[str(kv_key)] = inner
+        phys["attn_scale_by_batch_and_kv"] = norm2
 
     if "weight_time_scale_by_tag" not in phys or phys["weight_time_scale_by_tag"] is None:
         phys["weight_time_scale_by_tag"] = {}
@@ -569,6 +602,7 @@ def simulate_decode_step(
     attn_time_scale: float = 1.0,
     attn_time_scale_inv_batch: float = 0.0,
     attn_scale_by_batch: Optional[dict[int, float]] = None,
+    attn_scale_by_batch_and_kv: Optional[dict[str, dict[int, float]]] = None,
     weight_tag: Optional[str] = None,
     weight_time_scale_by_tag: Optional[dict[str, float]] = None,
 ) -> tuple[float, list[SimEvent]]:
@@ -592,8 +626,8 @@ def simulate_decode_step(
     **kv_attn_byte_mode:** ``storage`` (legacy) or ``fp16_equiv_dequant`` (default) —
     see ``kv_attn_read_bpt_layer``.
 
-    **attn_time_scale / attn_time_scale_inv_batch:** multiply only ``attn_core`` time by
-    ``attn_time_scale + attn_time_scale_inv_batch / batch_size``.
+    **attn_time_scale / attn_time_scale_inv_batch / attn_scale_by_batch(/_and_kv):**
+    multiply only ``attn_core`` time by an effective scale (see ``effective_attn_scale``).
     """
 
     B = int(batch_size)
@@ -638,9 +672,11 @@ def simulate_decode_step(
     )
     attn_scale_eff = effective_attn_scale(
         B,
+        kv_quant_key,
         attn_time_scale,
         attn_time_scale_inv_batch,
         attn_scale_by_batch,
+        attn_scale_by_batch_and_kv,
     )
 
     wt_scale = 1.0
@@ -886,6 +922,7 @@ def predict_ms_per_token(
     attn_time_scale: float = 1.0,
     attn_time_scale_inv_batch: float = 0.0,
     attn_scale_by_batch: Optional[dict[int, float]] = None,
+    attn_scale_by_batch_and_kv: Optional[dict[str, dict[int, float]]] = None,
     weight_tag: Optional[str] = None,
     weight_time_scale_by_tag: Optional[dict[str, float]] = None,
 ) -> float:
@@ -913,6 +950,7 @@ def predict_ms_per_token(
         attn_time_scale=attn_time_scale,
         attn_time_scale_inv_batch=attn_time_scale_inv_batch,
         attn_scale_by_batch=attn_scale_by_batch,
+        attn_scale_by_batch_and_kv=attn_scale_by_batch_and_kv,
         weight_tag=weight_tag,
         weight_time_scale_by_tag=weight_time_scale_by_tag,
     )
@@ -1404,6 +1442,7 @@ def main() -> None:
         attn_time_scale=float(phys["attn_time_scale"]),
         attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
         attn_scale_by_batch=phys.get("attn_scale_by_batch"),
+        attn_scale_by_batch_and_kv=phys.get("attn_scale_by_batch_and_kv"),
         weight_tag=w_tag_resolved,
         weight_time_scale_by_tag=phys.get("weight_time_scale_by_tag"),
     )
@@ -1447,10 +1486,14 @@ def main() -> None:
     print(f"layers={model['n_layers']}  d_model={model['d_model']}  ffn_dim={model['ffn_dim']}")
     if cal is not None:
         print(f"  calibration: {args.calibration_json!r}  (t_floor_ms={cal['t_floor_ms']}, scale={cal['scale']})")
-    if phys.get("attn_scale_by_batch") and int(args.batch_size) in phys["attn_scale_by_batch"]:
-        psc = float(phys["attn_scale_by_batch"][int(args.batch_size)])
-    else:
-        psc = float(phys["attn_time_scale"]) + float(phys["attn_time_scale_inv_batch"]) / float(args.batch_size)
+    psc = effective_attn_scale(
+        int(args.batch_size),
+        str(kv_key),
+        float(phys["attn_time_scale"]),
+        float(phys["attn_time_scale_inv_batch"]),
+        phys.get("attn_scale_by_batch"),
+        phys.get("attn_scale_by_batch_and_kv"),
+    )
     print(
         f"  sim_physics: kv_attn_byte_mode={phys['kv_attn_byte_mode']!r}  "
         f"attn_scale={phys['attn_time_scale']!r}+inv_B*{phys['attn_time_scale_inv_batch']!r} "

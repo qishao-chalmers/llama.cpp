@@ -598,6 +598,41 @@ def _rep_rate(token_ids, window=20, ngram=3):
     return 1.0 - len(set(grams)) / len(grams)
 
 
+def _period_rep_stop(token_ids, rep_period_min=8, rep_period_max=160,
+                     rep_period_repeats=3, rep_period_similarity=0.92,
+                     rep_min_tokens=256):
+    """Detect a periodic repetition pattern in the generated token sequence.
+
+    For each candidate period p, compares the last p-token block against the
+    (rep_period_repeats-1) preceding p-token blocks.  If every comparison
+    exceeds rep_period_similarity (exact token match fraction), fires.
+
+    Returns (True, period, min_similarity) when detected, else (False, 0, 0.0).
+    Not called until len(token_ids) >= rep_min_tokens.
+    """
+    n = len(token_ids)
+    if n < rep_min_tokens:
+        return False, 0, 0.0
+    for p in range(rep_period_min, rep_period_max + 1):
+        if n < p * rep_period_repeats:
+            continue
+        last_block = token_ids[-p:]
+        sims = []
+        for k in range(1, rep_period_repeats):
+            start = -(p * (k + 1))
+            end   = -(p * k)
+            prev_block = token_ids[start:end]
+            if len(prev_block) != p:
+                break
+            matches = sum(a == b for a, b in zip(last_block, prev_block))
+            sims.append(matches / p)
+        if len(sims) < rep_period_repeats - 1:
+            continue
+        if all(s >= rep_period_similarity for s in sims):
+            return True, p, min(sims)
+    return False, 0, 0.0
+
+
 def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                  max_new_tokens=512, is_eog=None,
                  stop_strings=None,
@@ -606,13 +641,24 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                  stream_text=False,
                  stream_text_stride=1,
                  rep_rate_threshold=0.0,
-                 rep_rate_consecutive=5):
+                 rep_rate_consecutive=5,
+                 rep_period_stop=False,
+                 rep_period_min=8,
+                 rep_period_max=160,
+                 rep_period_repeats=3,
+                 rep_period_similarity=0.92,
+                 rep_min_tokens=256):
     """Greedy autoregressive generation after batch-prefilling the prompt.
 
     Applies the same KV hook as the PPL pass so the quantization conditions
     match exactly.  Returns (generated, diags) where generated is a list of
-    token ids and diags is a dict{"H", "p_max", "self_surp", "rep_rate"} of
-    per-step lists (or None when return_diagnostics=False).
+    token ids and diags is a dict{"stop_reason", ...} — always a dict (never
+    None).  When return_diagnostics=True the dict also includes per-step lists
+    "H", "p_max", "self_surp", "rep_rate".
+
+    stop_reason values: "eog" | "stop_string" | "rep_rate" | "period_repetition"
+    | "max_tokens".
+
     Stops at max_new_tokens, when is_eog(token) returns True, or when any
     string in stop_strings appears in the decoded suffix of the output.
     is_eog: callable(token_id) -> bool, typically lib.llama_vocab_is_eog(vocab, id).
@@ -628,13 +674,21 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     rep_rate_threshold (0.0 = disabled): if the 3-gram repetition rate in the
     last 20 tokens exceeds this value for rep_rate_consecutive steps in a row,
     generation stops early (repetition loop detected).
+
+    rep_period_stop (False = disabled): if a period-p repetition is detected
+    (last rep_period_repeats blocks of length p all have >= rep_period_similarity
+    token overlap), generation stops early.  Only checked after rep_min_tokens
+    tokens have been generated.
     """
     n_prompt = len(prompt_tokens)
     mem = lib.llama_get_memory(ctx)
     lib.llama_memory_clear(mem, True)
 
-    diag_lists = ({"H": [], "p_max": [], "self_surp": [], "rep_rate": []}
-                  if return_diagnostics else None)
+    if return_diagnostics:
+        diag_lists = {"H": [], "p_max": [], "self_surp": [], "rep_rate": [],
+                      "stop_reason": "max_tokens"}
+    else:
+        diag_lists = {"stop_reason": "max_tokens"}
     _rep_consec = 0   # consecutive steps above rep_rate_threshold
 
     # Batch prefill — request logits only for the last prompt token
@@ -659,7 +713,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     # Subsequent tokens come from single-token decode batches where index 0 is correct.
     ptr    = lib.llama_get_logits_ith(ctx, n_prompt - 1)
     logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-    if diag_lists is not None:
+    if return_diagnostics:
         log_q  = llama.log_softmax(logits.astype(np.float32))
         token  = int(np.argmax(log_q))
     else:
@@ -679,7 +733,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
     _stop_check_len = max((len(s) for s in stop_strings), default=0) * 3 + 32 if stop_strings else 0
     _in_think_block = False
 
-    if diag_lists is not None:
+    if return_diagnostics:
         p     = np.exp(log_q)
         H     = -float(np.sum(p * log_q))
         diag_lists["H"].append(H)
@@ -689,6 +743,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
 
     for _ in range(max_new_tokens - 1):
         if is_eog is not None and is_eog(token):
+            diag_lists["stop_reason"] = "eog"
             break
 
         batch = lib.llama_batch_init(1, 0, 1)
@@ -713,7 +768,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
 
         ptr    = lib.llama_get_logits_ith(ctx, 0)
         logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
-        if diag_lists is not None:
+        if return_diagnostics:
             log_q = llama.log_softmax(logits.astype(np.float32))
             token = int(np.argmax(log_q))
         else:
@@ -728,7 +783,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                 print(full[len(prev_stream):], end="", flush=True)
                 prev_stream = full
 
-        if diag_lists is not None:
+        if return_diagnostics:
             p     = np.exp(log_q)
             H     = -float(np.sum(p * log_q))
             ss    = float(log_q[prev_top1])
@@ -738,7 +793,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
             diag_lists["rep_rate"].append(_rep_rate(generated))
         prev_top1 = token
 
-        # Repetition early stop (works even without --save-diags).
+        # Repetition early stop: 3-gram rate (works even without --save-diags).
         if rep_rate_threshold > 0.0:
             rr = _rep_rate(generated)
             if rr >= rep_rate_threshold:
@@ -747,9 +802,26 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
                     import sys
                     print(f"\n[rep-stop] rep_rate={rr:.2f} for {_rep_consec} steps "
                           f"at token {len(generated)} — stopping early", file=sys.stderr)
+                    diag_lists["stop_reason"] = "rep_rate"
                     break
             else:
                 _rep_consec = 0
+
+        # Repetition early stop: periodic pattern detector.
+        if rep_period_stop:
+            fired, period, sim = _period_rep_stop(
+                generated,
+                rep_period_min=rep_period_min,
+                rep_period_max=rep_period_max,
+                rep_period_repeats=rep_period_repeats,
+                rep_period_similarity=rep_period_similarity,
+                rep_min_tokens=rep_min_tokens)
+            if fired:
+                import sys
+                print(f"\n[period-rep-stop] period={period} sim={sim:.3f} "
+                      f"at token {len(generated)} — stopping early", file=sys.stderr)
+                diag_lists["stop_reason"] = "period_repetition"
+                break
 
         if stop_strings and len(generated) >= 4:
             tail = generated[-_stop_check_len:] if _stop_check_len else generated
@@ -761,6 +833,7 @@ def run_generate(lib, ctx, vocab, prompt_tokens, n_vocab, kv_hook=None,
             if "</think>" in tail_text or "<|channel|>final" in tail_text:
                 _in_think_block = False
             if not _in_think_block and any(s in tail_text for s in stop_strings):
+                diag_lists["stop_reason"] = "stop_string"
                 break
 
     if kv_hook:

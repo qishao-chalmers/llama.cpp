@@ -65,7 +65,7 @@ import os
 import re
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -406,19 +406,140 @@ def roofline_ms(model_name: str, hw_name: str, weight_bits: float,
     return t_step / batch_size * 1000.0   # ms per token
 
 
+# Native GPU KV quants (q8_0, q4_0) are *slower* than fp16 despite fewer bytes
+# because flash-attention must dequantize compressed KV tiles before use.  The
+# dequant latency is approximately per-kernel-call (fixed), not per-byte, so
+# q4_0 ≈ q8_0 in wall time.  Applying a bytes-only model badly mispredicts KV
+# latency for these types.  Use fp16 bytes × overhead as effective KV bytes.
+#
+# Overhead values from roofline_calibration.md (B=1 low end; B=32 high end):
+#   f16:  1.00 (no dequant)
+#   q8_0: 1.08 (dequant adds ~8–22% vs fp16 depending on B)
+#   q4_0: 1.08 (same kernel path as q8_0 — different table size, same overhead)
+KV_DEQUANT_OVERHEAD = {
+    "f16":  1.00,
+    "q8_0": 1.08,
+    "q4_0": 1.08,
+}
+
+
+def roofline_decompose_ms(model_name: str, hw_name: str, weight_bits: float,
+                           kv_type: str, ctx_len: int, batch_size: int = 1,
+                           ) -> tuple[float, float]:
+    """Weight-only and KV-only roofline components, each in ms per token.
+
+    The standard roofline_ms() uses a single bandwidth pool:
+        roof_ms = (w_bytes + kv_bpt*ctx*B) / (bw_eff * B) * 1000
+                = w_bytes/(bw_eff*B)*1000 + kv_bpt*ctx/bw_eff*1000
+
+    This function returns those two additive terms separately so a three-parameter
+    calibration can fit independent correction factors (alpha, beta):
+        predicted_ms = T_floor/B + alpha * wt_ms + beta * kv_ms
+
+    KV component uses *effective* bytes, not storage bytes:
+        - fp16: fp16 bytes (no dequant)
+        - q8_0/q4_0: fp16 bytes × KV_DEQUANT_OVERHEAD (dequant costs ≈ reading fp16)
+
+    Using storage bytes (as roofline_ms() does) gives accurate results only per-slice
+    because each slice has one kv_type and absorbs the overhead into its own scale.
+    The effective-byte model is needed for global multi-quant pooled fits.
+
+    Returns (wt_ms_per_tok, kv_ms_per_tok), or (nan, nan) on unknown model/hw.
+    """
+    if not HAS_PERF_MODEL:
+        return float("nan"), float("nan")
+    model = dict(MODEL_PRESETS.get(model_name, {}))
+    if not model:
+        return float("nan"), float("nan")
+    hw = HARDWARE_PRESETS.get(hw_name)
+    if hw is None:
+        return float("nan"), float("nan")
+
+    model["weight_bits"] = weight_bits
+    fp16_kv_bpt = kv_bytes_per_token("fp16", model)
+    w_bytes     = weight_bytes(model)
+    bw_eff      = hw["memory_bw_gbps"] * 1e9 * hw["efficiency"]
+
+    # Effective KV bytes: fp16 × overhead (dequant cost dominates byte savings for GPU quants)
+    overhead = KV_DEQUANT_OVERHEAD.get(kv_type.lower(), 1.0)
+    kv_bpt_eff = fp16_kv_bpt * overhead
+
+    # Weight: read once per step, amortised over batch_size tokens
+    wt_ms = w_bytes / bw_eff / batch_size * 1000.0
+    # KV: read for every sequence; per-token = kv_bpt_eff * ctx_len (independent of B)
+    kv_ms = kv_bpt_eff * ctx_len / bw_eff * 1000.0
+
+    return wt_ms, kv_ms
+
+
+def load_roofline_calibration_json(path: str) -> Optional[dict[str, Any]]:
+    """Load JSON from fit_roofline_calibration.py (t_floor_ms + scale)."""
+
+    with open(os.path.expanduser(path), encoding="utf-8") as f:
+        cal = json.load(f)
+    for k in ("t_floor_ms", "scale", "model_preset", "hw"):
+        if k not in cal:
+            print(f"[warn] calibration JSON missing {k!r}; ignoring {path}", file=sys.stderr)
+            return None
+    return cal
+
+
+def calibrated_decode_ms_per_tok(roof_ms: float, batch_size: int, cal: dict) -> float:
+    """measured_ms ≈ t_floor_ms / batch_size + scale * roofline_ms (fit from cluster)."""
+
+    return float(cal["t_floor_ms"]) / float(batch_size) + float(cal["scale"]) * float(roof_ms)
+
+
+def row_matches_roofline_calibration(
+    cal: dict,
+    *,
+    model_preset: str,
+    hw: str,
+    weight_tag: str,
+    kv_type: str,
+    prompt_len: int,
+) -> bool:
+    if str(cal.get("model_preset")) != str(model_preset):
+        return False
+    if str(cal.get("hw")) != str(hw):
+        return False
+    wt = cal.get("weight_tag")
+    if wt is not None and str(wt) != str(weight_tag):
+        return False
+    kv = cal.get("kv_type")
+    if kv is not None and str(kv).lower() != str(kv_type).lower():
+        return False
+    if cal.get("prompt_len_filter") is not None:
+        if int(prompt_len) != int(cal["prompt_len_filter"]):
+            return False
+    return True
+
+
 def print_table(rows: list, title: str):
     """Print a formatted results table.
 
     rows: list of dicts with keys: weight_tag, kv_type, prompt_len, decode_len,
           batch_size, measured_ms, roofline_ms, calib_factor, speedup_vs_f16, tok_per_s
+          optional: roofline_calibrated_ms
     """
+    def _sf(x) -> float:
+        if x is None:
+            return float("nan")
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return float("nan")
+
     W = 120
+    has_cal = any(not math.isnan(_sf(r.get("roofline_calibrated_ms"))) for r in rows)
     print(f"\n{'═'*W}")
     print(f"  {title}")
     print(f"{'─'*W}")
     hdr = (f"  {'weight':>8} {'kv':>6} {'prompt+dec':>12} {'B':>4} "
-           f"{'ms/tok':>9} {'tok/s':>8} {'roof ms/tok':>12} {'calib':>7} "
-           f"{'speedup':>8}  note")
+           f"{'ms/tok':>9} {'tok/s':>8} {'roof ms/tok':>12} {'calib':>7} ")
+    if has_cal:
+        hdr += f"{'roof cal':>10} {'c2':>6} "
+    hdr += f"{'speedup':>8}  note"
     print(hdr)
     print(f"{'─'*W}")
 
@@ -444,6 +565,14 @@ def print_table(rows: list, title: str):
         r["speedup_vs_f16"] = speedup
         r["tok_per_s"]      = tps
 
+        roof_cal = _sf(r.get("roofline_calibrated_ms"))
+        calib2 = (
+            meas / roof_cal
+            if (roof_cal > 0 and not math.isnan(roof_cal))
+            else float("nan")
+        )
+        r["calib_factor_vs_calibrated"] = calib2
+
         cur_group = (r["weight_tag"], r["prompt_len"], r["decode_len"])
         if prev_group is not None and cur_group != prev_group:
             print()
@@ -455,11 +584,19 @@ def print_table(rows: list, title: str):
         note    = ("← base" if r["kv_type"] == "f16"
                    else f"bw_ratio={KV_EFFECTIVE_BPE[r['kv_type']]/2:.3f}")
 
-        print(f"  {r['weight_tag']:>8} {r['kv_type']:>6}"
-              f" {r['prompt_len']:>6}+{r['decode_len']:<5}"
-              f" {r['batch_size']:>4} "
-              f"{meas:>9.3f} {tps:>8.1f} {roof_s:>12} {calib_s:>7} "
-              f"{spd_s:>8}  {note}")
+        line = (
+            f"  {r['weight_tag']:>8} {r['kv_type']:>6}"
+            f" {r['prompt_len']:>6}+{r['decode_len']:<5}"
+            f" {r['batch_size']:>4} "
+            f"{meas:>9.3f} {tps:>8.1f} {roof_s:>12} {calib_s:>7} "
+        )
+        if has_cal:
+            rc = _sf(r.get("roofline_calibrated_ms"))
+            rc_s = f"{rc:.3f}" if not math.isnan(rc) else "   n/a "
+            c2_s = f"{calib2:.2f}×" if not math.isnan(calib2) else "  n/a "
+            line += f"{rc_s:>10} {c2_s:>6} "
+        line += f"{spd_s:>8}  {note}"
+        print(line)
 
     print(f"\n{'═'*W}")
 
@@ -602,8 +739,26 @@ def main():
                    help="Save calibration JSON (also updates bootstrap_ms_quant_example.json entries)")
     p.add_argument("--lib", default=None,
                    help="Path to libllama.so (default: build_release/bin/libllama.so)")
+    p.add_argument(
+        "--roofline-calibration-json",
+        default=None,
+        metavar="PATH",
+        help="JSON from fit_roofline_calibration.py: adds roofline_calibrated_ms = "
+             "t_floor_ms/B + scale*roofline_ms when model/hw/weight/kv match",
+    )
 
     args = p.parse_args()
+
+    roofline_calib: Optional[dict] = None
+    if args.roofline_calibration_json:
+        roofline_calib = load_roofline_calibration_json(args.roofline_calibration_json)
+        if roofline_calib:
+            print(
+                f"[info] loaded roofline calibration: "
+                f"t_floor_ms={roofline_calib['t_floor_ms']}  scale={roofline_calib['scale']} "
+                f"({args.roofline_calibration_json})",
+                file=sys.stderr,
+            )
 
     # Load library
     lib_path = args.lib or os.path.join(_SCRIPT_DIR, "../../build_release/bin/libllama.so")
@@ -690,6 +845,23 @@ def main():
                                             kv_type_name, mid_ctx, batch_size=batch_size)
                                 if model_preset else float("nan"))
 
+                        roof_cal = float("nan")
+                        if (
+                            roofline_calib is not None
+                            and model_preset
+                            and not math.isnan(roof)
+                            and row_matches_roofline_calibration(
+                                roofline_calib,
+                                model_preset=model_preset,
+                                hw=args.hw,
+                                weight_tag=weight_tag,
+                                kv_type=kv_type_name,
+                                prompt_len=prompt_len,
+                            )
+                        ):
+                            roof_cal = calibrated_decode_ms_per_tok(
+                                roof, batch_size, roofline_calib)
+
                         tps = 1000.0 / ms if ms > 0 else 0.0
                         print(f"{ms:.3f} ms/tok  ({tps:.1f} tok/s)  "
                               + (f"roofline={roof:.3f}" if not math.isnan(roof) else ""))
@@ -711,6 +883,7 @@ def main():
                             "measured_ms":   ms,
                             "tok_per_s":     tps,
                             "roofline_ms":   roof,
+                            "roofline_calibrated_ms": roof_cal,
                             "calib_factor":  float("nan"),
                             "speedup_vs_f16": float("nan"),
                             "prefill_buckets": pre_buckets,
@@ -756,6 +929,8 @@ def main():
             "_comment": (
                 "Calibration data from benchmark_kv_timing.py. "
                 "calib_factor = measured_ms / roofline_ms (roofline at mid_ctx). "
+                "roofline_calibrated_ms = t_floor_ms/B + scale*roofline_ms when "
+                "--roofline-calibration-json matches. "
                 "Use mean_calib to scale roofline projections for int2/int3/int4. "
                 "Top-level decode_lens lists all timed decode lengths in this file; "
                 "each row has its own decode_len."
@@ -772,6 +947,15 @@ def main():
             # bootstrap_ms_quant: keyed by scenario (prompt, decode, mid_ctx in label)
             "bootstrap_ms_quant": {}
         }
+        if args.roofline_calibration_json:
+            out_data["roofline_calibration_file"] = args.roofline_calibration_json
+            if roofline_calib:
+                out_data["roofline_calibration"] = {
+                    "t_floor_ms": roofline_calib["t_floor_ms"],
+                    "scale": roofline_calib["scale"],
+                    "model_preset": roofline_calib["model_preset"],
+                    "hw": roofline_calib["hw"],
+                }
 
         for r in all_rows:
             base    = f16_base.get((r["weight_tag"], r["prompt_len"], r["decode_len"],

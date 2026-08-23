@@ -163,6 +163,7 @@ def main() -> None:
                 attn_time_scale=float(phys["attn_time_scale"]),
                 attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
                 attn_scale_by_batch=phys.get("attn_scale_by_batch"),
+                attn_scale_by_batch_and_kv=phys.get("attn_scale_by_batch_and_kv"),
                 weight_tag=wtag_res or str(tag),
                 weight_time_scale_by_tag=None,  # IMPORTANT: baseline split (scale=1)
             )

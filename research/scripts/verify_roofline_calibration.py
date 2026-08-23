@@ -68,10 +68,10 @@ def _run_one(
         n_decode: int,
         weight_tag: str,
         native_kv: str,
+        bucket_policy: str = "mean",
 ) -> tuple[str, Dict[str, Any]]:
     kvq = NATIVE_KV_TO_ROOFLINE.get(native_kv, "fp16")
     ckv = native_kv
-    # Row-level check: compare to measured_ms (mean). match_ctx would use decode_buckets.
     cmd = [
         sys.executable,
         ROOFLINE,
@@ -83,7 +83,7 @@ def _run_one(
         "--kv-quant", kvq,
         "--main-gguf-quant", weight_tag,
         "--calibration-kv-type", ckv,
-        "--calibration-bucket-policy", "mean",
+        "--calibration-bucket-policy", bucket_policy,
         "--calibration-json", profile_path,
     ]
     p = subprocess.run(
@@ -115,6 +115,9 @@ def main() -> None:
         "--profiles", nargs="*", metavar="PATH",
         help="Explicit kv_timing JSON paths (skip glob if set)")
     ap.add_argument("--hw", default="h100-sxm")
+    ap.add_argument(
+        "--bucket-policy", choices=("mean", "match_ctx"), default="mean",
+        help="mean=full-decode average (default); match_ctx=decode_bucket closest to roofline avg_ctx")
     ap.add_argument(
         "-o", "--output",
         default=os.path.join(_REPO_ROOT, "research", "results", "roofline_calibration_verify.json"),
@@ -166,6 +169,7 @@ def main() -> None:
                 n_decode=int(row["decode_len"]),
                 weight_tag=wtag,
                 native_kv=kv_t,
+                bucket_policy=args.bucket_policy,
             )
             ps = meta.get("parsed_measured_ms")
             scale = meta.get("decode_scale")

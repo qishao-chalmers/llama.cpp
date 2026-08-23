@@ -318,7 +318,12 @@ def tokenize(lib, vocab, text: str, buf_size: int = 400_000) -> list:
     buf = (ctypes.c_int32 * buf_size)()
     n = lib.llama_tokenize(vocab, text_bytes, len(text_bytes), buf, buf_size, False, True)
     if n < 0:
-        raise RuntimeError(f"tokenize failed, need buffer of {-n}")
+        # Buffer too small — retry with the exact required size
+        buf_size = -n
+        buf = (ctypes.c_int32 * buf_size)()
+        n = lib.llama_tokenize(vocab, text_bytes, len(text_bytes), buf, buf_size, False, True)
+        if n < 0:
+            raise RuntimeError(f"tokenize failed, need buffer of {-n}")
     return list(buf[:n])
 
 

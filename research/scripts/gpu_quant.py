@@ -128,6 +128,21 @@ def _quantize_inplace_gpu(arr, fn_name, dim_group_size=None):
         arr[:] = (q * scale).astype(cp.float16)
 
 
+def gpu_kv_cache_supported(lib, ctx, n_layer: int) -> bool:
+    """Return True if llama_get_kv_layer_info works for this context.
+
+    The C API only supports the classic ``llama_kv_cache`` backend.  Models that
+    use hybrid memory (e.g. Qwen3.5) or ``llama_kv_cache_iswa`` expose a
+    different ``llama_memory_i`` implementation, so the cast fails and the
+    function returns -1.  Callers must fall back to CPU ``parse_state`` hooks.
+    """
+    if not HAS_CUPY or n_layer <= 0:
+        return False
+    infos = (llama.LlamaKVLayerInfo * n_layer)()
+    n_filled = lib.llama_get_kv_layer_info(ctx, infos, n_layer)
+    return n_filled > 0
+
+
 def apply_kv_hook_gpu(lib, ctx, n_layer, k_fn_names, v_fn_names,
                       n_new_k=None, n_new_v=None, profile=None):
     """

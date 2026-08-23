@@ -113,6 +113,7 @@ def main() -> None:
                 attn_time_scale=float(phys["attn_time_scale"]),
                 attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
                 attn_scale_by_batch=phys.get("attn_scale_by_batch"),
+                attn_scale_by_batch_and_kv=phys.get("attn_scale_by_batch_and_kv"),
             )
             xs_inv_b.append(1.0 / B)
             xs_lay.append(lay)

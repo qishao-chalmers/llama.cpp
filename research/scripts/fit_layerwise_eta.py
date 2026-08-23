@@ -195,6 +195,7 @@ def main() -> None:
                 attn_time_scale=float(phys["attn_time_scale"]),
                 attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
                 attn_scale_by_batch=phys.get("attn_scale_by_batch"),
+                attn_scale_by_batch_and_kv=phys.get("attn_scale_by_batch_and_kv"),
             )
             out.append(pred - row["measured_ms"])
         return np.array(out, dtype=float)

@@ -31,13 +31,22 @@ The state blob format for llama_state_seq_get_data(ctx, buf, size, seq_id=0):
           for j in 0..n_embd_v_gqa:
             uint8[] raw V col data  (v_size_el * cell_count bytes)
 
-GGML types: 0=F32, 1=F16, 2=Q4_0, ..., 30=BF16
+GGML types: 0=F32, 1=F16, 2=Q4_0, ..., 30=BF16, 39=MXFP4 (Hopper GPU default for FA)
+
+Note: only F16/F32/BF16 KV types can be modified via state blob.  If the model
+stores KV in another type (e.g. MXFP4 on GH200 with flash-attn), apply_kv_hook
+prints a one-time warning and becomes a no-op for the rest of the run.
 """
 
 import ctypes
 import struct
 import time
 import numpy as np
+
+# Set to True after the first unsupported KV type is encountered so that all
+# subsequent apply_kv_hook calls are instant no-ops (avoids repeated expensive
+# state get/set and repeated warnings).
+_kv_parse_disabled: bool = False
 
 # GGML type to numpy dtype
 GGML_TYPE_F32 = 0
@@ -319,7 +328,8 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
 
     Returns: KVState (with modified arrays)
     """
-    if k_fn is None and v_fn is None:
+    global _kv_parse_disabled
+    if k_fn is None and v_fn is None or _kv_parse_disabled:
         return None
 
     if profile is not None:
@@ -334,7 +344,18 @@ def apply_kv_hook(lib, ctx, CP, k_fn=None, v_fn=None, seq_id: int = 0,
         profile.kv_get_s += time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    state = parse_kv_state(bytes(buf[:n_written]), n_pos_per_embd)
+    try:
+        state = parse_kv_state(bytes(buf[:n_written]), n_pos_per_embd)
+    except NotImplementedError as e:
+        _kv_parse_disabled = True
+        import re
+        m = re.search(r'type (\d+)', str(e))
+        kv_type = int(m.group(1)) if m else '?'
+        print(f"\n[WARN] KV quantization disabled for this model: {e}"
+              f"\n       (GGML type {kv_type} in state blob; likely MXFP4 on Hopper GPU)"
+              f"\n       KV cache will remain unmodified (no int2/int3/int4 applied).",
+              flush=True)
+        return None
     if profile is not None:
         profile.kv_parse_s += time.perf_counter() - t0
 

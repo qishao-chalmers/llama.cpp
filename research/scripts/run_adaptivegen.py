@@ -594,9 +594,10 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
         - draft_ctx generates adaptive_window tokens
         - verifier_ctx teacher-forces them, returns per-step logits
         - accept the longest prefix that passes adaptive_verify_accept
-        - commit by replaying on verifier only, then copy KV verifier → draft
+        - commit by replaying on verifier only, then optionally copy KV verifier → draft
+          (see --sync-draft-kv / --no-sync-draft-kv)
       Else:
-        - verifier-only greedy decode (one token at a time); sync draft KV from verifier
+        - verifier-only greedy decode (one token at a time); optional draft KV sync
 
     stop_strings: optional list; if empty/None, only EOG/EOS and max_gen apply.
     When non-empty, shared StopStringState across bootstrap + rollout.
@@ -605,6 +606,10 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
     draft_ctx    = _make_ctx(lib, model, args, split2_mode_init=1)
     _set_mode(lib, verifier_ctx, 0)
     _set_mode(lib, draft_ctx,    1)
+
+    def _maybe_sync_draft_from_verifier() -> None:
+        if getattr(args, "sync_draft_kv", True):
+            _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
 
     is_eog = lambda tok: bool(lib.llama_vocab_is_eog(vocab, tok))
     stop_state = strategies.StopStringState() if (stop_strings or args.stop_on_answer) else None
@@ -690,7 +695,7 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
             ret = strategies._single_decode(lib, verifier_ctx, token, pos)
             if ret != 0:
                 break
-            _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
+            _maybe_sync_draft_from_verifier()
             ptr    = lib.llama_get_logits_ith(verifier_ctx, 0)
             logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
             token  = int(np.argmax(logits))
@@ -754,7 +759,7 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
             strategies.restore_kv_state(lib, verifier_ctx, v_blob)
             strategies.restore_kv_state(lib, draft_ctx,    d_blob)
             strategies._single_decode(lib, verifier_ctx, token, pos)
-            _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
+            _maybe_sync_draft_from_verifier()
             token = next_tok
             generated.append(token)
             pos += 1
@@ -784,7 +789,7 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
                 if strategies.check_answer_regex(lib, vocab, generated, args._ans_re, stop_state):
                     hit_stop_commit = True
                     break
-        _sync_draft_kv_from_verifier(lib, verifier_ctx, draft_ctx)
+        _maybe_sync_draft_from_verifier()
         n_accept += acc_len
         if hit_stop_commit:
             break
@@ -799,6 +804,7 @@ def run_switch(lib, model, vocab, n_vocab: int, args,
     accept_rate = n_accept / n_verify_steps if n_verify_steps > 0 else 0.0
     return {
         "mode":                  "switch",
+        "sync_draft_kv":         bool(getattr(args, "sync_draft_kv", True)),
         "n_prompt":              len(prompt_tokens),
         "n_generated":           n_gen,
         "agree_rate_bootstrap":  round(agree_rate,   4),
@@ -879,6 +885,14 @@ def main():
                     help="Draft tokens per rollout window.")
     ap.add_argument("--min-agree-rate",   type=float, default=0.7,
                     help="Fall back to verifier-only if bootstrap agree-rate is below this.")
+    ap.add_argument(
+        "--sync-draft-kv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In --mode switch: after verifier commits or fallback, copy KV verifier→draft "
+             "(default: on). Use --no-sync-draft-kv so the draft keeps its own KV; "
+             "compare accept_rate_rollout vs baseline to see drift effects.",
+    )
     ap.add_argument("--verify-top-k",     type=int,   default=None)
     ap.add_argument("--verify-top-p",     type=float, default=None)
 
@@ -1018,7 +1032,8 @@ def main():
         results.append(r)
         extra = ""
         if args.mode == "switch":
-            extra = (f"  agree={r['agree_rate_bootstrap']:.2f}"
+            extra = (f"  sync_kv={r.get('sync_draft_kv', True)}"
+                     f"  agree={r['agree_rate_bootstrap']:.2f}"
                      f"  accept={r['accept_rate_rollout']:.2f}"
                      f"  n_draft={r['n_draft_steps']}")
         ev = ""

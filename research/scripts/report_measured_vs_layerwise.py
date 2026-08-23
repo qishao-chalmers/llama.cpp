@@ -70,6 +70,12 @@ def _fmt(x: float, width: int = 9) -> str:
     return f"{x:{width}.4f}"
 
 
+def _ms_per_tok_to_tok_s(ms_per_tok: float) -> float:
+    if ms_per_tok <= 0 or math.isnan(ms_per_tok) or math.isinf(ms_per_tok):
+        return float("nan")
+    return 1000.0 / float(ms_per_tok)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -96,6 +102,17 @@ def main() -> None:
     )
     ap.add_argument("--sim-physics-json", default=None, help="sim_physics JSON (weight scaling, etc.)")
     ap.add_argument("--calibration-json", default=None, help="Optional calibration JSON (t_floor_ms, scale)")
+    ap.add_argument("--auto-sim-physics", action="store_true",
+                    help="Auto-pick sim_physics JSON from the same directory as each measured JSON "
+                         "(prefers sim_physics_*with_weight_scale.json).")
+    ap.add_argument("--auto-calibration", action="store_true",
+                    help="Auto-pick layerwise_calibration_h100.json from the same directory as each measured JSON "
+                         "(falls back to global --calibration-json if not found).")
+    ap.add_argument("--use-gguf-bytes", action="store_true",
+                    help="Use GGUF per-tensor byte sizes for weight bytes when possible. "
+                         "Attempts to locate GGUF by measured row's model_path basename in --gguf-dir search paths.")
+    ap.add_argument("--gguf-dir", action="append", default=[],
+                    help="Directory to search for GGUF files (can be repeated).")
     ap.add_argument("--kv-group-size", type=int, default=None)
     ap.add_argument("--kv-asymmetric", action="store_true")
     ap.add_argument("--attn-impl", default="simple", choices=["simple", "flash"])
@@ -110,6 +127,12 @@ def main() -> None:
     ap.add_argument("--only-weight-tag", default=None, help="Filter: weight_tag (e.g. Q8_0)")
     ap.add_argument("--only-batch", type=int, default=0, help="Filter: batch_size (0=all)")
     ap.add_argument("--max-rows", type=int, default=0, help="Limit rows printed (0=all)")
+    ap.add_argument(
+        "--unit",
+        default="ms_per_tok",
+        choices=["ms_per_tok", "tok_s"],
+        help="Reporting unit. tok_s is derived as 1000/(ms/tok).",
+    )
     ap.add_argument(
         "--summary-only",
         action="store_true",
@@ -164,13 +187,74 @@ def main() -> None:
             "eta_kv": float(pj["eta_kv"]),
             "t_floor_ms": float(pj["t_floor_ms"]),
         }
-    phys = sim.resolve_sim_physics(
+    phys_global = sim.resolve_sim_physics(
         args.sim_physics_json,
         kv_attn_byte_mode=args.kv_attn_byte_mode,
         attn_time_scale=args.attn_time_scale,
         attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
     )
-    cal = sim.load_calibration_json(args.calibration_json) if args.calibration_json else None
+    cal_global = sim.load_calibration_json(args.calibration_json) if args.calibration_json else None
+
+    gguf_bytes_cache: dict[str, dict[str, int]] = {}
+
+    def _pick_sim_physics_for_file(measured_path: str) -> dict[str, Any]:
+        if not args.auto_sim_physics:
+            return dict(phys_global)
+        d = os.path.dirname(os.path.abspath(measured_path))
+        # Prefer the commonly used file name in this repo.
+        candidates = []
+        try:
+            import glob
+            candidates.extend(sorted(glob.glob(os.path.join(d, "sim_physics_*with_weight_scale*.json"))))
+            candidates.extend(sorted(glob.glob(os.path.join(d, "sim_physics_*.json"))))
+        except Exception:
+            pass
+        sp = next((p for p in candidates if os.path.isfile(p)), None)
+        if not sp:
+            return dict(phys_global)
+        return sim.resolve_sim_physics(
+            sp,
+            kv_attn_byte_mode=args.kv_attn_byte_mode,
+            attn_time_scale=args.attn_time_scale,
+            attn_time_scale_inv_batch=args.attn_time_scale_inv_batch,
+        )
+
+    def _pick_calibration_for_file(measured_path: str) -> Optional[dict[str, Any]]:
+        if not args.auto_calibration:
+            return cal_global
+        d = os.path.dirname(os.path.abspath(measured_path))
+        cand = os.path.join(d, "layerwise_calibration_h100.json")
+        if os.path.isfile(cand):
+            return sim.load_calibration_json(cand)
+        return cal_global
+
+    def _find_gguf_for_row(r: dict[str, Any]) -> Optional[str]:
+        mp = r.get("model_path")
+        if not mp:
+            return None
+        base = os.path.basename(str(mp))
+        if not base.endswith(".gguf"):
+            return None
+        search_dirs = list(args.gguf_dir)
+        # Common local location in this workspace
+        search_dirs.append("/home/qshao/Project/Fun/models")
+        for d in search_dirs:
+            if not d:
+                continue
+            p = os.path.join(os.path.abspath(os.path.expanduser(d)), base)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _gguf_bytes_for_row(r: dict[str, Any]) -> Optional[dict[str, int]]:
+        if not args.use_gguf_bytes:
+            return None
+        gp = _find_gguf_for_row(r)
+        if not gp:
+            return None
+        if gp not in gguf_bytes_cache:
+            gguf_bytes_cache[gp] = sim.load_gguf_tensor_n_bytes(gp)
+        return gguf_bytes_cache[gp]
 
     model_cache: dict[str, dict[str, Any]] = {}
 
@@ -186,7 +270,13 @@ def main() -> None:
         model_cache[preset] = dict(m)
         return model_cache[preset]
 
-    hdr = f"{'preset':10s} {'wtag':8s} {'kv':6s} {'B':>3s} {'mid':>5s} {'meas':>9s} {'pred':>9s} {'err':>9s} {'pred/meas':>9s}"
+    meas_lbl = "meas_tok/s" if args.unit == "tok_s" else "meas_ms"
+    pred_lbl = "pred_tok/s" if args.unit == "tok_s" else "pred_ms"
+    err_lbl = "err_tok/s" if args.unit == "tok_s" else "err_ms"
+    hdr = (
+        f"{'preset':10s} {'wtag':8s} {'kv':6s} {'B':>3s} {'mid':>5s} "
+        f"{meas_lbl:>9s} {pred_lbl:>9s} {err_lbl:>9s} {'pred/meas':>9s}"
+    )
     all_errs: list[float] = []
     all_ratios: list[float] = []
 
@@ -248,6 +338,8 @@ def main() -> None:
         if not rows:
             print(f"[skip] no rows: {measured_path!r}", file=sys.stderr)
             continue
+        phys = _pick_sim_physics_for_file(measured_path)
+        cal = _pick_calibration_for_file(measured_path)
 
         errs: list[float] = []
         ratios: list[float] = []
@@ -306,6 +398,7 @@ def main() -> None:
 
             kv_key = sim.resolve_kv_quant_key(kv_cli)
             m = get_model(mp)
+            gguf_tb = _gguf_bytes_for_row(r)
             if use_pipeline:
                 pred_raw = sim.predict_ms_per_token_pipeline(
                     m,
@@ -320,7 +413,7 @@ def main() -> None:
                     kv_quant_key=kv_key,
                     kv_group_size=args.kv_group_size,
                     kv_asym=bool(args.kv_asymmetric),
-                    gguf_tensor_bytes=None,
+                    gguf_tensor_bytes=gguf_tb,
                 )
                 pred = float(pred_raw)
             else:
@@ -335,7 +428,7 @@ def main() -> None:
                     kv_quant_key=kv_key,
                     kv_group_size=args.kv_group_size,
                     kv_asym=bool(args.kv_asymmetric),
-                    gguf_tensor_bytes=None,
+                    gguf_tensor_bytes=gguf_tb,
                     attn_impl=args.attn_impl,
                     fa_bc=int(args.fa_bc),
                     attn_naive_spill=bool(args.attn_naive_spill),
@@ -343,6 +436,7 @@ def main() -> None:
                     attn_time_scale=float(phys["attn_time_scale"]),
                     attn_time_scale_inv_batch=float(phys["attn_time_scale_inv_batch"]),
                     attn_scale_by_batch=phys.get("attn_scale_by_batch"),
+                    attn_scale_by_batch_and_kv=phys.get("attn_scale_by_batch_and_kv"),
                     weight_tag=wtag,
                     weight_time_scale_by_tag=phys.get("weight_time_scale_by_tag"),
                 )
@@ -356,11 +450,18 @@ def main() -> None:
                     float(cal["scale"]),
                 )
 
-            err = pred - meas
-            ratio = pred / meas
+            if args.unit == "tok_s":
+                meas_u = _ms_per_tok_to_tok_s(meas)
+                pred_u = _ms_per_tok_to_tok_s(pred)
+            else:
+                meas_u = float(meas)
+                pred_u = float(pred)
+
+            err = pred_u - meas_u
+            ratio = pred_u / meas_u
             if not args.summary_only:
                 print(f"{mp:10s} {wtag:8s} {kv_cli:6s} {B:3d} {mid:5d} "
-                      f"{_fmt(meas)} {_fmt(pred)} {_fmt(err)} {ratio:9.3f}")
+                      f"{_fmt(meas_u)} {_fmt(pred_u)} {_fmt(err)} {ratio:9.3f}")
 
             errs.append(err)
             ratios.append(ratio)

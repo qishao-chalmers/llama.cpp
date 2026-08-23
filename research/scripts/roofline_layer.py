@@ -58,14 +58,38 @@ Usage:
         --n-prompt 2048 --n-decode 4096 --kv-quant fp16 --main-gguf-quant Q8_0 \\
         --calibration-json research/results/qwen3-8b/profile/kv_timing_h100.json
 
+    # Fit decode overlays — input can be CSV from sweep_batched_bench.py or the
+    # DECODE DURATION paste from stderr (e.g. research/results/decode_sweep.txt).
+    python3 research/scripts/roofline_layer.py --model qwen3-8b --hw h100-sxm \\
+        --main-gguf-quant Q8_0 --sweep-fit --sweep-csv research/results/decode_sweep.txt \\
+        --sweep-calibration-out research/results/qwen3-8b_h100_decode_cal_cuda_perf.json
+
+    python3 research/scripts/roofline_layer.py --model qwen3-14b --hw h100-sxm \\
+        --main-gguf-quant Q8_0 --sweep-fit --sweep-csv research/results/decode_sweep_Qwen3-14B.txt \\
+        --sweep-calibration-out research/results/qwen3-14b_h100_decode_cal_cuda_perf.json
+
+    python3 research/scripts/roofline_layer.py --model qwen3-8b --hw h100-sxm \\
+        --decode-calibration-json research/results/qwen3-8b_h100_decode_cal_cuda_perf.json \\
+        --n-prompt 8192 --n-decode 128 --batch-size 8
+
+    python3 research/scripts/roofline_layer.py --model qwen3-8b --hw h100-sxm \\
+        --main-gguf-quant Q8_0 --sweep-family-analysis --sweep-family-only \\
+        --sweep-csv research/results/decode_sweep.txt
+
+    # Residual trends from the same sweep (no JSON): fits Δms per CUDA PERF category vs
+    # batch (npl) and context; replaces scalar decode overlays for this run.
+    python3 research/scripts/roofline_layer.py --model qwen3-8b --hw h100-sxm \\
+        --main-gguf-quant Q8_0 --sweep-trends --sweep-csv research/results/decode_sweep.txt \\
+        --n-prompt 4096 --n-decode 512 --batch-size 4
+
     # Build a report of measured vs analytic ms/tok for every row in downloaded profiles:
     python3 research/scripts/build_roofline_calibration_report.py \\
         -o research/results/roofline_real_calibration_report.json
 """
 
-import argparse, json, math, os, sys
+import argparse, copy, csv, json, math, os, random, re, sys
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 # ── Re-use presets from perf_model.py if available ───────────────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -76,7 +100,7 @@ except ImportError:
     # Inline minimal presets so the script is self-contained
     MODEL_PRESETS = {
         "qwen3-8b": dict(n_layers=36, d_model=4096, n_heads=32, n_kv_heads=8,
-                         head_dim=128, ffn_dim=11008, ffn_style="swiglu", weight_bits=16),
+                         head_dim=128, ffn_dim=12288, ffn_style="swiglu", weight_bits=16),
         "qwen3-14b": dict(n_layers=40, d_model=5120, n_heads=40, n_kv_heads=8,
                           head_dim=128, ffn_dim=17920, ffn_style="swiglu", weight_bits=16),
         "llama4-scout-17b": dict(n_layers=48, d_model=5120, n_heads=40, n_kv_heads=8,
@@ -119,6 +143,29 @@ ROOFLINE_OP_TO_BUCKET = {
     "ffn_gate_up": "mlp",
     "ffn_down":    "mlp",
     "ffn_up":      "mlp",
+}
+
+# Effective attention-BW multiplier relative to fp16, derived from cluster measurements.
+#
+# Native GPU KV quants (llama.cpp q8_0 / q4_0):
+#   Measured q8_0/f16 ratio ≈ 1.07–1.10× SLOWER across all (model, weight, B) combinations.
+#   Dequantization overhead inside the flash-attention kernel exceeds the bandwidth savings.
+#   q4_0 shows the same overhead as q8_0 — the dequant cost is fixed per kernel call,
+#   not proportional to bytes read.
+#
+# Soft KV quants (int2_ch / int3_ch / int3_half — CPU hook; int4_ch hook variant):
+#   The CPU hook dequantizes K/V back to fp16 before restoring to the GPU KV cache.
+#   The GPU attention kernel always reads fp16 → same BW as fp16 (factor = 1.0).
+#   Soft-quant overhead lives in the hook round-trip (kv_get + kv_quant + kv_set),
+#   which is NOT modelled in this roofline (it is a separate CPU-side cost).
+KV_ATTN_OVERHEAD = {
+    "fp16":              1.00,   # baseline
+    "int8_ch":           1.08,   # → q8_0 native: dequant overhead > bandwidth savings
+    "int4_ch":           1.08,   # → q4_0 native: same (dequant cost independent of bpw)
+    # soft quants: GPU sees fp16 (hook restores fp16 before each decode)
+    "int3_ch":           1.00,
+    "int3_half_1357_ch": 1.00,
+    "int2_ch":           1.00,
 }
 
 WeightBpwSpec = Union[float, Dict[str, float]]
@@ -211,9 +258,265 @@ class OpStats:
     time_s:      float   # estimated time for this op (one layer)
     note:        str = ""
     kv_dependent: bool = False  # True for ops whose time scales with KV context length
+    # When True, time_s is already for the full stack (all layers); do not multiply by n_layers.
+    global_per_step: bool = False
 
     @property
     def total_bytes(self): return self.wt_bytes + self.act_bytes
+
+
+def op_wall_time_s(op: OpStats, n_layers: int) -> float:
+    """Wall time contribution for one decode/prefill step (all layers unless global_per_step)."""
+    if getattr(op, "global_per_step", False):
+        return op.time_s
+    return op.time_s * n_layers
+
+
+def _decode_overlay_kwargs(args) -> dict:
+    """Decode-only empirical overlays (norm/rope/misc overhead, weight BW split, flash-attn launch)."""
+    return dict(
+        weight_mem_eff=getattr(args, "weight_mem_eff", None),
+        norm_overhead_ms=float(getattr(args, "norm_overhead_ms", 0.0) or 0.0),
+        rope_overhead_ms=float(getattr(args, "rope_overhead_ms", 0.0) or 0.0),
+        other_overhead_ms=float(getattr(args, "other_overhead_ms", 0.0) or 0.0),
+        attn_overhead_per_layer_ms=float(
+            getattr(args, "attn_overhead_per_layer_ms", 0.0) or 0.0),
+    )
+
+
+def _build_ops_kw(model, args, compute_peak, weight_bw, attn_bw, act_bw, batch_size, *,
+                  include_decode_overlay: bool) -> dict:
+    base_scalar = (
+        args.weight_bpw if args.weight_bpw is not None
+        else float(model.get("weight_bits", 16)))
+    weight_bpw = _merge_weight_bpw_profile(
+        base_scalar, getattr(args, "weight_bpw_profile", None))
+    k = dict(
+        model=model,
+        compute_eff=args.compute_eff,
+        mem_eff=args.mem_eff,
+        attn_eff=args.attn_eff,
+        compute_peak=compute_peak,
+        weight_bw=weight_bw,
+        attn_bw=attn_bw,
+        act_bw=act_bw,
+        flash_attn=args.flash_attn,
+        kv_quant=args.kv_quant,
+        kv_group_size=args.kv_group_size,
+        padding_eff=args.padding_efficiency,
+        weight_bpw=weight_bpw,
+        weight_bpw_fallback=base_scalar,
+        batch_size=batch_size,
+    )
+    if include_decode_overlay:
+        k.update(_decode_overlay_kwargs(args))
+    return k
+
+
+SWEEP_CAT_KEYS = ["QKV+O proj", "RoPE", "Attention", "FFN", "Norm", "Other"]
+
+# Primary matmul / attention stacks for per-family isolation reports.
+SWEEP_FAMILY_CORE_KEYS = ["QKV+O proj", "Attention", "FFN"]
+
+
+def _sweep_cat_from_op_name(name: str) -> str:
+    """Map decode op name to CUDA PERF / sweep bucket (same rules as decode_categories_ms)."""
+    if name in ("qkv_proj", "out_proj"):
+        return "QKV+O proj"
+    if name == "rope" or name.startswith("overhead_rope"):
+        return "RoPE"
+    if name.startswith("attention_"):
+        return "Attention"
+    if name.startswith("ffn_"):
+        return "FFN"
+    if "norm" in name or name.startswith("overhead_norm"):
+        return "Norm"
+    if name.startswith("overhead_misc"):
+        return "Other"
+    return "Other"
+
+
+def decode_category_physics(
+        model: dict, hw: dict, args, n_ctx: int, batch_size: int) -> Dict[str, Dict[str, float]]:
+    """Per sweep category: vanilla roofline decode time (ms) and full-stack FLOPs / bytes.
+
+    Uses baseline args only (no overlays, no sweep residual trend) so each family is judged
+    against the same analytic core model.
+    """
+    ab = _args_for_sweep_baseline(args)
+    compute_peak = hw["compute_tflops"] * 1e12
+    base_bw      = hw["memory_bw_gbps"] * 1e9
+    weight_bw    = base_bw * ab.weight_bw_fraction
+    act_bw       = base_bw * ab.act_bw_fraction
+    attn_bw      = ab.attn_bw * 1e9 if ab.attn_bw else base_bw * ab.attn_bw_fraction
+    kw = _build_ops_kw(
+        model, ab, compute_peak, weight_bw, attn_bw, act_bw, batch_size,
+        include_decode_overlay=False)
+    nl = model["n_layers"]
+    ops = ops_for_layer("decode", batch_size * 1, n_ctx, **kw)
+    acc = {
+        k: dict(pred_ms=0.0, flops=0.0, wt_b=0.0, act_b=0.0)
+        for k in SWEEP_CAT_KEYS
+    }
+    for op in ops:
+        cat = _sweep_cat_from_op_name(op.name)
+        ms = op_wall_time_s(op, nl) * 1000.0
+        acc[cat]["pred_ms"] += ms
+        if getattr(op, "global_per_step", False):
+            fac = 1.0
+        else:
+            fac = float(nl)
+        acc[cat]["flops"] += op.flops * fac
+        acc[cat]["wt_b"] += op.wt_bytes * fac
+        acc[cat]["act_b"] += op.act_bytes * fac
+    out: Dict[str, Dict[str, float]] = {}
+    for k in SWEEP_CAT_KEYS:
+        v = acc[k]
+        tb = v["wt_b"] + v["act_b"]
+        ai = v["flops"] / tb if tb > 1e-9 else float("inf")
+        out[k] = dict(
+            pred_ms=v["pred_ms"], flops=v["flops"], wt_b=v["wt_b"], act_b=v["act_b"],
+            tot_bytes=tb, arith_intensity=ai)
+    return out
+    nc = max(float(n_ctx), 2.0)
+    return [1.0, float(npl), math.log2(nc)]
+
+
+def _solve_3x3(A: List[List[float]], b: List[float]) -> Optional[List[float]]:
+    """Solve 3×3 Ax=b; return None if singular / unstable."""
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    n = 3
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-18:
+            return None
+        if piv != col:
+            M[col], M[piv] = M[piv], M[col]
+        div = M[col][col]
+        for j in range(n + 1):
+            M[col][j] /= div
+        for r in range(n):
+            if r == col:
+                continue
+            f = M[r][col]
+            if f == 0.0:
+                continue
+            for j in range(n + 1):
+                M[r][j] -= f * M[col][j]
+    return [M[i][n] for i in range(n)]
+
+
+def _ls_fit_linear_3(Xrows: List[List[float]], y: List[float]) -> Tuple[float, float, float]:
+    """Least squares min ||X beta - y||_2 for X rows 3-wide. Falls back to mean(y) if rank-deficient."""
+    if len(y) < 3:
+        mu = sum(y) / max(len(y), 1)
+        return (mu, 0.0, 0.0)
+    XtX = [[0.0] * 3 for _ in range(3)]
+    Xty = [0.0] * 3
+    for i, xi in enumerate(Xrows):
+        yi = y[i]
+        for a in range(3):
+            Xty[a] += xi[a] * yi
+            for b in range(3):
+                XtX[a][b] += xi[a] * xi[b]
+    sol = _solve_3x3(XtX, Xty)
+    if sol is None:
+        mu = sum(y) / len(y)
+        return (mu, 0.0, 0.0)
+    return (sol[0], sol[1], sol[2])
+
+
+def decode_categories_ms(
+        model: dict, hw: dict, args, n_ctx: int, batch_size: int) -> Dict[str, float]:
+    """One decode step, all layers: category ms matching sweep_batched_bench / CUDA PERF labels.
+
+    With args._sweep_residual_trend set (from --sweep-trends), overlays are disabled and
+    learned residual Δms(npl, n_ctx) is added per category (see fit_sweep_residual_trends).
+    """
+    trend = getattr(args, "_sweep_residual_trend", None)
+    use_overlay = trend is None
+
+    compute_peak = hw["compute_tflops"] * 1e12
+    base_bw      = hw["memory_bw_gbps"] * 1e9
+    weight_bw    = base_bw * args.weight_bw_fraction
+    act_bw       = base_bw * args.act_bw_fraction
+    attn_bw      = args.attn_bw * 1e9 if args.attn_bw else base_bw * args.attn_bw_fraction
+    kw = _build_ops_kw(
+        model, args, compute_peak, weight_bw, attn_bw, act_bw, batch_size,
+        include_decode_overlay=use_overlay)
+    nl = model["n_layers"]
+    ops = ops_for_layer("decode", batch_size * 1, n_ctx, **kw)
+    cats = {
+        "QKV+O proj": 0.0,
+        "RoPE":       0.0,
+        "Attention":  0.0,
+        "FFN":        0.0,
+        "Norm":       0.0,
+        "Other":      0.0,
+    }
+    for op in ops:
+        ms = op_wall_time_s(op, nl) * 1000.0
+        cats[_sweep_cat_from_op_name(op.name)] += ms
+
+    if trend is not None:
+        fv = _sweep_feat(n_ctx, batch_size)
+        bmap = trend.beta_by_cat
+        for k in SWEEP_CAT_KEYS:
+            b = bmap.get(k, (0.0, 0.0, 0.0))
+            cats[k] += b[0] * fv[0] + b[1] * fv[1] + b[2] * fv[2]
+            if cats[k] < 0.0:
+                cats[k] = 0.0
+    return cats
+
+
+@dataclass
+class SweepResidualTrend:
+    """Per-category residual ms ≈ b0 + b1*npl + b2*log2(n_ctx). Fitted from sweep; no JSON."""
+    beta_by_cat: Dict[str, Tuple[float, float, float]]
+    sweep_ntg: int
+    feat_names: Tuple[str, str, str] = ("1", "npl", "log2(n_ctx)")
+
+
+def append_decode_trend_ops(ops: list, trend: Optional[SweepResidualTrend],
+                            n_ctx: int, npl: int) -> list:
+    """Append global_per_step ops so print_stage_table reflects CUDA PERF category residuals."""
+    if trend is None:
+        return ops
+    fv = _sweep_feat(n_ctx, npl)
+    out = list(ops)
+    tag = (
+        ("QKV+O proj", "trend_QKV"),
+        ("RoPE",       "trend_RoPE"),
+        ("Attention",  "trend_Attn"),
+        ("FFN",        "trend_FFN"),
+        ("Norm",       "trend_Norm"),
+        ("Other",      "trend_Oth"),
+    )
+    for cat, name in tag:
+        b = trend.beta_by_cat.get(cat, (0.0, 0.0, 0.0))
+        ms = b[0] * fv[0] + b[1] * fv[1] + b[2] * fv[2]
+        if ms <= 0.0:
+            continue
+        out.append(OpStats(
+            name=name, flops=0.0, wt_bytes=0.0, act_bytes=0.0, intensity=0.0,
+            bound="trend", time_s=ms / 1000.0,
+            note=f"Δ from sweep fit: {cat}", kv_dependent=False, global_per_step=True))
+    return out
+
+
+def decode_step_ops_all_layers(model: dict, hw: dict, args, n_ctx: int, batch_size: int) -> list:
+    """Decode ops for one step (all stack), vanilla roofline + optional sweep residual rows."""
+    compute_peak = hw["compute_tflops"] * 1e12
+    base_bw      = hw["memory_bw_gbps"] * 1e9
+    weight_bw    = base_bw * args.weight_bw_fraction
+    act_bw       = base_bw * args.act_bw_fraction
+    attn_bw      = args.attn_bw * 1e9 if args.attn_bw else base_bw * args.attn_bw_fraction
+    use_trend    = getattr(args, "_sweep_residual_trend", None) is not None
+    kw = _build_ops_kw(
+        model, args, compute_peak, weight_bw, attn_bw, act_bw, batch_size,
+        include_decode_overlay=not use_trend)
+    ops = ops_for_layer("decode", batch_size * 1, n_ctx, **kw)
+    return append_decode_trend_ops(ops, getattr(args, "_sweep_residual_trend", None), n_ctx, batch_size)
 
 
 def _kv_bytes_per_token_per_layer(kv_quant: str, n_kv_heads: int, head_dim: int,
@@ -235,7 +538,7 @@ def ops_for_layer(stage: str,
                   n_ctx: int,         # KV context tokens PER SEQUENCE (not total)
                   model: dict,
                   compute_eff: float, # fraction of peak compute utilised
-                  mem_eff: float,     # fraction of peak weight/act BW utilised
+                  mem_eff: float,     # fraction of peak activation BW utilised
                   attn_eff: float,    # fraction of peak BW utilised for attention KV reads
                   compute_peak: float, # FLOPs/s
                   weight_bw: float,   # bytes/s for weight reads
@@ -248,13 +551,21 @@ def ops_for_layer(stage: str,
                   weight_bpw: WeightBpwSpec,  # scalar bpw or profile dict (attn/mlp/per-op)
                   weight_bpw_fallback: float = 16.0,
                   batch_size: int = 1,
-                  act_bits: int = 16) -> list:
+                  act_bits: int = 16,
+                  weight_mem_eff: Optional[float] = None,
+                  norm_overhead_ms: float = 0.0,
+                  rope_overhead_ms: float = 0.0,
+                  other_overhead_ms: float = 0.0,
+                  attn_overhead_per_layer_ms: float = 0.0) -> list:
     """Return list of OpStats for one transformer layer at this stage.
 
     Memory model:
-      - Weights: loaded once per step (shared across batch); BW = weight_bw
-      - Activations (inputs/outputs): scale with n_q; BW = act_bw
+      - Weights: loaded once per step (shared across batch); BW = weight_bw × weight_mem_eff (or mem_eff)
+      - Activations (inputs/outputs): scale with n_q; BW = act_bw × mem_eff
       - Attention KV reads: scale with n_ctx × B; BW = attn_bw (affected by KV quant)
+
+    Decode empirical overlays (optional, global_per_step, not multiplied by n_layers):
+      norm_overhead_ms, rope_overhead_ms, other_overhead_ms, attn_overhead_per_layer_ms.
 
     Compute model:
       - FLOPs scale with n_q (or n_q × n_ctx for attention)
@@ -272,9 +583,10 @@ def ops_for_layer(stage: str,
     def _wbpe(op_name: str) -> float:
         return _resolve_weight_bpw(op_name, weight_bpw, fallback=weight_bpw_fallback) / 8.0
 
-    # Effective compute and BW
+    # Effective compute and BW (GEMV on weights often achieves much lower util than act BW)
+    w_mem_mult = weight_mem_eff if weight_mem_eff is not None else mem_eff
     comp_peak  = compute_peak * compute_eff
-    wt_bw_eff  = weight_bw  * mem_eff
+    wt_bw_eff  = weight_bw  * w_mem_mult
     act_bw_eff = act_bw     * mem_eff
     kv_bw_eff  = attn_bw    * attn_eff
 
@@ -347,30 +659,44 @@ def ops_for_layer(stage: str,
     # Each sequence in the batch reads its own KV cache independently.
     B = batch_size
 
+    # Effective attention KV bandwidth cost:
+    #   Native GPU quants (int8_ch/int4_ch): dequant overhead > bandwidth savings →
+    #   net effect is SLOWER than fp16 by ~8% (KV_ATTN_OVERHEAD factor > 1).
+    #   Soft quants (int3_ch/int2_ch): GPU reads fp16 (hook restores fp16 before decode)
+    #   → same cost as fp16 (factor = 1.0). Pure-byte model is wrong for both cases.
+    fp16_kv_bpt  = _kv_bytes_per_token_per_layer("fp16", nkv, hd, kv_group_size)
+    kv_attn_factor = KV_ATTN_OVERHEAD.get(kv_quant, 1.0)
+    kv_attn_bpt  = fp16_kv_bpt * kv_attn_factor   # effective BW cost per K or V token
+
     if flash_attn:
         # Flash attention reads Q,K,V from HBM once (tiled, no O(n²) intermediate).
         # Q: n_q × nh × hd (activation BW)
         # K,V: B × n_ctx × nkv × hd per K and V (each seq reads its own KV)
         # Output: n_q × nh × hd (activation BW)
-        kv_bpt     = _kv_bytes_per_token_per_layer(kv_quant, nkv, hd, kv_group_size)
         attn_q_b   = n_q * nh * hd * abpe         # Q in act BW
         attn_out_b = n_q * nh * hd * abpe         # output in act BW
-        attn_kv_b  = B * n_ctx * 2 * kv_bpt       # K+V in attn BW (B sequences)
-        note = f"flash,ctx={n_ctx}"
+        attn_kv_b  = B * n_ctx * 2 * kv_attn_bpt  # K+V in attn BW (overhead-corrected)
+        note = f"flash,ctx={n_ctx},kv_factor={kv_attn_factor:.2f}"
         ops.append(_op("attention_flash", attn_flops, 0,
                         attn_q_b + attn_out_b, note, attn_b=attn_kv_b,
                         kv_dep=True))
     else:
         # Standard attention: write + read O(n²) attention weight matrix
         attn_mat_b = n_q * nh * avg_attended * 4   # fp32 attn weights (write+read)
-        kv_bpt     = _kv_bytes_per_token_per_layer(kv_quant, nkv, hd, kv_group_size)
         attn_q_b   = n_q * nh * hd * abpe
         attn_out_b = n_q * nh * hd * abpe
-        attn_kv_b  = B * n_ctx * 2 * kv_bpt
-        note = f"standard,ctx={n_ctx}"
+        attn_kv_b  = B * n_ctx * 2 * kv_attn_bpt
+        note = f"standard,ctx={n_ctx},kv_factor={kv_attn_factor:.2f}"
         ops.append(_op("attention_std", attn_flops, 0,
                         attn_q_b + attn_out_b + attn_mat_b, note, attn_b=attn_kv_b,
                         kv_dep=True))
+
+    if attn_overhead_per_layer_ms > 0.0:
+        extra = attn_overhead_per_layer_ms / 1000.0
+        for op in ops:
+            if op.name.startswith("attention_"):
+                op.time_s += extra
+                break
 
     # ── 6. Output projection ─────────────────────────────────────────────────
     out_flops = 2 * n_real * nh * hd * d
@@ -402,6 +728,19 @@ def ops_for_layer(stage: str,
         ffn_act_dn   = n_q * ffn * abpe + n_q * d * abpe
         ops.append(_op("ffn_up",   ffn_flops_up, ffn_wt_up, ffn_act_up))
         ops.append(_op("ffn_down", ffn_flops_dn, ffn_wt_dn, ffn_act_dn))
+
+    def _global_overhead(name: str, ms: float, kv_dep: bool = False) -> OpStats:
+        return OpStats(
+            name=name, flops=0.0, wt_bytes=0.0, act_bytes=0.0, intensity=0.0,
+            bound="overhead", time_s=ms / 1000.0, note="decode empirical overlay",
+            kv_dependent=kv_dep, global_per_step=True)
+
+    if norm_overhead_ms > 0.0:
+        ops.append(_global_overhead("overhead_norm", norm_overhead_ms, kv_dep=False))
+    if rope_overhead_ms > 0.0:
+        ops.append(_global_overhead("overhead_rope", rope_overhead_ms, kv_dep=False))
+    if other_overhead_ms > 0.0:
+        ops.append(_global_overhead("overhead_misc", other_overhead_ms, kv_dep=False))
 
     return ops
 
@@ -435,11 +774,12 @@ def print_stage_table(stage_label: str, ops_per_layer: list, n_layers: int,
 
     op_rows = []
     for op in ops_per_layer:
-        f   = op.flops    * n_layers
-        wb  = op.wt_bytes * n_layers
-        ab  = op.act_bytes * n_layers
+        lay = 1 if getattr(op, "global_per_step", False) else n_layers
+        f   = op.flops * lay
+        wb  = op.wt_bytes * lay
+        ab  = op.act_bytes * lay
         tb  = wb + ab
-        t   = op.time_s   * n_layers
+        t   = op_wall_time_s(op, n_layers)
         total_flops += f
         total_wt    += wb
         total_act   += ab
@@ -718,40 +1058,13 @@ def roofline_decode_total_seconds(model: dict, hw: dict, args) -> float:
     """Uncorrected analytic total decode time (seconds) for args.n_decode steps. No printing."""
     if args.n_decode <= 0:
         return 0.0
-    compute_peak = hw["compute_tflops"] * 1e12
-    base_bw      = hw["memory_bw_gbps"] * 1e9
-    weight_bw    = base_bw * args.weight_bw_fraction
-    act_bw       = base_bw * args.act_bw_fraction
-    attn_bw      = args.attn_bw * 1e9 if args.attn_bw else base_bw * args.attn_bw_fraction
     B = args.batch_size
-    base_scalar = (
-        args.weight_bpw if args.weight_bpw is not None
-        else float(model.get("weight_bits", 16)))
-    weight_bpw = _merge_weight_bpw_profile(
-        base_scalar, getattr(args, "weight_bpw_profile", None))
-    kw = dict(
-        model=model,
-        compute_eff=args.compute_eff,
-        mem_eff=args.mem_eff,
-        attn_eff=args.attn_eff,
-        compute_peak=compute_peak,
-        weight_bw=weight_bw,
-        attn_bw=attn_bw,
-        act_bw=act_bw,
-        flash_attn=args.flash_attn,
-        kv_quant=args.kv_quant,
-        kv_group_size=args.kv_group_size,
-        padding_eff=args.padding_efficiency,
-        weight_bpw=weight_bpw,
-        weight_bpw_fallback=base_scalar,
-        batch_size=B,
-    )
     nl = model["n_layers"]
     avg_ctx = args.n_prompt + args.n_decode // 2
     n_q_dec = B * 1
-    ops_dec = ops_for_layer("decode", n_q_dec, avg_ctx, **kw)
-    T_fixed = sum(op.time_s * nl for op in ops_dec if not op.kv_dependent)
-    T_kv = sum(op.time_s * nl for op in ops_dec if op.kv_dependent)
+    ops_dec = decode_step_ops_all_layers(model, hw, args, avg_ctx, B)
+    T_fixed = sum(op_wall_time_s(op, nl) for op in ops_dec if not op.kv_dependent)
+    T_kv = sum(op_wall_time_s(op, nl) for op in ops_dec if op.kv_dependent)
     return T_fixed * args.n_decode + T_kv * args.n_decode
 
 
@@ -774,37 +1087,10 @@ def roofline_decode_ms_at_ctx(model: dict, hw: dict, args, ctx: int) -> float:
     """
     if ctx <= 0:
         return 0.0
-    compute_peak = hw["compute_tflops"] * 1e12
-    base_bw      = hw["memory_bw_gbps"] * 1e9
-    weight_bw    = base_bw * args.weight_bw_fraction
-    act_bw       = base_bw * args.act_bw_fraction
-    attn_bw      = args.attn_bw * 1e9 if args.attn_bw else base_bw * args.attn_bw_fraction
     B = args.batch_size
-    base_scalar = (
-        args.weight_bpw if args.weight_bpw is not None
-        else float(model.get("weight_bits", 16)))
-    weight_bpw = _merge_weight_bpw_profile(
-        base_scalar, getattr(args, "weight_bpw_profile", None))
-    kw = dict(
-        model=model,
-        compute_eff=args.compute_eff,
-        mem_eff=args.mem_eff,
-        attn_eff=args.attn_eff,
-        compute_peak=compute_peak,
-        weight_bw=weight_bw,
-        attn_bw=attn_bw,
-        act_bw=act_bw,
-        flash_attn=args.flash_attn,
-        kv_quant=args.kv_quant,
-        kv_group_size=args.kv_group_size,
-        padding_eff=args.padding_efficiency,
-        weight_bpw=weight_bpw,
-        weight_bpw_fallback=base_scalar,
-        batch_size=B,
-    )
     nl = model["n_layers"]
-    ops = ops_for_layer("decode", B * 1, ctx, **kw)
-    T_step = sum(op.time_s * nl for op in ops)   # seconds for one decode step
+    ops = decode_step_ops_all_layers(model, hw, args, ctx, B)
+    T_step = sum(op_wall_time_s(op, nl) for op in ops)   # seconds for one decode step
     return T_step / B * 1000.0   # ms per token
 
 
@@ -820,33 +1106,25 @@ def analyze_and_print(model, hw, args):
 
     nl = model["n_layers"]
     B  = args.batch_size
+    use_trend = getattr(args, "_sweep_residual_trend", None) is not None
 
-    # Shared kwargs for ops_for_layer (weight_bpw may be scalar or attn/mlp/per-op profile)
     base_scalar = (
         args.weight_bpw if args.weight_bpw is not None
         else float(model.get("weight_bits", 16)))
     weight_bpw = _merge_weight_bpw_profile(
         base_scalar, getattr(args, "weight_bpw_profile", None))
-    kw = dict(
-        model                = model,
-        compute_eff          = args.compute_eff,
-        mem_eff              = args.mem_eff,
-        attn_eff             = args.attn_eff,
-        compute_peak         = compute_peak,
-        weight_bw            = weight_bw,
-        attn_bw              = attn_bw,
-        act_bw               = act_bw,
-        flash_attn           = args.flash_attn,
-        kv_quant             = args.kv_quant,
-        kv_group_size        = args.kv_group_size,
-        padding_eff          = args.padding_efficiency,
-        weight_bpw           = weight_bpw,
-        weight_bpw_fallback  = base_scalar,
-        batch_size           = B,
-    )
+
+    kw_prefill = _build_ops_kw(
+        model, args, compute_peak, weight_bw, attn_bw, act_bw, B,
+        include_decode_overlay=False)
+    kw_decode = _build_ops_kw(
+        model, args, compute_peak, weight_bw, attn_bw, act_bw, B,
+        include_decode_overlay=not use_trend)
 
     # ── Header ────────────────────────────────────────────────────────────────
     print(f"\n{'═'*105}")
+    wm = getattr(args, "weight_mem_eff", None)
+    wm_s = f"{wm:.0%}" if wm is not None else "(=mem_eff)"
     print(f"  Layer-level roofline model  |  model={args.model}  hw={args.hw}  "
           f"batch={B}  kv_quant={args.kv_quant}  weight_bpw={_format_weight_bpw_spec(weight_bpw)}")
     attn_mode = "flash" if args.flash_attn else "standard"
@@ -854,7 +1132,14 @@ def analyze_and_print(model, hw, args):
     print(f"  weight_bw={weight_bw/1e9:.0f} GB/s  attn_bw={attn_bw_label}  "
           f"act_bw={act_bw/1e9:.0f} GB/s  "
           f"compute_eff={args.compute_eff:.0%}  mem_eff={args.mem_eff:.0%}  "
-          f"attn_eff={args.attn_eff:.0%}  pad={args.padding_efficiency:.0%}")
+          f"weight_mem_eff={wm_s}  attn_eff={args.attn_eff:.0%}  pad={args.padding_efficiency:.0%}")
+    ovl = _decode_overlay_kwargs(args)
+    if use_trend:
+        print(f"  decode calibration: sweep residual trends (Δms vs npl, log2 n_ctx); scalar decode overlays off")
+    elif (ovl["norm_overhead_ms"] > 0 or ovl["rope_overhead_ms"] > 0 or ovl["other_overhead_ms"] > 0
+            or ovl["attn_overhead_per_layer_ms"] > 0 or ovl.get("weight_mem_eff") is not None):
+        print(f"  decode overlay: norm={ovl['norm_overhead_ms']:.3f} ms  rope={ovl['rope_overhead_ms']:.3f} ms  "
+              f"other={ovl['other_overhead_ms']:.3f} ms  attn_layer={ovl['attn_overhead_per_layer_ms']:.4f} ms")
     print(f"  attn={attn_mode}  ridge={ridge:.0f} FLOPs/B")
 
     results = {}
@@ -863,7 +1148,7 @@ def analyze_and_print(model, hw, args):
     if args.n_prompt > 0:
         n_q   = B * args.n_prompt
         n_ctx = args.n_prompt
-        ops   = ops_for_layer("prefill", n_q, n_ctx, **kw)
+        ops   = ops_for_layer("prefill", n_q, n_ctx, **kw_prefill)
         info  = (f"B={B}  n_tokens={args.n_prompt}  "
                  f"causal_avg_ctx≈{n_ctx//2}")
         T_pre = print_stage_table(f"PREFILL", ops, nl, n_q, "prefill", info)
@@ -876,7 +1161,7 @@ def analyze_and_print(model, hw, args):
     if args.n_decode > 0:
         avg_ctx  = args.n_prompt + args.n_decode // 2
         n_q_dec  = B * 1              # one new token per sequence per step
-        ops_dec  = ops_for_layer("decode", n_q_dec, avg_ctx, **kw)
+        ops_dec  = decode_step_ops_all_layers(model, hw, args, avg_ctx, B)
         info     = (f"B={B}  n_q=1/seq  avg_ctx={avg_ctx}  "
                     f"(prompt={args.n_prompt}+decode/2={args.n_decode//2})")
         T_one    = print_stage_table("DECODE (one step, avg ctx)", ops_dec, nl,
@@ -887,8 +1172,8 @@ def analyze_and_print(model, hw, args):
         # KV/attn ops scale with (n_prompt + i).
         # Approximation: split into weight-dominated part (constant) and
         # KV-dominated part (linear in context).
-        T_fixed_per_step = sum(op.time_s * nl for op in ops_dec if not op.kv_dependent)
-        T_kv_per_step    = sum(op.time_s * nl for op in ops_dec if op.kv_dependent)
+        T_fixed_per_step = sum(op_wall_time_s(op, nl) for op in ops_dec if not op.kv_dependent)
+        T_kv_per_step    = sum(op_wall_time_s(op, nl) for op in ops_dec if op.kv_dependent)
         # KV-dependent ops scale linearly with context length.  The per-step
         # time was computed at avg_ctx; summing over n_decode steps where
         # context grows from n_prompt to n_prompt+n_decode-1 gives the same
@@ -910,7 +1195,7 @@ def analyze_and_print(model, hw, args):
         # KV cache at verification point: n_prompt + first_fail_pos ≈ n_prompt + n_decode×first_fail_frac
         v_ctx  = args.n_prompt + int(args.n_decode * args.verify_ctx_frac)
         n_q_v  = B * W_v
-        ops_v  = ops_for_layer("verify", n_q_v, v_ctx + W_v, **kw)
+        ops_v  = ops_for_layer("verify", n_q_v, v_ctx + W_v, **kw_prefill)
         info   = (f"B={B}  W={W_v} tokens  n_ctx={v_ctx+W_v}  "
                   f"(existing KV={v_ctx} + verify window)")
         T_ver  = print_stage_table(f"VERIFY WINDOW (W={W_v})", ops_v, nl,
@@ -925,10 +1210,10 @@ def analyze_and_print(model, hw, args):
 
     # ── Adaptive decode analysis ────────────────────────────────────────────
     if args.adaptive and args.n_decode > 0:
-        _print_adaptive_analysis(model, hw, args, kw, results)
+        _print_adaptive_analysis(model, hw, args, kw_decode, results)
 
     if getattr(args, "calibration_json", None) and args.n_decode > 0:
-        _print_calibration(model, args, kw, weight_bpw, results)
+        _print_calibration(model, args, kw_decode, weight_bpw, results)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'─'*105}")
@@ -952,15 +1237,18 @@ def analyze_and_print(model, hw, args):
 
 # ── Adaptive decode model ─────────────────────────────────────────────────────
 
-def _decode_step_time(n_q, n_ctx, kv_quant, model, kw_base, weight_bpw=None):
+def _decode_step_time(n_q, n_ctx, kv_quant, model, kw_base, weight_bpw=None, *,
+                      sweep_trend=None):
     """Compute one decode step time (all layers) for a given KV quant."""
     kw = dict(kw_base, kv_quant=kv_quant)
     if weight_bpw is not None:
         kw = dict(kw, weight_bpw=weight_bpw)
     ops = ops_for_layer("decode", n_q, n_ctx, **kw)
+    if sweep_trend is not None:
+        ops = append_decode_trend_ops(ops, sweep_trend, n_ctx, n_q)
     nl = model["n_layers"]
-    T_fixed = sum(op.time_s * nl for op in ops if not op.kv_dependent)
-    T_kv    = sum(op.time_s * nl for op in ops if op.kv_dependent)
+    T_fixed = sum(op_wall_time_s(op, nl) for op in ops if not op.kv_dependent)
+    T_kv    = sum(op_wall_time_s(op, nl) for op in ops if op.kv_dependent)
     return T_fixed, T_kv
 
 
@@ -973,7 +1261,7 @@ def _verify_window_time(B, W, n_ctx, verify_quant, model, kw_base, weight_bpw=No
     n_q_v = B * W
     ops = ops_for_layer("verify", n_q_v, n_ctx + W, **kw)
     nl = model["n_layers"]
-    return sum(op.time_s * nl for op in ops)
+    return sum(op_wall_time_s(op, nl) for op in ops)
 
 
 def _decode_total_time(model, args, kw, weight_bpw: WeightBpwSpec, kv_quant: str) -> float:
@@ -982,9 +1270,12 @@ def _decode_total_time(model, args, kw, weight_bpw: WeightBpwSpec, kv_quant: str
     n_q_dec = args.batch_size * 1
     kw2 = dict(kw, kv_quant=kv_quant, weight_bpw=weight_bpw)
     ops_dec = ops_for_layer("decode", n_q_dec, avg_ctx, **kw2)
+    trend = getattr(args, "_sweep_residual_trend", None)
+    if trend is not None:
+        ops_dec = append_decode_trend_ops(ops_dec, trend, avg_ctx, n_q_dec)
     nl = model["n_layers"]
-    T_fixed_per_step = sum(op.time_s * nl for op in ops_dec if not op.kv_dependent)
-    T_kv_per_step    = sum(op.time_s * nl for op in ops_dec if op.kv_dependent)
+    T_fixed_per_step = sum(op_wall_time_s(op, nl) for op in ops_dec if not op.kv_dependent)
+    T_kv_per_step    = sum(op_wall_time_s(op, nl) for op in ops_dec if op.kv_dependent)
     return T_fixed_per_step * args.n_decode + T_kv_per_step * args.n_decode
 
 
@@ -1024,12 +1315,13 @@ def _print_adaptive_analysis(model, hw, args, kw_base, results):
     draft_bpw = _effective_draft_weight_spec(args, kw_base, model)
 
     # Per-step times at avg context (draft uses lighter weights if --draft-weight-bpw / profile)
+    tr = getattr(args, "_sweep_residual_trend", None)
     T_draft_fixed, T_draft_kv = _decode_step_time(
-        n_q_dec, avg_ctx, draft_q, model, kw_base, weight_bpw=draft_bpw)
+        n_q_dec, avg_ctx, draft_q, model, kw_base, weight_bpw=draft_bpw, sweep_trend=tr)
     T_verify_fixed, T_verify_kv = _decode_step_time(
-        n_q_dec, avg_ctx, verify_q, model, kw_base, weight_bpw=main_bpw)
+        n_q_dec, avg_ctx, verify_q, model, kw_base, weight_bpw=main_bpw, sweep_trend=tr)
     T_fp16_fixed, T_fp16_kv = _decode_step_time(
-        n_q_dec, avg_ctx, "fp16", model, kw_base, weight_bpw=16.0)
+        n_q_dec, avg_ctx, "fp16", model, kw_base, weight_bpw=16.0, sweep_trend=tr)
 
     T_draft_step  = T_draft_fixed  + T_draft_kv
     T_verify_step = T_verify_fixed + T_verify_kv
@@ -1146,6 +1438,388 @@ def _print_adaptive_analysis(model, hw, args, kw_base, results):
     print(f"{'═'*105}")
 
 
+# ── Sweep CSV (sweep_batched_bench.py) calibration ────────────────────────────
+
+# ── Sweep rows (CSV / decode_sweep*.txt) ─────────────────────────────────────
+
+def _load_sweep_decode_duration_txt(path: str) -> list:
+    """Parse DECODE DURATION (ms) table from sweep_batched_bench stderr / decode_sweep*.txt."""
+    p = os.path.expanduser(path)
+    with open(p, encoding="utf-8") as f:
+        text = f.read()
+    rows = []
+    in_duration = False
+    # npp npl + 6 categories + wall + tok/s
+    row_re = re.compile(
+        r"^\s*(\d+)\s+(\d+)\s+"
+        r"(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+"
+        r"(\d+\.\d+)\s+(\d+\.\d+)\s*$")
+    for line in text.splitlines():
+        if "DECODE DURATION" in line and "ms" in line:
+            in_duration = True
+            continue
+        if in_duration and "DECODE PERCENTAGE" in line:
+            break
+        if not in_duration:
+            continue
+        s = line.strip()
+        if not s or s.startswith("-") or s.startswith("="):
+            continue
+        m = row_re.match(line.rstrip())
+        if not m:
+            continue
+        rows.append({
+            "npp":            m.group(1),
+            "npl":            m.group(2),
+            "QKV+O proj_ms":  m.group(3),
+            "RoPE_ms":        m.group(4),
+            "Attention_ms":   m.group(5),
+            "FFN_ms":         m.group(6),
+            "Norm_ms":        m.group(7),
+            "Other_ms":       m.group(8),
+            "wall_ms":        m.group(9),
+        })
+    return rows
+
+
+def _load_sweep_rows(path: str) -> list:
+    """Sweep rows: CSV from sweep_batched_bench -o, or decode_sweep*.txt (DECODE DURATION block)."""
+    p = os.path.expanduser(path)
+    with open(p, encoding="utf-8") as f:
+        head = f.read(4096)
+    if "DECODE DURATION" in head and "ms" in head:
+        return _load_sweep_decode_duration_txt(p)
+    with open(p, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _measured_kernel_ms(row: dict) -> float:
+    if row.get("kernel_ms"):
+        return float(row["kernel_ms"])
+    return sum(float(row.get(f"{k}_ms", 0) or 0) for k in SWEEP_CAT_KEYS)
+
+
+def _args_for_sweep_baseline(args) -> object:
+    """Roofline only: no scalar overlays / weight_mem_eff / prior sweep trend."""
+    a = copy.copy(args)
+    a.weight_mem_eff = None
+    a.norm_overhead_ms = 0.0
+    a.rope_overhead_ms = 0.0
+    a.other_overhead_ms = 0.0
+    a.attn_overhead_per_layer_ms = 0.0
+    a._sweep_residual_trend = None
+    return a
+
+
+def fit_sweep_residual_trends(
+        model: dict, hw: dict, args_template, rows: list, ntg: int) -> SweepResidualTrend:
+    """Fit Δms per category ≈ b0 + b1*npl + b2*log2(n_ctx), n_ctx = npp + ntg//2 (sweep convention)."""
+    beta_by_cat: Dict[str, Tuple[float, float, float]] = {}
+    for cat in SWEEP_CAT_KEYS:
+        Xrows: List[List[float]] = []
+        y: List[float] = []
+        for row in rows:
+            npp = int(row["npp"])
+            npl = int(row["npl"])
+            n_ctx = npp + ntg // 2
+            ab = _args_for_sweep_baseline(args_template)
+            pred = decode_categories_ms(model, hw, ab, n_ctx, npl)
+            meas = float(row.get(f"{cat}_ms", 0) or 0)
+            Xrows.append(_sweep_feat(n_ctx, npl))
+            y.append(meas - pred[cat])
+        beta_by_cat[cat] = _ls_fit_linear_3(Xrows, y)
+    return SweepResidualTrend(beta_by_cat=beta_by_cat, sweep_ntg=ntg)
+
+
+def run_sweep_trend_report(
+        model: dict, hw: dict, args, rows: list, ntg: int, trend: SweepResidualTrend) -> None:
+    """Human-readable trends (no JSON): equations, marginal slices, MAPE before/after."""
+    W = 100
+    print(f"\n{'═'*W}")
+    print("  SWEEP RESIDUAL TRENDS  (roofline baseline → + Δms per category)")
+    print(f"  n_ctx rows use sweep convention: n_ctx = npp + {ntg}//2  |  rows={len(rows)}")
+    print(f"  Model: Δt_c ≈ b0 + b1·npl + b2·log2(n_ctx)  for each CUDA PERF category c")
+    print(f"{'─'*W}")
+    for cat in SWEEP_CAT_KEYS:
+        b0, b1, b2 = trend.beta_by_cat[cat]
+        print(f"  {cat:<14}  Δms = {b0:+.4f}  {b1:+.5f}·npl  {b2:+.5f}·log2(n_ctx)")
+        if abs(b1) > abs(b0) * 0.02 and abs(b1) > 1e-4:
+            print(f"                 └ batch effect: ~{b1*4:.3f} ms Δ when npl 1→5 at fixed context")
+        if abs(b2) > 1e-4:
+            print(f"                 └ context effect: ~{b2 * (math.log2(8192) - math.log2(1024)):.3f} ms Δ "
+                  f"when log2(n_ctx) 10→13 at fixed npl")
+    print(f"{'─'*W}")
+    # Marginal: mean residual (meas−pred_base) vs npl and vs npp
+    by_npl: Dict[int, List[float]] = {}
+    by_npp: Dict[int, List[float]] = {}
+    for row in rows:
+        npp, npl = int(row["npp"]), int(row["npl"])
+        n_ctx = npp + ntg // 2
+        ab = _args_for_sweep_baseline(args)
+        pred = decode_categories_ms(model, hw, ab, n_ctx, npl)
+        meas_t = _measured_kernel_ms(row)
+        pred_t = sum(pred.values())
+        resid = meas_t - pred_t
+        by_npl.setdefault(npl, []).append(resid)
+        by_npp.setdefault(npp, []).append(resid)
+    print("  Total kernel residual (meas − vanilla roofline), mean over other sweep axis:")
+    print(f"    by npl: " + "  ".join(
+        f"npl={k}: {sum(v)/len(v):+.2f} ms" for k, v in sorted(by_npl.items())))
+    print(f"    by npp: " + "  ".join(
+        f"npp={k}: {sum(v)/len(v):+.2f} ms" for k, v in sorted(by_npp.items())))
+    print(f"{'─'*W}")
+    mae_b = 0.0
+    mae_a = 0.0
+    a_eval = copy.copy(args)
+    a_eval._sweep_residual_trend = trend
+    for row in rows:
+        npp, npl = int(row["npp"]), int(row["npl"])
+        n_ctx = npp + ntg // 2
+        meas = _measured_kernel_ms(row)
+        p0 = sum(decode_categories_ms(model, hw, _args_for_sweep_baseline(args), n_ctx, npl).values())
+        p1 = sum(decode_categories_ms(model, hw, a_eval, n_ctx, npl).values())
+        mae_b += abs(meas - p0)
+        mae_a += abs(meas - p1)
+    n = len(rows)
+    print(f"  Mean abs error on kernel sum (train grid):  baseline {mae_b/n:.3f} ms  "
+          f"→  +trends {mae_a/n:.3f} ms")
+    print(f"{'═'*W}\n")
+
+
+def run_sweep_family_isolation_report(model: dict, hw: dict, args, rows: list, ntg: int) -> None:
+    """Measured vs vanilla roofline, one CUDA PERF family at a time (with stack FLOPs / intensity)."""
+    W = 100
+    print(f"\n{'═'*W}")
+    print("  SWEEP FAMILY ISOLATION  (each bucket vs analytic roofline for ops in that bucket only)")
+    print(f"  n_ctx = npp + {ntg}//2  |  rows={len(rows)}")
+    print("  Roofline side: baseline (no overlays, no sweep trends) — same core as residual fit.")
+    print(f"{'─'*W}")
+    row0 = rows[0]
+    npp0, npl0 = int(row0["npp"]), int(row0["npl"])
+    ctx0 = npp0 + ntg // 2
+    phys0 = decode_category_physics(model, hw, args, ctx0, npl0)
+    print(f"  Sample (first row: npp={npp0} npl={npl0} n_ctx={ctx0})  full stack decode:")
+    order = SWEEP_FAMILY_CORE_KEYS + [k for k in SWEEP_CAT_KEYS if k not in SWEEP_FAMILY_CORE_KEYS]
+    for fam in order:
+        p = phys0[fam]
+        ai = p["arith_intensity"]
+        ais = f"{ai:.1f}" if math.isfinite(ai) else "inf"
+        print(f"    {fam:<14}  roof_ms={p['pred_ms']:>8.3f}  I={ais:>10} F/B  "
+              f"F={p['flops']/1e12:.3f} TF  xfer≈{p['tot_bytes']/1e6:.1f} MB")
+    print(f"{'─'*W}")
+
+    by_fam_err: Dict[str, List[float]] = {k: [] for k in SWEEP_CAT_KEYS}
+    by_fam_meas: Dict[str, List[float]] = {k: [] for k in SWEEP_CAT_KEYS}
+    by_fam_npl: Dict[str, Dict[int, List[float]]] = {k: {} for k in SWEEP_CAT_KEYS}
+    by_fam_npp: Dict[str, Dict[int, List[float]]] = {k: {} for k in SWEEP_CAT_KEYS}
+    sum_abs_kernel = 0.0
+
+    for row in rows:
+        npp, npl = int(row["npp"]), int(row["npl"])
+        n_ctx = npp + ntg // 2
+        phys = decode_category_physics(model, hw, args, n_ctx, npl)
+        p_hat = sum(phys[k]["pred_ms"] for k in SWEEP_CAT_KEYS)
+        m_hat = _measured_kernel_ms(row)
+        sum_abs_kernel += abs(m_hat - p_hat)
+        for fam in SWEEP_CAT_KEYS:
+            pred = phys[fam]["pred_ms"]
+            meas = float(row.get(f"{fam}_ms", 0) or 0)
+            err = meas - pred
+            by_fam_err[fam].append(err)
+            by_fam_meas[fam].append(meas)
+            by_fam_npl[fam].setdefault(npl, []).append(err)
+            by_fam_npp[fam].setdefault(npp, []).append(err)
+
+    nrows = len(rows)
+    for fam in SWEEP_CAT_KEYS:
+        errs = by_fam_err[fam]
+        m_me = by_fam_meas[fam]
+        mae = sum(abs(e) for e in errs) / nrows
+        mape_acc = 0.0
+        mape_n = 0
+        for i in range(nrows):
+            if m_me[i] > 1e-6:
+                mape_acc += abs(errs[i] / m_me[i])
+                mape_n += 1
+        mape = 100.0 * mape_acc / mape_n if mape_n else 0.0
+        tag = ""
+        if fam in SWEEP_FAMILY_CORE_KEYS:
+            tag = "  [core: QKV / Attn / FFN path]"
+        print(f"  === {fam}{tag}")
+        print(f"    MAE={mae:.4f} ms   MAPE={mape:.2f}%  (MAPE over rows where meas>0)")
+        bnpl = by_fam_npl[fam]
+        bnpp = by_fam_npp[fam]
+        print("    Mean (meas − roofline) by npl: " + "  ".join(
+            f"npl={k}: {sum(v)/len(v):+.3f} ms" for k, v in sorted(bnpl.items())))
+        print("    by npp: " + "  ".join(
+            f"npp={k}: {sum(v)/len(v):+.3f} ms" for k, v in sorted(bnpp.items())))
+
+    print(f"{'─'*W}")
+    print("  ASSEMBLE CHECK   Σ_c meas_c  vs  Σ_c roofline_c  (kernel totals, all buckets)")
+    print(f"    Mean abs error: {sum_abs_kernel/nrows:.3f} ms")
+    print(f"{'═'*W}\n")
+
+
+def _assign_decode_calibration(args,
+                               weight_mem_eff: Optional[float] = None,
+                               attn_eff: Optional[float] = None,
+                               norm_overhead_ms: float = 0.0,
+                               rope_overhead_ms: float = 0.0,
+                               other_overhead_ms: float = 0.0,
+                               attn_overhead_per_layer_ms: float = 0.0) -> None:
+    if weight_mem_eff is not None:
+        args.weight_mem_eff = weight_mem_eff
+    if attn_eff is not None:
+        args.attn_eff = attn_eff
+    args.norm_overhead_ms = norm_overhead_ms
+    args.rope_overhead_ms = rope_overhead_ms
+    args.other_overhead_ms = other_overhead_ms
+    args.attn_overhead_per_layer_ms = attn_overhead_per_layer_ms
+
+
+def _clear_decode_scalar_overlays(args) -> None:
+    """Strip empirical decode overlays so sweep residual trends are not double-counted."""
+    args.weight_mem_eff = None
+    args.norm_overhead_ms = 0.0
+    args.rope_overhead_ms = 0.0
+    args.other_overhead_ms = 0.0
+    args.attn_overhead_per_layer_ms = 0.0
+
+
+def _sweep_loss(model: dict, hw: dict, args, rows: list, ntg: int) -> Tuple[float, float, list]:
+    """Return (mse_on_total, mape_pct, per_row_err)."""
+    errs = []
+    ss = 0.0
+    n = 0
+    for row in rows:
+        npp = int(row["npp"])
+        npl = int(row["npl"])
+        n_ctx = npp + ntg // 2
+        meas = _measured_kernel_ms(row)
+        cats = decode_categories_ms(model, hw, args, n_ctx, npl)
+        pred = sum(cats.values())
+        if meas <= 0:
+            continue
+        e = (pred - meas) / meas
+        ss += e * e
+        errs.append((npp, npl, meas, pred, e * 100.0))
+        n += 1
+    mse = ss / max(n, 1)
+    mape = sum(abs(x[4]) for x in errs) / max(len(errs), 1)
+    return mse, mape, errs
+
+
+def _fit_sweep_params(model: dict, hw: dict, args_template, rows: list, ntg: int,
+                      *, n_trials: int = 2500, seed: int = 0) -> dict:
+    """Random search + coordinate refine; returns dict of fitted fields for _assign_decode_calibration."""
+    rng = random.Random(seed)
+    bounds = dict(
+        weight_mem_eff=(0.18, 0.72),
+        attn_eff=(0.18, 0.72),
+        norm_overhead_ms=(0.0, 2.5),
+        rope_overhead_ms=(0.0, 1.0),
+        other_overhead_ms=(0.0, 3.5),
+        attn_overhead_per_layer_ms=(0.0, 0.035),
+    )
+    keys = list(bounds.keys())
+
+    def vec_to_args(v: dict):
+        a = copy.copy(args_template)
+        _assign_decode_calibration(a, **v)
+        return a
+
+    def loss_vec(v: dict) -> float:
+        a = vec_to_args(v)
+        mse, _, _ = _sweep_loss(model, hw, a, rows, ntg)
+        return mse
+
+    best_v = {k: 0.5 * (bounds[k][0] + bounds[k][1]) for k in keys}
+    best_l = loss_vec(best_v)
+
+    for _ in range(n_trials):
+        v = {k: rng.uniform(bounds[k][0], bounds[k][1]) for k in keys}
+        L = loss_vec(v)
+        if L < best_l:
+            best_l, best_v = L, v
+
+    step = 0.04
+    for _ in range(120):
+        improved = False
+        for k in keys:
+            lo, hi = bounds[k]
+            for delta in (-step, step):
+                v2 = dict(best_v)
+                v2[k] = min(hi, max(lo, v2[k] + delta))
+                L = loss_vec(v2)
+                if L < best_l:
+                    best_l, best_v, improved = L, v2, True
+        if not improved:
+            step *= 0.5
+            if step < 1e-4:
+                break
+
+    return best_v
+
+
+def run_sweep_compare(model: dict, hw: dict, args, rows: list, ntg: int) -> None:
+    mse, mape, errs = _sweep_loss(model, hw, args, rows, ntg)
+    print(f"\n{'═'*100}")
+    print(f"  SWEEP COMPARE  (ntg midpoint ctx = npp + {ntg}//2)  |  rows={len(rows)}")
+    print(f"  Relative-MSE on kernel total={mse:.6f}  |  MAPE={mape:.2f}%")
+    print(f"{'─'*100}")
+    hdr = f"  {'npp':>6} {'npl':>4} {'meas':>8} {'pred':>8} {'err%':>8}"
+    for c in ["QKV", "RoPE", "Attn", "FFN", "Norm", "Oth"]:
+        hdr += f" {c:>11}"
+    print(hdr)
+    print(f"  {'─'*96}")
+    for row in rows:
+        npp = int(row["npp"])
+        npl = int(row["npl"])
+        n_ctx = npp + ntg // 2
+        meas = _measured_kernel_ms(row)
+        cats = decode_categories_ms(model, hw, args, n_ctx, npl)
+        pred = sum(cats.values())
+        errp = 100.0 * (pred - meas) / meas if meas > 0 else 0.0
+        line = f"  {npp:>6} {npl:>4} {meas:>8.2f} {pred:>8.2f} {errp:>7.1f}%"
+        for ck in [
+            "QKV+O proj",
+            "RoPE",
+            "Attention",
+            "FFN",
+            "Norm",
+            "Other",
+        ]:
+            m = float(row.get(f"{ck}_ms", 0) or 0)
+            p = cats.get(ck, 0.0)
+            line += f" {m:>5.1f}/{p:>5.1f}"
+        print(line)
+    print(f"{'═'*100}\n")
+
+
+def run_sweep_fit_and_compare(model: dict, hw: dict, args, path: str, ntg: int,
+                              out_json: Optional[str]) -> None:
+    rows = _load_sweep_rows(path)
+    print(f"\nLoaded {len(rows)} rows from {path}")
+    fitted = _fit_sweep_params(model, hw, args, rows, ntg)
+    print("Fitted decode calibration:")
+    for k, v in sorted(fitted.items()):
+        print(f"    {k} = {v:.6f}")
+    _assign_decode_calibration(args, **fitted)
+    run_sweep_compare(model, hw, args, rows, ntg)
+    if out_json:
+        out = {
+            "_comment": "Fitted by roofline_layer.py --sweep-fit from CUDA PERF sweep CSV",
+            "sweep_csv": path,
+            "sweep_ntg": ntg,
+            "model": args.model,
+            "hw": args.hw,
+            **fitted,
+        }
+        with open(os.path.expanduser(out_json), "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote {out_json}\n")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1189,7 +1863,10 @@ def main():
     p.add_argument("--compute-eff",         type=float, default=0.70,
                    help="Compute utilisation fraction (default 0.70)")
     p.add_argument("--mem-eff",             type=float, default=0.85,
-                   help="Weight/activation memory BW utilisation (default 0.85)")
+                   help="Activation memory BW utilisation (default 0.85)")
+    p.add_argument("--weight-mem-eff",      type=float, default=None,
+                   help="Weight-read BW utilisation for matmul (default: same as --mem-eff). "
+                        "Decode GEMV/GEMM often needs a lower value than activations (e.g. 0.35–0.50 on H100).")
     p.add_argument("--attn-eff",            type=float, default=0.85,
                    help="Attention KV memory BW utilisation (default 0.85)")
     p.add_argument("--attn-bw",             type=float, default=None,
@@ -1201,6 +1878,40 @@ def main():
                    help="Activation BW as fraction of peak hw BW (default 1.0)")
     p.add_argument("--attn-bw-fraction",    type=float, default=1.0,
                    help="Attention KV BW as fraction of peak hw BW (overridden by --attn-bw)")
+
+    p.add_argument("--norm-overhead-ms", type=float, default=0.0,
+                   help="Fixed RMSNorm time per decode step (all layers), CUDA PERF style (ms).")
+    p.add_argument("--rope-overhead-ms", type=float, default=0.0,
+                   help="Fixed RoPE time per decode step (ms).")
+    p.add_argument("--other-overhead-ms", type=float, default=0.0,
+                   help="Fixed residual/copy/launch bucket per decode step (ms).")
+    p.add_argument("--attn-overhead-per-layer-ms", type=float, default=0.0,
+                   help="Flash-attn fixed overhead per layer per decode step (ms).")
+
+    p.add_argument("--sweep-csv", type=str, default=None, metavar="PATH",
+                   help="sweep_batched_bench CSV (-o), or decode_sweep*.txt (DECODE DURATION table). "
+                        "See research/results/decode_sweep.txt, decode_sweep_Qwen3-14B.txt.")
+    p.add_argument("--sweep-ntg", type=int, default=128,
+                   help="ntg used in sweep; avg decode ctx = npp + sweep_ntg//2 (default 128).")
+    p.add_argument("--sweep-compare", action="store_true",
+                   help="Print predicted vs measured table for --sweep-csv.")
+    p.add_argument("--sweep-family-analysis", action="store_true",
+                   help="With --sweep-csv: per-bucket isolation (QKV, Attention, FFN, …) vs vanilla roofline + I=F/B.")
+    p.add_argument("--sweep-family-only", action="store_true",
+                   help="With --sweep-family-analysis: print isolation report and exit.")
+    p.add_argument("--sweep-fit", action="store_true",
+                   help="Fit decode overlays + eff to --sweep-csv; print compare; optional --sweep-calibration-out.")
+    p.add_argument("--sweep-calibration-out", type=str, default=None, metavar="PATH",
+                   help="Write fitted JSON from --sweep-fit.")
+    p.add_argument("--sweep-trends", action="store_true",
+                   help="Fit per-category residual ms vs npl and log2(n_ctx) from --sweep-csv; "
+                        "use instead of scalar decode overlays (clears norm/rope/other/attn_layer "
+                        "overlays and weight_mem_eff from --decode-calibration-json if set).")
+    p.add_argument("--sweep-trend-only", action="store_true",
+                   help="With --sweep-trends: print the trend report and exit (skip full analysis).")
+    p.add_argument("--decode-calibration-json", type=str, default=None, metavar="PATH",
+                   help="Load fitted decode params (weight_mem_eff, attn_eff, *_overhead_ms) from JSON. "
+                        "Scalar overlays are ignored when --sweep-trends is used (attn_eff is kept).")
 
     # Padding
     p.add_argument("--padding-efficiency", type=float, default=1.0,
@@ -1270,6 +1981,15 @@ def main():
     args = p.parse_args()
     _apply_gguf_weight_quant_args(args)
 
+    if getattr(args, "decode_calibration_json", None):
+        calp = os.path.expanduser(args.decode_calibration_json)
+        with open(calp, encoding="utf-8") as f:
+            calj = json.load(f)
+        for key in ("weight_mem_eff", "attn_eff", "norm_overhead_ms", "rope_overhead_ms",
+                    "other_overhead_ms", "attn_overhead_per_layer_ms"):
+            if key in calj and calj[key] is not None:
+                setattr(args, key, float(calj[key]))
+
     # Build configs
     model = dict(MODEL_PRESETS[args.model])
     for attr, key in [("n_layers","n_layers"),("d_model","d_model"),("n_heads","n_heads"),
@@ -1279,6 +1999,37 @@ def main():
     if args.n_kv_heads is not None: model["n_kv_heads"] = args.n_kv_heads
 
     hw = dict(HARDWARE_PRESETS[args.hw])
+
+    if args.sweep_family_analysis and not args.sweep_csv:
+        p.error("--sweep-family-analysis requires --sweep-csv")
+
+    if args.sweep_family_analysis and args.sweep_csv:
+        rows_fa = _load_sweep_rows(args.sweep_csv)
+        run_sweep_family_isolation_report(model, hw, args, rows_fa, args.sweep_ntg)
+        if args.sweep_family_only:
+            return
+
+    if getattr(args, "sweep_trends", False):
+        if not args.sweep_csv:
+            p.error("--sweep-trends requires --sweep-csv")
+        rows_tr = _load_sweep_rows(args.sweep_csv)
+        args._sweep_residual_trend = fit_sweep_residual_trends(
+            model, hw, args, rows_tr, args.sweep_ntg)
+        _clear_decode_scalar_overlays(args)
+        run_sweep_trend_report(model, hw, args, rows_tr, args.sweep_ntg, args._sweep_residual_trend)
+        if args.sweep_trend_only:
+            return
+
+    if args.sweep_fit and args.sweep_csv and getattr(args, "sweep_trends", False):
+        p.error("Choose either --sweep-fit or --sweep-trends (not both).")
+
+    if args.sweep_fit and args.sweep_csv:
+        run_sweep_fit_and_compare(model, hw, args, args.sweep_csv, args.sweep_ntg,
+                                  args.sweep_calibration_out)
+        return
+    if args.sweep_compare and args.sweep_csv:
+        run_sweep_compare(model, hw, args, _load_sweep_rows(args.sweep_csv), args.sweep_ntg)
+        return
 
     analyze_and_print(model, hw, args)
 

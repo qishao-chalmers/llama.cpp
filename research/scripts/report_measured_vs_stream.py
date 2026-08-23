@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare measured kv_timing rows vs stream_perf_model predictions."""
+"""Compare measured kv_timing rows vs stream_perf_model predictions.
+
+Without --calibration-json and without --auto-calibration (or if auto finds no JSON),
+predictions use stream_perf_model.default_calib() — fixed η defaults, no fit to cluster.
+"""
 
 from __future__ import annotations
 
@@ -108,15 +112,16 @@ def main() -> None:
             gguf_cache[gp] = load_gguf_tensor_n_bytes(gp)
         return gguf_cache[gp]
 
-    def _pick_cal(measured_path: str) -> dict[str, Any]:
+    def _pick_cal(measured_path: str) -> tuple[dict[str, Any], str]:
         if args.auto_calibration:
             d = os.path.dirname(os.path.abspath(measured_path))
             cand = os.path.join(d, "stream_calib_decode_h100.json")
             if os.path.isfile(cand):
-                return spm.load_stream_calib(cand)
+                return spm.load_stream_calib(cand), cand
         if args.calibration_json:
-            return spm.load_stream_calib(args.calibration_json)
-        return spm.default_calib(str(args.hw))
+            p = os.path.abspath(os.path.expanduser(args.calibration_json))
+            return spm.load_stream_calib(p), p
+        return spm.default_calib(str(args.hw)), "(default_calib — uncalibrated)"
 
     meas_lbl = "meas_tok/s" if args.unit == "tok_s" else "meas_ms"
     pred_lbl = "pred_tok/s" if args.unit == "tok_s" else "pred_ms"
@@ -135,7 +140,7 @@ def main() -> None:
     all_ratios: list[float] = []
 
     for measured_path in paths:
-        cal = _pick_cal(measured_path)
+        cal, cal_src = _pick_cal(measured_path)
         for w in spm.stream_calib_report_warnings(
             cal,
             hw_name=str(args.hw),
@@ -157,7 +162,7 @@ def main() -> None:
             print("=" * 120)
             print("MEASURED vs stream_perf_model", flush=True)
             print(f"measured_json={measured_path!r}", flush=True)
-            print(f"calibration={args.calibration_json!r} auto={bool(args.auto_calibration)}", flush=True)
+            print(f"stream_calibration={cal_src!r}", flush=True)
             print("=" * 120)
             print(hdr)
             print("-" * len(hdr))

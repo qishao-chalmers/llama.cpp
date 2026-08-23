@@ -6,12 +6,27 @@ Usage:
         --n-ctx 128 --n-chunks 20 --n-threads 8 --out results.json
 """
 
-import argparse, html, json, math, os, re, sys, time
+import argparse, contextlib, html, json, math, os, re, sys, time
 from collections import Counter
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+
+
+@contextlib.contextmanager
+def _suppress_c_stderr():
+    """Silence fd 2 (C library stderr). Python logging still uses dup'd fd after restore."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_fd = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+        os.close(devnull)
+
 
 import llama_bindings as llama
 import parse_state
@@ -207,6 +222,21 @@ _QVIZ_LEGEND = (
 
 
 
+def _infer_weight_tag(path: str) -> str:
+    """Infer a short weight-precision tag from a GGUF filename.
+
+    Takes the LAST -Q{N} match so that 'Qwen3-8B-Q8_0-Q4_K_M.gguf' → 'Q4'
+    rather than 'Q8' (which would match the source model's Q8_0 prefix first).
+    Falls back to 'draft' if no pattern is found.
+    """
+    import re
+    name = os.path.basename(path)
+    matches = re.findall(r'-Q(\d)', name, re.IGNORECASE)
+    if matches:
+        return f"Q{matches[-1]}"
+    return "draft"
+
+
 def _quant_bits_estimate(qspec: str) -> int:
     """Best-effort bit-width estimate for ordering candidate quant specs."""
     if not qspec:
@@ -231,15 +261,44 @@ def _quant_bits_estimate(qspec: str) -> int:
     return bits or 16
 
 
+def _bootstrap_weight_bits_for_tiebreak(pick_name: str) -> int:
+    """Leading weight tag from bootstrap candidate label (``Q8 fp16``, ``Q4 int4_ch``).
+
+    Secondary sort key when KV bit estimates tie: **lower** → prefer smaller/faster
+    weights (Q4 before Q8).  Matches ``cand_display`` built as ``f'{tag} {kv}'``.
+    """
+    if not pick_name:
+        return 16
+    first = pick_name.split(None, 1)[0]
+    if len(first) >= 2 and first[0] in "Qq" and first[1:].isdigit():
+        return int(first[1:])
+    if first.lower() == "draft":
+        return 6
+    return 8
+
+
 def _bootstrap_est_cost_ms_per_tok(agree_rate: float, t_quant: float, t_recover: float) -> float:
     """Expected ms/token: a * t_quant + (1-a) * t_recover (mixture model)."""
     return agree_rate * t_quant + (1.0 - agree_rate) * t_recover
 
 
 def _bootstrap_quant_ms_lookup(name: str, ms_map: dict, default_ms) -> float:
-    """Resolve ms/token for quant path; default_ms used when name missing from ms_map."""
+    """Resolve ms/token for a candidate.
+
+    name is the full display name, e.g. 'Q8 int3_ch' or 'Q4 int3_ch'.
+    Lookup order:
+      1. Exact match: 'Q8 int3_ch'  (weight-precision-aware entry)
+      2. KV-only fallback: 'int3_ch' (backward-compatible entry)
+      3. default_ms
+    Providing separate 'Q4 int3_ch' and 'Q8 int3_ch' entries in the JSON
+    lets cost mode account for the faster Q4_K_M matmul.
+    """
     if name in ms_map:
         return float(ms_map[name])
+    # KV-only fallback: strip weight tag prefix ("Q8 " / "Q4 ")
+    kv_part = name.split(" ", 1)[-1] if " " in name else name
+    if kv_part in ms_map:
+        return float(ms_map[kv_part])
     if default_ms is not None:
         return float(default_ms)
     raise KeyError(name)
@@ -278,6 +337,8 @@ def _bootstrap_split_cost_json(raw: dict):
     recover_map = {str(k): float(v) for k, v in recover.items()}
     quant_map = {}
     for k, v in data.items():
+        if str(k).startswith("_"):  # skip comment/metadata keys
+            continue
         if not isinstance(v, (int, float)):
             raise ValueError(f"quant {k!r}: expected number, got {type(v).__name__}")
         quant_map[str(k)] = float(v)
@@ -445,9 +506,21 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
     k_uniform  = len(set(k_layer_gs)) == 1
     v_uniform  = len(set(v_layer_gs)) == 1
 
+    # GPU path requires raw K/V pointers via llama_get_kv_layer_info (llama_kv_cache
+    # only). Hybrid / iswa models (e.g. Qwen3.5) return -1 — use CPU hooks.
+    use_gpu_eff = bool(use_gpu and HAS_GPU_QUANT and ctx_ptr is not None)
+    if use_gpu_eff and not gpu_quant.gpu_kv_cache_supported(lib, ctx_ptr, n_layer):
+        if not getattr(make_kv_hook, "_warned_gpu_kv_unsupported", False):
+            print("NOTE: GPU KV quant hooks need llama_get_kv_layer_info; this model "
+                  "uses a memory backend without it (e.g. Qwen3.5 hybrid / SWA). "
+                  "Falling back to CPU parse_state for KV quantization (slower).",
+                  flush=True)
+            make_kv_hook._warned_gpu_kv_unsupported = True
+        use_gpu_eff = False
+
     if k_uniform and v_uniform:
         # Simple path: no per-layer tracking needed; hook fires at the right cadence
-        if use_gpu and HAS_GPU_QUANT:
+        if use_gpu_eff:
             return _apply_window(
                 gpu_quant.make_kv_hook_gpu(lib, ctx_ptr, k_names, v_names, n_layer,
                                            profile=profile),
@@ -487,7 +560,7 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                     result.append(0)    # not enough accumulated yet
         return result
 
-    if use_gpu and HAS_GPU_QUANT:
+    if use_gpu_eff:
         def hook_gpu_mixed(ctx, n_new_k=None, n_new_v=None, **_):
             k_per = _per_layer_new(n_new_k, k_pending, k_layer_gs)
             v_per = _per_layer_new(n_new_v, v_pending, v_layer_gs)
@@ -514,6 +587,11 @@ def make_kv_hook(lib, k_names, v_names, n_pos_per_embd=1,
                                       profile=profile)
     return _apply_window(hook_cpu_mixed, n_sink, n_recent,
                          sink_hook=sink_hook, recent_hook=recent_hook)
+
+
+def _noop_kv_hook(_ctx, n_new_k=None, n_new_v=None, **kwargs):
+    """Callable stand-in when make_kv_hook returns None (fp16 KV — bootstrap still calls cand_hook)."""
+    pass
 
 
 def get_kv_group_sizes(k_names, v_names, default_group_size):
@@ -574,6 +652,9 @@ def _failure_summary(gl: dict, n_total: int) -> str:
         if gl["n_trunc_fail"]: parts.append(f"trunc={gl['n_trunc_fail']}")
         if gl["n_no_match"]:   parts.append(f"no_match={gl['n_no_match']}")
         if gl.get("n_inconclusive"): parts.append(f"inconclusive={gl['n_inconclusive']}")
+        if gl.get("n_rep_stop"):     parts.append(f"rep_stop={gl['n_rep_stop']}"
+                                                   f"(+{gl.get('n_rep_stop_with_answer',0)}"
+                                                   f"/-{gl.get('n_rep_stop_no_answer',0)})")
     elif gl.get("n_truncated"):
         parts.append(f"trunc={gl['n_truncated']}/{n_total}")
     return ("  " + "  ".join(parts)) if parts else ""
@@ -654,7 +735,11 @@ def main():
                         help="Print detokenized prompt/completion and fp16 top-1 predictions.")
     parser.add_argument("--show-gen",       action="store_true",
                         help="Print the full generated text for each accuracy example (raw, not repr). "
-                             "Useful for inspecting CoT reasoning without the prompt noise.")
+                             "Useful for inspecting CoT reasoning without the prompt noise. "
+                             "Streams live while generating; use --show-gen-stream-every to reduce overhead.")
+    parser.add_argument("--show-gen-stream-every", type=int, default=1, metavar="N",
+                        help="With --show-gen, print detokenized output every N tokens (default 1). "
+                             "Values like 8–32 reduce Python-side detokenize cost on long runs.")
     parser.add_argument("--show-prompt",    action="store_true",
                         help="Print the detokenized prompt for each accuracy example (raw). "
                              "Combine with --show-gen to see prompt + generation together.")
@@ -689,6 +774,35 @@ def main():
                              "(overrides the auto-enable of --skip-ppl).")
     parser.add_argument("--max-gen-tokens", type=int, default=512,
                         help="Max new tokens to generate per example for --eval-accuracy (default 512).")
+    parser.add_argument("--list-tasks", action="store_true",
+                        help="Dry-run: print all task labels that would be tested (respects "
+                             "--n-chunks / --offset), then exit. No model is loaded.")
+    parser.add_argument("--task-ids", type=int, nargs="+", metavar="ID", default=None,
+                        help="Run only these task IDs (the number after '#' in labels like "
+                             "'aime#17'). Example: --task-ids 17 26 28 29")
+    parser.add_argument("--rep-rate-threshold", type=float, default=0.0, metavar="T",
+                        help="Repetition early-stop threshold (0=disabled). If the 3-gram "
+                             "repetition rate in the last 20 tokens exceeds T for "
+                             "--rep-rate-consecutive steps in a row, generation stops early. "
+                             "Useful for long AIME generations. Suggested: 0.8.")
+    parser.add_argument("--rep-rate-consecutive", type=int, default=5, metavar="N",
+                        help="Number of consecutive steps above --rep-rate-threshold before "
+                             "stopping generation (default 5).")
+    parser.add_argument("--rep-period-stop", action="store_true", default=False,
+                        help="Enable period-repetition early stop. Detects when the last "
+                             "rep-period-repeats blocks of length p all share >= "
+                             "rep-period-similarity token overlap.")
+    parser.add_argument("--rep-period-min", type=int, default=8, metavar="P",
+                        help="Minimum period length to check (default 8).")
+    parser.add_argument("--rep-period-max", type=int, default=160, metavar="P",
+                        help="Maximum period length to check (default 160).")
+    parser.add_argument("--rep-period-repeats", type=int, default=3, metavar="N",
+                        help="Number of consecutive same-period blocks required to fire (default 3).")
+    parser.add_argument("--rep-period-similarity", type=float, default=0.92, metavar="S",
+                        help="Minimum per-block token match fraction to count as a repeat (default 0.92).")
+    parser.add_argument("--rep-min-tokens", type=int, default=256, metavar="N",
+                        help="Do not check period repetition until this many tokens have been "
+                             "generated (default 256).")
     parser.add_argument("--answer-regex",
                         default=r"(?:####|[Tt]he answer is)\s*\$?\s*\*{0,2}\s*([\d,]+)\s*\*{0,2}|\\boxed\{([\d,]+)\}",
                         help="Regex with capture group(s) to extract the answer from generated "
@@ -731,7 +845,9 @@ def main():
     parser.add_argument("--adaptive-gen",    action="store_true",
                         help="Real adaptive generation: bootstrap window (fp16 generates W tokens); "
                              "then quant rollout windows (draft quant generates W tokens, verifier "
-                             "replays; accept or fp16 fallback). Requires --eval-accuracy --skip-ppl.")
+                             "replays; accept or fp16 fallback). Requires --eval-accuracy --skip-ppl. "
+                             "With only --quants fp16 and --draft-models, runs adaptive-gen with "
+                             "fp16 KV on both contexts (weight-quant draft vs main GGUF).")
     parser.add_argument("--adaptive-window", type=int, default=8,
                         help="Rollout window size W (tokens) for each quant draft / fp16 verify "
                              "cycle in --adaptive-sim/--adaptive-gen (default: 8).")
@@ -748,12 +864,13 @@ def main():
                         metavar="E",
                         help="With --bootstrap-probe-windows 0 and --bootstrap-pick-mode agree-rate: "
                              "among candidates whose verifier-agree rate is within E of the best, "
-                             "pick the lowest-bit quant. Default 0.02.")
+                             "pick min KV bit estimate, then prefer lower weight tag (Q4 before Q8). "
+                             "Default 0.02.")
     parser.add_argument("--bootstrap-pick-mode", choices=("agree-rate", "cost"),
                         default="agree-rate",
-                        help="When --bootstrap-probe-windows 0: agree-rate (ε band + min bits) or "
-                             "cost (min expected ms/token; see --bootstrap-ms-quant-file). "
-                             "Ignored when probe is enabled.")
+                        help="When --bootstrap-probe-windows 0: agree-rate (ε band + min KV bits + "
+                             "weight tag tie-break) or cost (min expected ms/token; see "
+                             "--bootstrap-ms-quant-file). Ignored when probe is enabled.")
     parser.add_argument("--bootstrap-ms-quant-file", default=None, metavar="FILE",
                         help="For --bootstrap-pick-mode cost: JSON with \"recover\" "
                              "{verifier-quant -> ms/token} plus draft quant -> ms/token; "
@@ -774,6 +891,13 @@ def main():
                         help="For --adaptive-gen: use CPU KV blob save/restore (PCIe on GPU). "
                              "Default: GPU device-to-device shadow checkpoint via CuPy when "
                              "GPU KV is active.")
+    parser.add_argument("--no-sync-draft-kv", dest="sync_draft_kv",
+                        action="store_false", default=True,
+                        help="With --adaptive-gen + --draft-model: draft context keeps its own "
+                             "accumulated KV instead of being seeded from verifier KV at each "
+                             "window. By default (sync on) draft starts every window from the "
+                             "verifier's fp16 KV blob. Only affects runs where ex_draft_ctx is "
+                             "a separate context (i.e. --draft-model is set).")
     parser.add_argument("--qviz-html", default=None, metavar="FILE",
                         help="With --adaptive-gen: write grayscale HTML segment qviz (tall=dark, "
                              "short=light) to FILE.")
@@ -785,6 +909,16 @@ def main():
                              "in-place kernels + cuda synchronize. Per-quant summary; --profile-kv-out JSON.")
     parser.add_argument("--profile-kv-out", default=None, metavar="FILE",
                         help="Write per-quant profile dicts as JSON (quant name -> timings).")
+    parser.add_argument("--draft-model", default=None, metavar="PATH",
+                        help="Draft model GGUF (lower weight precision, e.g. Q4_K_M). "
+                             "Used with --adaptive-gen: draft uses this model's weights + "
+                             "KV quant hook; verifier uses main model + verifier KV hook. "
+                             "Create with: python3 research/scripts/make_draft_model.py SRC Q4_K_M")
+    parser.add_argument("--draft-models", nargs="+", default=None, metavar="PATH",
+                        help="Additional draft model GGUFs (e.g. Q3_K_M Q2_K). "
+                             "Weight tag inferred from filename (Q4_K_M→Q4, Q3_K_M→Q3, Q2_K→Q2). "
+                             "Bootstrap picks from all (weight, KV quant) combinations. "
+                             "Can be combined with --draft-model.")
     parser.add_argument("--out",            default="results.json")
     parser.add_argument("--quants",    nargs="+",
                         default=["fp16","bf16","fp8_e4m3","fp8_e5m2","int8","int8_ch","int4","int4_ch","nf4","int2"])
@@ -827,6 +961,29 @@ def main():
     if args.save_diags       is None: args.save_diags       = _sibling("_diags.json")
     if args.profile_kv and args.profile_kv_out is None:
         args.profile_kv_out = _sibling("_kv_profile.json")
+
+    # ── --list-tasks: print task labels without loading model, then exit ────────
+    if args.list_tasks:
+        if args.corpus_mode != "structured" or not args.corpus_file.endswith(".jsonl"):
+            sys.exit("--list-tasks only works with --corpus-mode structured and a .jsonl file")
+        records = []
+        with open(args.corpus_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        max_examples = args.n_chunks if args.n_chunks > 0 else len(records)
+        records = records[:max_examples]
+        print(f"# {len(records)} tasks  file={args.corpus_file}  n_chunks={args.n_chunks}")
+        for i, rec in enumerate(records):
+            if "dataset" in rec:
+                label = f"{rec['dataset']}#{rec.get('id', i)}"
+            elif "repo" in rec and "file" in rec:
+                label = f"{rec['repo']}/{rec['file']}"
+            else:
+                label = str(rec.get("id", i))
+            print(f"  {i:>4}  {label}")
+        sys.exit(0)
 
     # ── Structured corpus implies skip-ppl by default ────────────────────────
     # Teacher-forced PPL is meaningless for QA/reasoning tasks (GSM8K, NIAH,
@@ -875,6 +1032,30 @@ def main():
     vocab = lib.llama_model_get_vocab(model)
     n_vocab = lib.llama_vocab_n_tokens(vocab)
     n_layer = lib.llama_model_n_layer(model)
+
+    # Build list of (tag, model_ptr) for all draft models.
+    # Tag is inferred from filename: Q4_K_M→"Q4", Q3_K_M→"Q3", Q2_K→"Q2", etc.
+    _draft_paths = []
+    if args.draft_model:
+        _draft_paths.append(args.draft_model)
+    if args.draft_models:
+        _draft_paths.extend(args.draft_models)
+    if _draft_paths and not args.adaptive_gen:
+        print("[warning] --draft-model / --draft-models have no effect without --adaptive-gen",
+              flush=True)
+        _draft_paths = []
+    draft_models_list = []  # list of (tag, model_ptr)
+    for _dp in _draft_paths:
+        _tag = _infer_weight_tag(_dp)
+        _dmp = lib.llama_model_default_params()
+        _dmp.n_gpu_layers = args.n_gpu_layers
+        with _suppress_c_stderr():
+            _dm = lib.llama_model_load_from_file(_dp.encode(), _dmp)
+        if not _dm:
+            sys.exit(f"Failed to load draft model: {_dp}")
+        print(f"[draft model] {_tag}  {_dp}", flush=True)
+        draft_models_list.append((_tag, _dm))
+    draft_ctx_list = []  # list of (tag, ctx_ptr); set per-iteration; captured by run_adaptive_gen
 
     # End-of-generation check — stops generation when the model emits any token
     # that the model author marked as EOG (EOS, EOT, or model-specific variants).
@@ -1425,10 +1606,27 @@ def main():
                     break
             return n
 
-        cand_specs = draft_quant_candidates if draft_quant_candidates is not None else [draft_quant_name]
-        cand_specs = [c for c in cand_specs if c and c != "fp16"]
-        _ord = {c: i for i, c in enumerate(cand_specs)}
-        cand_specs = sorted(cand_specs, key=lambda c: (_quant_bits_estimate(c), _ord.get(c, 10**9)))
+        _kv_quants = draft_quant_candidates if draft_quant_candidates is not None else [draft_quant_name]
+        _kv_quants = [c for c in _kv_quants if c and c != "fp16"]
+        if not _kv_quants:
+            # Weight-quant draft + fp16 KV: callers pass draft_quant_name=fp16 and no int4/int8
+            # quants in --quants; expand so bootstrap still builds (Q8,fp16)+(draft,fp16) rows.
+            if draft_quant_name == "fp16":
+                _kv_quants = ["fp16"]
+            else:
+                raise RuntimeError(
+                    "run_adaptive_gen: empty KV quant candidate list "
+                    f"(draft_quant_name={draft_quant_name!r})")
+        _ord = {c: i for i, c in enumerate(_kv_quants)}
+
+        # Build combined candidate list: (weight_tag, kv_quant, cand_ctx).
+        # For each KV quant: Q8 (main ctx) first, then each draft model in order.
+        # Sorted by KV bits then original order; draft models appended after Q8.
+        cand_specs = []
+        for _kv in sorted(_kv_quants, key=lambda c: (_quant_bits_estimate(c), _ord.get(c, 10**9))):
+            cand_specs.append(("Q8", _kv, ctx))
+            for (_dtag, _dc) in draft_ctx_list:
+                cand_specs.append((_dtag, _kv, _dc))
 
         def _emit_segment(buf: list, name: str, n: int) -> None:
             """Merge consecutive runs with the same quant label."""
@@ -1479,6 +1677,25 @@ def main():
                 return
             raise RuntimeError("restore_ckpt_pair: empty checkpoint")
 
+        def _restore_to(pair, target):
+            """Restore checkpoint into target context.
+
+            target=ctx uses _restore_ckpt_pair (handles GPU shadow).
+            target=draft_ctx always uses CPU blob (GPU shadow not supported for draft_ctx).
+            """
+            if target is ctx:
+                _restore_ckpt_pair(pair)
+            else:
+                _, c = pair
+                if c is None:
+                    raise RuntimeError("_restore_to draft_ctx: no CPU blob")
+                strategies.restore_kv_state(lib, target, c)
+
+        # ex_draft_ctx: context for the rollout draft phase; set by bootstrap pick.
+        # Before bootstrap runs (or when no candidates), defaults to the first draft ctx
+        # if any draft models are loaded, else the main ctx.
+        _default_draft_ctx = draft_ctx_list[0][1] if draft_ctx_list else ctx
+
         for ei, (pt, ct, label) in enumerate(examples):
             max_ctx_avail = args.n_ctx - len(pt) - 1
             max_gen = min(args.max_gen_tokens, max_ctx_avail)
@@ -1488,6 +1705,8 @@ def main():
 
             mem = lib.llama_get_memory(ctx)
             lib.llama_memory_clear(mem, True)
+            for (_, _dc) in draft_ctx_list:
+                lib.llama_memory_clear(lib.llama_get_memory(_dc), True)
             n_pt = len(pt)
 
             # ── Prompt prefill ────────────────────────────────────────────
@@ -1545,6 +1764,13 @@ def main():
             _emit_segment(segments, "fp16", len(bootstrap_tokens))
             # KV = 0..n_pt+len(bootstrap_tokens)-2 (all fp16)
             kv_boundary = _save_ckpt_pair()
+            # Separate draft KV boundary for --no-sync-draft-kv mode.
+            # None when sync is on (draft always restored from kv_boundary).
+            draft_boundary = None
+            if args.show_gen and _show_this(ei, len(examples)):
+                _sg = llama.detokenize(lib, vocab, bootstrap_tokens, remove_special=False)
+                print(f"\n--- gen [{label}] ---", flush=True)
+                print(f"[fp16 bootstrap] {_sg}", end="", flush=True)
             prime_tok = bootstrap_tokens[-1]
             prime_pos = n_pt + len(bootstrap_tokens) - 1
 
@@ -1591,6 +1817,7 @@ def main():
             ex_draft_k_gs = draft_k_gs
             ex_draft_v_gs = draft_v_gs
             ex_draft_name = draft_quant_name
+            ex_draft_ctx  = _default_draft_ctx
 
             # ── Bootstrap pick: try each --quants candidate; score probe acceptance;
             # then pick max (probe_rate, bit_width) so int4 can win over int2 on ties.
@@ -1602,8 +1829,10 @@ def main():
                 picked = None
                 scored = []  # bootstrap+probe results per candidate (for final argmax)
                 failed = []  # candidates that failed bootstrap, with n_match score
-                tried = cand_specs or [draft_quant_name]
-                _cand_w = max((len(c) for c in tried), default=8)
+                # cand_specs is list of (weight_tag, kv_quant, cand_ctx)
+                # Fall back to single Q8 entry using draft_quant_name if empty.
+                tried = cand_specs or [("Q8", draft_quant_name, ctx)]
+                _cand_w = max((len(f"{tag} {kv}") for tag, kv, _ in tried), default=8)
                 _cand_w = max(_cand_w, 10)
                 bootstrap_probe_disabled = max(0, args.bootstrap_probe_windows) == 0
                 probe_min_rate = 0.90
@@ -1633,7 +1862,8 @@ def main():
                         raise ValueError(
                             "--bootstrap-pick-mode cost: add draft quant entries to the JSON "
                             "and/or set --bootstrap-ms-quant-default")
-                for cand in tried:
+                for (cand_tag, cand, cand_ctx_iter) in tried:
+                    cand_display = f"{cand_tag} {cand}"
                     cand_k_names, cand_v_names = quant_mod.resolve_quant_layers(cand, n_layer)
                     cand_k_gs, cand_v_gs = get_kv_group_sizes(
                         cand_k_names, cand_v_names, args.quant_group_size)
@@ -1649,6 +1879,8 @@ def main():
                         v_recent_names=v_recent_names,
                         asym=args.asym, quant_fn_factory=None,
                         profile=kv_prof)
+                    if cand_hook is None:
+                        cand_hook = _noop_kv_hook
 
                     kv_roll = None  # fp16 teacher after each chunk (pair or gpu/cpu ckpt)
                     prime_tok_bs = pt[-1]
@@ -1675,31 +1907,32 @@ def main():
                         # decode pt[-1]). Do *not* use rollout bulk+decode(prime) here: the
                         # fp16 prompt checkpoint already has pt[-1] at n_pt-1, which would
                         # duplicate position (llama requires Y = X+1).
+                        # Draft uses cand_ctx_iter: ctx for Q8 candidates, draft_ctx for Q4.
                         if off == 0:
-                            _restore_ckpt_pair(pre_prime_blob)
-                            cand_hook(ctx, n_new_k=None, n_new_v=None,
+                            _restore_to(pre_prime_blob, cand_ctx_iter)
+                            cand_hook(cand_ctx_iter, n_new_k=None, n_new_v=None,
                                       n_prompt=n_pt - 1)
-                            ret = strategies._single_decode(lib, ctx, pt[-1], n_pt - 1)
+                            ret = strategies._single_decode(lib, cand_ctx_iter, pt[-1], n_pt - 1)
                             if ret != 0:
                                 w0_ok = False
                                 n_match = off
                                 break
-                            cand_hook(ctx, n_new_k=1, n_new_v=1)
+                            cand_hook(cand_ctx_iter, n_new_k=1, n_new_v=1)
                         else:
-                            _restore_ckpt_pair(kv_roll)
-                            cand_hook(ctx, n_new_k=None, n_new_v=None,
+                            _restore_to(kv_roll, cand_ctx_iter)
+                            cand_hook(cand_ctx_iter, n_new_k=None, n_new_v=None,
                                       n_prompt=0, n_seq_len=prime_pos_bs + 1)
-                            ret = strategies._single_decode(lib, ctx, prime_tok_bs,
+                            ret = strategies._single_decode(lib, cand_ctx_iter, prime_tok_bs,
                                                             prime_pos_bs)
                             if ret != 0:
                                 w0_ok = False
                                 n_match = off
                                 break
-                            cand_hook(ctx, n_new_k=1, n_new_v=1)
-                        ptr_d = lib.llama_get_logits_ith(ctx, 0)
+                            cand_hook(cand_ctx_iter, n_new_k=1, n_new_v=1)
+                        ptr_d = lib.llama_get_logits_ith(cand_ctx_iter, 0)
                         d_logits = np.ctypeslib.as_array(ptr_d, shape=(n_vocab,)).copy()
                         draft_tokens = strategies.generate_window(
-                            lib, ctx, n_vocab, int(np.argmax(d_logits)),
+                            lib, cand_ctx_iter, n_vocab, int(np.argmax(d_logits)),
                             pos_start=pos_start, W=w_chunk,
                             kv_hook=cand_hook,
                             k_group_size=cand_k_gs, v_group_size=cand_v_gs,
@@ -1825,7 +2058,7 @@ def main():
                     _ver_lbl = verifier_quant_name if ver_hook else "fp16"
                     if not w0_ok:
                         if len(bootstrap_ref_tokens) > 1 and n_match >= 0:
-                            print(f"      {cand:<{_cand_w}}  bootstrap FAIL "
+                            print(f"      {cand_display:<{_cand_w}}  bootstrap FAIL "
                                   f"(decode/empty at offset {n_match}/{len(bootstrap_ref_tokens)}) | "
                                   f"tok {bootstrap_quant_toks} full+{_ver_lbl} + "
                                   f"{bootstrap_prefix_ok_toks} verif-prefix + "
@@ -1834,14 +2067,15 @@ def main():
                                   f"| {bootstrap_win_ok}q+{bootstrap_steers}s chunks",
                                   flush=True)
                         else:
-                            print(f"      {cand:<{_cand_w}}  bootstrap FAIL", flush=True)
+                            print(f"      {cand_display:<{_cand_w}}  bootstrap FAIL", flush=True)
                         failed.append({
-                            "name":  cand,
+                            "name":  cand_display,
                             "match": n_match if len(bootstrap_ref_tokens) > 1 else -1,
                             "bits":  _quant_bits_estimate(cand),
                             "hook":  cand_hook,
                             "k_gs":  cand_k_gs,
                             "v_gs":  cand_v_gs,
+                            "cand_ctx": cand_ctx_iter,
                         })
                         continue
 
@@ -1863,18 +2097,18 @@ def main():
                             break
                         probe_attempted += 1
 
-                        # Draft window under candidate
-                        _restore_ckpt_pair(probe_ckpt)
-                        cand_hook(ctx, n_new_k=None, n_new_v=None,
+                        # Draft window under candidate; use per-candidate context
+                        _restore_to(probe_ckpt, cand_ctx_iter)
+                        cand_hook(cand_ctx_iter, n_new_k=None, n_new_v=None,
                                   n_prompt=0, n_seq_len=probe_prime_pos + 1)
-                        ret_p = strategies._single_decode(lib, ctx, probe_prime_tok, probe_prime_pos)
+                        ret_p = strategies._single_decode(lib, cand_ctx_iter, probe_prime_tok, probe_prime_pos)
                         if ret_p != 0:
                             break
-                        cand_hook(ctx, n_new_k=1, n_new_v=1)
-                        ptr_p = lib.llama_get_logits_ith(ctx, 0)
+                        cand_hook(cand_ctx_iter, n_new_k=1, n_new_v=1)
+                        ptr_p = lib.llama_get_logits_ith(cand_ctx_iter, 0)
                         cand_draft_logits = np.ctypeslib.as_array(ptr_p, shape=(n_vocab,)).copy()
                         draft_tokens = strategies.generate_window(
-                            lib, ctx, n_vocab, int(np.argmax(cand_draft_logits)),
+                            lib, cand_ctx_iter, n_vocab, int(np.argmax(cand_draft_logits)),
                             pos_start=probe_prime_pos + 1, W=probe_w,
                             kv_hook=cand_hook,
                             k_group_size=cand_k_gs, v_group_size=cand_v_gs,
@@ -1966,7 +2200,7 @@ def main():
                     if use_cost_pick:
                         try:
                             _tq = _bootstrap_quant_ms_lookup(
-                                cand, cost_ms_map, cost_ms_default)
+                                cand_display, cost_ms_map, cost_ms_default)
                         except KeyError as _e:
                             raise KeyError(
                                 f"bootstrap cost mode: no ms/token for quant {cand!r}; "
@@ -1981,7 +2215,7 @@ def main():
                             f"agree {_ar:>6.3f} ({_agree_toks:>3}/{_br_len})  | ")
                     else:
                         _metric_col = ""
-                    print(f"      {cand:<{_cand_w}}  bootstrap OK  | {_metric_col}"
+                    print(f"      {cand_display:<{_cand_w}}  bootstrap OK  | {_metric_col}"
                           f"{off}/{len(bootstrap_ref_tokens)} tok: "
                           f"{bootstrap_quant_toks} full+{_ver_lbl} + "
                           f"{bootstrap_prefix_ok_toks} verif-prefix + "
@@ -1991,14 +2225,15 @@ def main():
                           f"{probe_note}",
                           flush=True)
                     scored.append({
-                        "name":   cand,
-                        "rate":   probe_rate,
-                        "acc":    probe_accepted,
-                        "tot":    probe_attempted,
-                        "bits":   _quant_bits_estimate(cand),
-                        "hook":   cand_hook,
-                        "k_gs":   cand_k_gs,
-                        "v_gs":   cand_v_gs,
+                        "name":     cand_display,
+                        "rate":     probe_rate,
+                        "acc":      probe_accepted,
+                        "tot":      probe_attempted,
+                        "bits":     _quant_bits_estimate(cand),
+                        "hook":     cand_hook,
+                        "k_gs":     cand_k_gs,
+                        "v_gs":     cand_v_gs,
+                        "cand_ctx": cand_ctx_iter,
                         "bootstrap_prefix_ok_toks": bootstrap_prefix_ok_toks,
                         "bootstrap_mismatch_toks":    bootstrap_mismatch_toks,
                         "probe_disabled":             probe_disabled,
@@ -2023,19 +2258,31 @@ def main():
                         if bootstrap_probe_disabled and use_cost_pick:
                             win = min(
                                 eligible,
-                                key=lambda s: (s["est_cost_ms_per_tok"], s["bits"]))
+                                key=lambda s: (
+                                    s["est_cost_ms_per_tok"],
+                                    s["bits"],
+                                    _bootstrap_weight_bits_for_tiebreak(s["name"])))
                         elif bootstrap_probe_disabled:
                             eps = float(args.bootstrap_pick_epsilon)
                             best_ag = max(s["bootstrap_agree_rate"] for s in eligible)
                             band = [
                                 s for s in eligible
                                 if best_ag - s["bootstrap_agree_rate"] <= eps + 1e-15]
-                            win = min(band, key=lambda s: s["bits"])
+                            win = min(
+                                band,
+                                key=lambda s: (
+                                    s["bits"],
+                                    _bootstrap_weight_bits_for_tiebreak(s["name"])))
                         else:
-                            win = min(eligible, key=lambda s: (s["bits"], -s["rate"]))
+                            win = min(
+                                eligible,
+                                key=lambda s: (
+                                    s["bits"],
+                                    -s["rate"],
+                                    _bootstrap_weight_bits_for_tiebreak(s["name"])))
                     else:
                         win = max(scored, key=lambda s: (s["rate"], s["bits"]))
-                    picked = (win["name"], win["hook"], win["k_gs"], win["v_gs"])
+                    picked = (win["name"], win["hook"], win["k_gs"], win["v_gs"], win["cand_ctx"])
                     _br_show = len(bootstrap_ref_tokens)
                     _win_w = max(_cand_w, len(win["name"]))
                     if bootstrap_probe_disabled:
@@ -2062,7 +2309,8 @@ def main():
                     elif bootstrap_probe_disabled:
                         pick_note = (
                             f"probe disabled → agree {win['bootstrap_agree_rate']:.3f} "
-                            f"(ε={args.bootstrap_pick_epsilon} band → min bits)")
+                            f"(ε={args.bootstrap_pick_epsilon} band → min KV bits, "
+                            f"then prefer lower weight tag)")
                     else:
                         pick_note = (
                             f"probe={win['rate']:.2f} ({win['acc']}/{win['tot']})")
@@ -2088,6 +2336,7 @@ def main():
                     fb_hook = fb_entry["hook"]
                     fb_k_gs = fb_entry["k_gs"]
                     fb_v_gs = fb_entry["v_gs"]
+                    fb_cand_ctx = fb_entry["cand_ctx"]
                     match_str = (f"{fb_entry['match']}/{len(bootstrap_ref_tokens)}"
                                  if fb_entry["match"] >= 0 else "?")
                     def _fmt_fail(s):
@@ -2098,7 +2347,7 @@ def main():
                         _fmt_fail(s)
                         for s in sorted(failed, key=lambda s: (_quant_bits_estimate(s["name"]), s["name"]))
                         if s["name"] != fb)
-                    picked = (fb, fb_hook, fb_k_gs, fb_v_gs)
+                    picked = (fb, fb_hook, fb_k_gs, fb_v_gs, fb_cand_ctx)
                     print(f"    bootstrap_pick [{label}]: {fb}  FALLBACK (best n_match={match_str})"
                           + (f"  [{others}]" if others else ""),
                           flush=True)
@@ -2107,7 +2356,7 @@ def main():
 
                 n_attempted += 1
                 if picked is not None:
-                    ex_draft_name, ex_draft_hook, ex_draft_k_gs, ex_draft_v_gs = picked
+                    ex_draft_name, ex_draft_hook, ex_draft_k_gs, ex_draft_v_gs, ex_draft_ctx = picked
                 if scored:
                     n_accepted += 1
                 # else: keep the passed-in draft_* as fallback
@@ -2130,20 +2379,31 @@ def main():
                 n_attempted += 1
 
                 # Step A: draft generates w_size tokens with quantized KV.
-                # Restore fp16 boundary, then bulk-quantize KV (respecting sink/recent zones
-                # from --sink-tokens/--recent-tokens) so the draft attends to the correct
-                # quantized background — matching the real deployment configuration.
-                _restore_ckpt_pair(kv_boundary)
-                ex_draft_hook(ctx, n_new_k=None, n_new_v=None,
-                              n_prompt=0, n_seq_len=prime_pos + 1)
-                ret = strategies._single_decode(lib, ctx, prime_tok, prime_pos)
+                # ex_draft_ctx: ctx (Q8 winner) or draft_ctx (Q4 winner) from bootstrap_pick.
+                # ex_draft_hook=None means fp16 KV (weight-quant-only baseline).
+                # With --no-sync-draft-kv: draft keeps its own accumulated KV when it is a
+                # separate context; otherwise (sync on, or same ctx) restore from verifier.
+                _use_draft_boundary = (
+                    not args.sync_draft_kv
+                    and ex_draft_ctx is not ctx
+                    and draft_boundary is not None
+                )
+                if _use_draft_boundary:
+                    strategies.restore_kv_state(lib, ex_draft_ctx, draft_boundary)
+                else:
+                    _restore_to(kv_boundary, ex_draft_ctx)
+                if ex_draft_hook is not None:
+                    ex_draft_hook(ex_draft_ctx, n_new_k=None, n_new_v=None,
+                                  n_prompt=0, n_seq_len=prime_pos + 1)
+                ret = strategies._single_decode(lib, ex_draft_ctx, prime_tok, prime_pos)
                 if ret != 0:
                     break
-                ex_draft_hook(ctx, n_new_k=1, n_new_v=1)        # quantize prime_pos cell
-                ptr          = lib.llama_get_logits_ith(ctx, 0)
+                if ex_draft_hook is not None:
+                    ex_draft_hook(ex_draft_ctx, n_new_k=1, n_new_v=1)
+                ptr          = lib.llama_get_logits_ith(ex_draft_ctx, 0)
                 draft_logits = np.ctypeslib.as_array(ptr, shape=(n_vocab,)).copy()
                 quant_rollout_tokens = strategies.generate_window(
-                    lib, ctx, n_vocab, int(np.argmax(draft_logits)),
+                    lib, ex_draft_ctx, n_vocab, int(np.argmax(draft_logits)),
                     pos_start=pos_start, W=w_size,
                     kv_hook=ex_draft_hook,
                     k_group_size=ex_draft_k_gs, v_group_size=ex_draft_v_gs,
@@ -2203,8 +2463,14 @@ def main():
                     _emit_segment(segments, ex_draft_name, len(quant_rollout_tokens))
                     # KV is fp16 from verify_window; save new boundary blob.
                     kv_boundary = _save_ckpt_pair()
+                    if not args.sync_draft_kv and ex_draft_ctx is not ctx:
+                        draft_boundary = strategies.save_kv_state(lib, ex_draft_ctx)
                     prime_tok = quant_rollout_tokens[-1]
                     prime_pos = pos_start + len(quant_rollout_tokens) - 1
+                    if args.show_gen and _show_this(ei, len(examples)):
+                        _sg = llama.detokenize(lib, vocab, quant_rollout_tokens, remove_special=False)
+                        print(f"\n[{ex_draft_name}]", end="", flush=True)
+                        print(_sg, end="", flush=True)
                 else:
                     # Fallback: fp16 generates this window (restore fp16 first).
                     _restore_ckpt_pair(kv_boundary)
@@ -2222,8 +2488,16 @@ def main():
                     path_per_tok += ["fp16"] * len(fb_toks)
                     _emit_segment(segments, "fp16", len(fb_toks))
                     kv_boundary = _save_ckpt_pair()
+                    if not args.sync_draft_kv and ex_draft_ctx is not ctx:
+                        # Fallback used fp16 on verifier ctx; draft KV is stale.
+                        # Sync draft to verifier so it attends correct positions next window.
+                        draft_boundary = strategies.save_kv_state(lib, ctx)
                     prime_tok = fb_toks[-1]
                     prime_pos = pos_start + len(fb_toks) - 1
+                    if args.show_gen and _show_this(ei, len(examples)):
+                        _sg = llama.detokenize(lib, vocab, fb_toks, remove_special=False)
+                        print(f"\n[↩fp16 {ex_draft_name}]", end="", flush=True)
+                        print(_sg, end="", flush=True)
 
             # Trim at first EOG (keep path aligned with trimmed output)
             trimmed = []
@@ -2275,6 +2549,9 @@ def main():
                         for i, row in enumerate(qviz_lines):
                             print(f"    qviz{i + 1}: {row}", flush=True)
 
+            if args.show_gen and _show_this(ei, len(examples)):
+                print(f"\n--- end gen [{label}] ---", flush=True)
+
             results.append({
                 "gen_ids":           trimmed,
                 "n_tokens":          len(trimmed),
@@ -2313,6 +2590,9 @@ def main():
         n_wrong          = 0   # pred found but incorrect (not a length issue)
         n_trunc_fail     = 0   # truncated AND no answer extracted (length caused failure)
         n_no_match       = 0   # finished cleanly but regex found nothing
+        n_rep_stop       = 0   # stopped by any repetition detector
+        n_rep_stop_no_answer  = 0
+        n_rep_stop_with_answer = 0
         for ei, (pt, ct, label) in enumerate(examples):
             gold = gold_answers[ei] if gold_answers else None
             max_ctx_avail = args.n_ctx - len(pt) - 1
@@ -2327,10 +2607,19 @@ def main():
             if max_gen <= 0:
                 per_ex.append((gold, None, 0.0))
                 continue
-            if pregenerated is not None and ei < len(pregenerated) and pregenerated[ei] is not None:
+            _use_pregen = (
+                pregenerated is not None
+                and ei < len(pregenerated)
+                and pregenerated[ei] is not None)
+            _show_stream = args.show_gen and _show_this(ei, len(examples)) and not _use_pregen
+            if _use_pregen:
                 gen_ids   = pregenerated[ei]["gen_ids"]
                 gen_diags = {}
             else:
+                if _show_stream:
+                    print(f"\n--- gen [{label}] (ex {ei + 1}/{len(examples)}, "
+                          f"max {max_gen} tok) ---",
+                          flush=True)
                 gen_ids, gen_diags = strategies.run_generate(
                     lib, ctx, vocab, pt, n_vocab,
                     kv_hook=kv_hook,
@@ -2339,7 +2628,20 @@ def main():
                     stop_strings=args.stop_strings or None,
                     k_group_size=k_group_size,
                     v_group_size=v_group_size,
-                    return_diagnostics=bool(args.save_per_example))
+                    return_diagnostics=bool(args.save_per_example),
+                    stream_text=_show_stream,
+                    stream_text_stride=max(1, args.show_gen_stream_every),
+                    rep_rate_threshold=args.rep_rate_threshold,
+                    rep_rate_consecutive=args.rep_rate_consecutive,
+                    rep_period_stop=args.rep_period_stop,
+                    rep_period_min=args.rep_period_min,
+                    rep_period_max=args.rep_period_max,
+                    rep_period_repeats=args.rep_period_repeats,
+                    rep_period_similarity=args.rep_period_similarity,
+                    rep_min_tokens=args.rep_min_tokens)
+            stop_reason = (gen_diags.get("stop_reason", "max_tokens")
+                           if gen_diags else "max_tokens")
+            rep_stopped = stop_reason in {"rep_rate", "period_repetition"}
             gen_text_raw = llama.detokenize(lib, vocab, gen_ids, remove_special=False)
             if use_code:
                 # Preserve leading indentation — code bodies need their 4-space indent.
@@ -2427,22 +2729,34 @@ def main():
                 elif pred is None and not truncated:
                     n_no_match += 1       # finished cleanly, regex found nothing
             (gen_lens_correct if score == 1.0 else gen_lens_wrong).append(gen_len)
+            if rep_stopped:
+                n_rep_stop += 1
+                if pred_disp in ("None", ""):
+                    n_rep_stop_no_answer += 1
+                else:
+                    n_rep_stop_with_answer += 1
             ex_entry = {"label": label, "score": score,
                         "gold": gold_disp, "pred": pred_disp,
                         "gen_len": gen_len, "truncated": truncated,
-                        "inconclusive": inconclusive, "n_hedges": n_hedges}
-            if gen_diags is not None:
+                        "inconclusive": inconclusive, "n_hedges": n_hedges,
+                        "stop_reason": stop_reason, "rep_stopped": rep_stopped}
+            if gen_diags and "H" in gen_diags:
                 ex_entry["gen_diags"] = gen_diags
             per_ex.append(ex_entry)
-            hedge_str = f"  hedges={n_hedges}" if n_hedges > 0 else ""
+            hedge_str   = f"  hedges={n_hedges}" if n_hedges > 0 else ""
+            rep_str     = f"  [{stop_reason}]" if rep_stopped else ""
             print(f"  acc ex {ei+1}/{len(examples)}: {label} | "
-                  f"gold={gold_disp}  pred={pred_disp}  {mark}  gen_len={gen_len}{hedge_str}", flush=True)
+                  f"gold={gold_disp}  pred={pred_disp}  {mark}  gen_len={gen_len}{hedge_str}{rep_str}", flush=True)
             if args.show_text and _show_this(ei, len(examples)):
                 print(f"    gen: {gen_text!r}", flush=True)
             if args.show_gen and _show_this(ei, len(examples)):
-                print(f"\n--- gen [{label}] gold={gold_disp} pred={pred_disp} {mark} ---",
-                      flush=True)
-                print(gen_text_raw.strip(), flush=True)
+                if _show_stream:
+                    print(f"\n--- end gen [{label}] gold={gold_disp} pred={pred_disp} {mark} ---",
+                          flush=True)
+                else:
+                    print(f"\n--- gen [{label}] gold={gold_disp} pred={pred_disp} {mark} ---",
+                          flush=True)
+                    print(gen_text_raw.strip(), flush=True)
                 print("---", flush=True)
         mean_score = score_sum / n_total if n_total > 0 else 0.0
         all_lens = gen_lens_correct + gen_lens_wrong
@@ -2460,6 +2774,10 @@ def main():
             "n_wrong":                 n_wrong,
             "n_trunc_fail":            n_trunc_fail,
             "n_no_match":              n_no_match,
+            # Repetition-stop counters (all detectors combined)
+            "n_rep_stop":              n_rep_stop,
+            "n_rep_stop_no_answer":    n_rep_stop_no_answer,
+            "n_rep_stop_with_answer":  n_rep_stop_with_answer,
         }
         return mean_score, n_total, per_ex, gen_len_stats
 
@@ -2560,6 +2878,22 @@ def main():
                 n_gold = sum(a is not None for a in gold_answers)
                 print(f"  Gold answers found: {n_gold}/{len(examples)}", flush=True)
 
+        # ── --task-ids: filter to specific examples ──────────────────────────
+        if args.task_ids:
+            task_id_set = set(args.task_ids)
+            filtered_ex   = []
+            filtered_gold = []
+            for ex, gold in zip(examples, gold_answers if gold_answers else [None]*len(examples)):
+                label = ex[2]
+                num = int(label.split("#")[-1]) if "#" in label else None
+                if num in task_id_set:
+                    filtered_ex.append(ex)
+                    filtered_gold.append(gold)
+            print(f"  --task-ids: keeping {len(filtered_ex)}/{len(examples)} examples "
+                  f"{sorted(task_id_set)}", flush=True)
+            examples     = filtered_ex
+            gold_answers = filtered_gold if gold_answers else []
+
         if args.skip_ppl and not args.eval_accuracy:
             raise ValueError("--skip-ppl requires --eval-accuracy (nothing left to compute otherwise)")
 
@@ -2585,6 +2919,15 @@ def main():
         if args.flash_attn:
             cparams.flash_attn_type = 1
         ctx = lib.llama_init_from_model(model, cparams)
+        draft_ctx_list.clear()
+        for (_dtag, _dm) in draft_models_list:
+            with _suppress_c_stderr():
+                _dc = lib.llama_init_from_model(_dm, cparams)
+            if not _dc:
+                sys.exit(f"Failed to create draft context for {_dtag}")
+            draft_ctx_list.append((_dtag, _dc))
+        if draft_ctx_list:
+            print(f"[draft ctx] {len(draft_ctx_list)} model(s)  n_ctx={actual_n_ctx}", flush=True)
 
         results = {}
         if args.skip_ppl:
@@ -2595,28 +2938,45 @@ def main():
             base_dists_per_ex = [None] * len(examples)
             fp16_ppl          = float("nan")
             if "fp16" in args.quants:
-                t0 = time.time()
-                print("\n[fp16]", flush=True)
-                mean_score, nt, per_ex_fp16, gl = eval_accuracy_pass(
-                    examples, gold_answers,
-                    kv_hook=None,
-                    k_group_size=args.quant_group_size,
-                    v_group_size=args.quant_group_size)
-                metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
-                elapsed = time.time() - t0
-                entry = {"ppl": None, "mean_kl": None, "n_tokens": None,
-                         metric_label: mean_score, "n_total": nt}
-                entry.update(gl)
-                if args.save_per_example:
-                    _per_example_results["fp16"] = per_ex_fp16
-                    with open(args.save_per_example, "w") as _f:
-                        json.dump(_per_example_results, _f, indent=2)
-                print(f"  => {metric_label}={mean_score:.4f}  "
-                      f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})"
-                      + _failure_summary(gl, nt)
-                      + f"  ({elapsed:.1f}s)", flush=True)
-                results["fp16"] = entry
-                save_results(results)
+                # Plain fp16 eval would duplicate work: adaptive-gen in the quant loop
+                # runs draft+verify then eval_accuracy_pass(..., pregenerated=...).
+                _quants_non_fp16 = [q for q in args.quants if q != "fp16"]
+                _defer_fp16_to_adaptive = (
+                    args.adaptive_gen
+                    and bool(draft_ctx_list)
+                    and len(_quants_non_fp16) == 0)
+                if _defer_fp16_to_adaptive:
+                    print(
+                        "  [fp16] Deferred: --adaptive-gen + --draft-model(s) + "
+                        "--quants fp16 only — skipping a plain Q8-only pass; "
+                        "adaptive-gen and scoring run in the quant loop next.",
+                        flush=True)
+                else:
+                    t0 = time.time()
+                    print("\n[fp16]", flush=True)
+                    print("  KV cache: fp16 (no KV quant hooks). "
+                          "Model weights follow the GGUF (e.g. Q8_0).",
+                          flush=True)
+                    mean_score, nt, per_ex_fp16, gl = eval_accuracy_pass(
+                        examples, gold_answers,
+                        kv_hook=None,
+                        k_group_size=args.quant_group_size,
+                        v_group_size=args.quant_group_size)
+                    metric_label = "f1" if args.eval_metric == "f1" else "accuracy"
+                    elapsed = time.time() - t0
+                    entry = {"ppl": None, "mean_kl": None, "n_tokens": None,
+                             metric_label: mean_score, "n_total": nt}
+                    entry.update(gl)
+                    if args.save_per_example:
+                        _per_example_results["fp16"] = per_ex_fp16
+                        with open(args.save_per_example, "w") as _f:
+                            json.dump(_per_example_results, _f, indent=2)
+                    print(f"  => {metric_label}={mean_score:.4f}  "
+                          f"gen_len={gl['mean_gen_tokens']:.1f}  (n={nt})"
+                          + _failure_summary(gl, nt)
+                          + f"  ({elapsed:.1f}s)", flush=True)
+                    results["fp16"] = entry
+                    save_results(results)
         else:
             # ── fp16 baseline: collect full log distributions for KL reference ──
             print("\n[fp16 baseline]", flush=True)
@@ -2650,6 +3010,9 @@ def main():
                 n_tok = sum(len(lps) for lps in base_lps_per_ex)
                 entry = {"ppl": fp16_ppl, "mean_kl": 0.0, "n_tokens": n_tok}
                 if args.eval_accuracy:
+                    print("  KV cache: fp16 (no KV quant hooks). "
+                          "Model weights follow the GGUF (e.g. Q8_0).",
+                          flush=True)
                     mean_score, nt, per_ex_fp16, gl = eval_accuracy_pass(
                         examples, gold_answers,
                         kv_hook=None,
@@ -2672,8 +3035,17 @@ def main():
         adaptive_gen_done = False
 
         for quant_name in args.quants:
-            if quant_name == "fp16":
+            _quants_non_fp16 = [q for q in args.quants if q != "fp16"]
+            _fp16_draft_only_adaptive = (
+                quant_name == "fp16"
+                and bool(draft_ctx_list)
+                and args.adaptive_gen
+                and not adaptive_gen_done
+                and len(_quants_non_fp16) == 0)
+            if quant_name == "fp16" and not _fp16_draft_only_adaptive:
                 continue
+            if args.adaptive_gen and adaptive_gen_done:
+                continue  # adaptive-gen already ran; skip standalone per-quant passes
             if kv_prof is not None:
                 kv_prof.reset()
             t0 = time.time()
@@ -2752,7 +3124,10 @@ def main():
                 # ── Adaptive gen: quant rollout windows + verifier replay ─────────
                 gen_pregenerated = None
                 gen_stats_valid  = []
-                if args.adaptive_gen and not adaptive_gen_done and quant_name != "fp16":
+                # fp16 allowed when --draft-model is active: measures weight-quant-only
+                # acceptance (dc uses Q4_K_M weights + fp16 KV, no KV hook applied).
+                _fp16_draft_ok = (bool(draft_ctx_list) and quant_name == "fp16")
+                if args.adaptive_gen and not adaptive_gen_done and (quant_name != "fp16" or _fp16_draft_ok):
                     adaptive_draft_hook_gen = make_kv_hook(
                         lib, k_names, v_names, args.n_pos_per_embd,
                         use_gpu=use_gpu, n_layer=n_layer, ctx_ptr=ctx,
@@ -2788,12 +3163,19 @@ def main():
                         ver_hook_gen = None
                         ver_k_gs, ver_v_gs = k_group_size, v_group_size
                     ag_use_shadow = (
-                        use_gpu and HAS_GPU_KV_SHADOW and not args.no_adaptive_gen_gpu_shadow)
+                        use_gpu and HAS_GPU_KV_SHADOW and not args.no_adaptive_gen_gpu_shadow
+                        and not draft_ctx_list)
                     cand_specs = [q for q in args.quants if q != "fp16"]
-                    print(f"  [adaptive-gen] draft=auto({len(cand_specs)}) verify={ver_vq} "
+                    _draft_auto_lbl = (
+                        "fp16+weight-draft" if not cand_specs and draft_ctx_list else str(len(cand_specs)))
+                    _draft_model_tag = (
+                        " draft_weights=" + "+".join(t for t, _ in draft_ctx_list)
+                        if draft_ctx_list else "")
+                    print(f"  [adaptive-gen] draft=auto({_draft_auto_lbl}) verify={ver_vq} "
                           f"bootstrap_window={args.bootstrap_window} rollout_window={args.adaptive_window} "
                           f"sink={args.sink_tokens} recent={args.recent_tokens} "
-                          f"kv_ckpt={'gpu_d2d' if ag_use_shadow else 'cpu_blob'}",
+                          f"kv_ckpt={'gpu_d2d' if ag_use_shadow else 'cpu_blob'}"
+                          f"{_draft_model_tag}",
                           flush=True)
                     gen_results = run_adaptive_gen(
                         examples, adaptive_draft_hook_gen, k_group_size, v_group_size,
@@ -2849,7 +3231,7 @@ def main():
                         "n_all_ok":          n_all_ok,
                         "n_examples":        len(valid),
                     }
-                if args.adaptive_gen and quant_name != "fp16" and gen_stats_valid:
+                if args.adaptive_gen and (quant_name != "fp16" or _fp16_draft_ok) and gen_stats_valid:
                     ag_entry = {
                         "rollout_window":    args.adaptive_window,
                         "bootstrap_window":  args.bootstrap_window,
@@ -2948,6 +3330,11 @@ def main():
             with open(args.profile_kv_out, "w", encoding="utf-8") as f:
                 json.dump(profile_agg, f, indent=2)
             print(f"\nKV profile JSON → {args.profile_kv_out}", flush=True)
+        for (_, _dc) in draft_ctx_list:
+            lib.llama_free(_dc)
+        draft_ctx_list.clear()
+        for (_, _dm) in draft_models_list:
+            lib.llama_model_free(_dm)
         lib.llama_free(ctx)
         lib.llama_model_free(model)
         lib.llama_backend_free()
