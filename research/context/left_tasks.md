@@ -65,3 +65,43 @@ Earlier wording focused only on speeding up **sequential** `verify_window` under
 ---
 
 *Add further “left tasks” below as needed.*
+
+---
+
+## Combined Weight + KV Cache Quantization
+
+**Recorded:** 2026-04-10
+
+Full design in [`combined_weight_kv_quant.md`](combined_weight_kv_quant.md).
+
+### Core idea
+
+Extend adaptive-gen to also quantize **model weights** (not just KV cache).
+Draft uses lower-precision weights (e.g. Q4_K_M) + int2/int3 KV.
+Verifier uses higher-precision weights (Q8_0) + fp16/int8 KV.
+If acceptance rate stays high, speedup compounds from both axes.
+
+Longer-term: **base+delta weight storage** (W_fp16 = W_q4 + sparse delta) so
+both draft and verifier share the same weight memory with no 2× storage cost.
+
+### Near-term implementation
+
+1. **Make draft model** (one-time):
+   ```bash
+   python3 research/scripts/make_draft_model.py \
+       models/Qwen3-8B-Q8_0.gguf Q4_K_M
+   # → models/Qwen3-8B-Q8_0-Q4_K_M.gguf
+   ```
+   Try: Q4_K_M, Q3_K_M, Q2_K.
+
+2. **`--draft-model PATH`** flag in `run_sweep.py` — loads second llama context.
+   KV blobs are layout-compatible between Q8_0 and Q4_K_M (same architecture).
+
+3. **KV sync**: at each window boundary, save verifier's KV → restore into
+   draft_ctx, then apply int2 hook. Same invariant as current adaptive-gen.
+
+### Open questions
+
+- Does weight quant + KV quant compound errors or stay roughly independent?
+- Q4_K_M vs Q3_K_M operating point?
+- Is imatrix quantization needed or does magnitude-only suffice at Q4_K_M?

@@ -82,6 +82,60 @@ Hardware: same **peak TFLOPS / GB/s** table as today, **duplicated** in the new 
 
 ---
 
+## 5b. sim_physics knobs (beyond η)
+
+`η` is meant to represent **family-level hardware efficiency** (compute / BW) and is
+ideally portable across nearby workloads. In practice we also need a small set of
+“physics knobs” that capture *systematic* effects which are **not** explained by
+pure bytes/FLOPs:
+
+- **`kv_attn_byte_mode`**: how to count KV bytes for attention (e.g. storage vs fp16-equivalent).
+- **`attn_time_scale`**, **`attn_time_scale_inv_batch`**, `attn_scale_by_batch`:
+  simple correction factors for attention kernels (tile/scheduler effects).
+- **`weight_time_scale_by_tag`**: map `weight_tag -> multiplier` that scales only the
+  **GEMM family** time. This is intended to capture weight-quant kernel regime
+  changes (dequant overhead, kernel selection) that a single “effective bpw” cannot.
+
+### Design: `weight_time_scale_by_tag`
+
+Within one simulated decode step, split time into:
+
+\[
+T = T_\text{gemm} + T_\text{other}
+\]
+
+and apply:
+
+\[
+T' = s(\text{weight\_tag}) \cdot T_\text{gemm} + T_\text{other}
+\]
+
+where `s(weight_tag)` is read from `sim_physics["weight_time_scale_by_tag"]`.
+
+Key intent:
+- Keep `η` stable (family-level), and let `s(weight_tag)` capture quant-kernel
+  overhead differences between e.g. `Q8_0` vs `Q4_K_M`.
+- This is per-profile/per-model by default (local fit), but can be merged into a
+  shared prior later if it generalizes.
+
+### Fitting workflow (implemented)
+
+- `research/scripts/fit_sim_physics_weight_scale.py` fits `weight_time_scale_by_tag`
+  from one `kv_timing*.json` plus its `layerwise_eta_*.json`.
+- It runs the simulator once per measured row, extracts `gemm_ms` and `other_ms`,
+  and solves the least-squares fit:
+
+\[
+\min_s \sum_i (s \cdot \text{gemm}_i + \text{other}_i - \text{meas}_i)^2
+\]
+
+with clamps (default \(s \in [0.5, 2.0]\)).
+
+This is designed to be a “small knob” fit: if the tag’s behavior is already
+explained by η, the fitted scale lands near 1.0.
+
+---
+
 ## 6. Event-driven simulation loop
 
 **One decode step:**
@@ -138,6 +192,10 @@ python3 layerwise_roofline_sim.py \
 | `research/scripts/layerwise_roofline_sim.py` | CLI + simulation loop |
 | `research/scripts/model_structures.json` | Presets: `schema_version`, `presets` map (qwen3-8b, qwen3-14b, llama4-scout-17b, …) |
 | `research/context/layerwise_roofline_sim_plan.md` | This document |
+| `research/scripts/fit_layerwise_eta.py` | Fit per-op-family η from measured kv_timing JSON |
+| `research/scripts/fit_layerwise_calibration.py` | Fit linear `(t_floor_ms, scale)` calibration on top of layerwise prediction |
+| `research/scripts/fit_sim_physics_weight_scale.py` | Fit `weight_time_scale_by_tag` into a sim_physics JSON |
+| `research/scripts/report_measured_vs_layerwise.py` | Table/report measured vs predicted across many kv_timing JSONs; supports auto-discovery of per-profile files |
 
 **Constraint:** no edits to `perf_model.py` for this feature set; keep aggregate roofline **unchanged**.
 

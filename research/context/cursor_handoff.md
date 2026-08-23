@@ -1,6 +1,6 @@
 # Cursor Agent Handoff — KV Cache Quantization Research
 
-Last updated: 2026-03-27
+Last updated: 2026-04-28
 
 ## Project Summary
 
@@ -68,6 +68,11 @@ history. The authoritative source of prior conversation and decisions is:
 |--------|---------|
 | `perf_model.py` | **High-level** analytical model. Bandwidth-bound decode, compute-bound prefill. Supports adaptive quant sim. Has `--sweep` mode for benchmark × batch grid. |
 | `roofline_layer.py` | **Per-operation** roofline model. Breaks each transformer layer into ops (QKV, attn, FFN, norms). Separate weight/activation/KV bandwidth streams. Flash attention model. Three stages (prefill/decode/verify). **Validated against Qwen2-7B/A100 measured data — see validation section below.** |
+| `layerwise_roofline_sim.py` | Layer-by-layer decode-step simulator used for **H100 measured-vs-predicted** validation; supports `eta-json`, `sim-physics-json`, optional calibration, and GGUF exact tensor bytes (weights). |
+| `fit_layerwise_eta.py` | Fit per-op-family `η` (gemm/attn/elem/kv) to `kv_timing*.json` for one profile directory. |
+| `fit_sim_physics_weight_scale.py` | Fit `sim_physics["weight_time_scale_by_tag"]` (scales GEMM family only) to capture weight-quant kernel regime changes not explained by bpw alone. |
+| `fit_layerwise_calibration.py` | Fit linear calibration: `measured_ms/tok ≈ t_floor_ms/B + scale × pred_ms/tok`. |
+| `report_measured_vs_layerwise.py` | Print per-row/per-file discrepancy tables across many `kv_timing*.json`. Supports `--auto-eta/--auto-sim-physics/--auto-calibration` and `--use-gguf-bytes`. Also supports `--unit tok_s` vs `ms_per_tok`. |
 
 ### Batch execution
 | Script | Purpose |
@@ -228,6 +233,26 @@ Our model does **not** account for dequantization compute overhead of weight-qua
 | `compute_eff` | 0.60–0.70 | Prefill compute utilization |
 
 With these settings, the model is within 10% for short/medium contexts (≤32K) and 15-30% for very long contexts (64K-128K). The systematic over-prediction at long contexts comes from: (a) flash attention tiling inefficiency, (b) paged attention overhead (vLLM), (c) cache pollution effects.
+
+---
+
+## Layerwise simulator: interpreting batch-size discrepancies
+
+Two gotchas that frequently confuse “error grows with batch”:
+
+- **tok/s is nonlinear:** `tok/s = 1000/(ms/tok)`. When `ms/tok` becomes small at large
+  batch, a small ms residual turns into a big tok/s residual.
+- **efficiency regimes change with B:** kernel occupancy, tile shapes, and scheduler
+  behavior can vary across batches, so constant `η` (and even a single linear
+  calibration) won’t perfectly match all B regimes.
+
+Recommended debugging workflow:
+
+1. Compare in **ms/tok** first (`--unit ms_per_tok`).
+2. Do an **A/B without calibration** to see if `sim_physics` knobs are doing work:
+   - `--auto-eta --auto-sim-physics` (no `--auto-calibration`)
+   - vs `--auto-eta` alone.
+3. Slice by batch with `report_measured_vs_layerwise.py --only-batch <B>`.
 
 ### 5. Cross-model comparison: perf_model.py vs roofline_layer.py
 

@@ -1,11 +1,28 @@
 {
+  "_comment": "ms/token for each candidate. 'recover' = verifier-quant ms/token (used on rollout rejection). For draft candidates, use 'Q8 <kv>' / 'Q4 <kv>' / 'Q3 <kv>' / 'Q2 <kv>' keys when --draft-model(s) active so cost mode accounts for faster matmul. Tag inferred from filename: Q4_K_M→Q4, Q3_K_M→Q3, Q2_K→Q2. Falls back to plain '<kv>' key if weight-specific entry is absent.",
   "recover": {
     "fp16": 0.09,
     "int8_ch": 0.075,
     "int8": 0.075
   },
-  "int2_ch": 0.040,
-  "int3_ch": 0.043,
+  "Q8 int2_ch":           0.040,
+  "Q8 int3_ch":           0.043,
+  "Q8 int3_half_1357_ch": 0.044,
+  "Q8 int4_ch":           0.047,
+  "Q4 int2_ch":           0.026,
+  "Q4 int3_ch":           0.028,
+  "Q4 int3_half_1357_ch": 0.029,
+  "Q4 int4_ch":           0.031,
+  "Q3 int2_ch":           0.022,
+  "Q3 int3_ch":           0.024,
+  "Q3 int3_half_1357_ch": 0.024,
+  "Q3 int4_ch":           0.026,
+  "Q2 int2_ch":           0.019,
+  "Q2 int3_ch":           0.020,
+  "Q2 int3_half_1357_ch": 0.021,
+  "Q2 int4_ch":           0.022,
+  "int2_ch":           0.040,
+  "int3_ch":           0.043,
   "int3_half_1357_ch": 0.044,
-  "int4_ch": 0.047
+  "int4_ch":           0.047
 }
