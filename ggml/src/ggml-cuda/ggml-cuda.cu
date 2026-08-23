@@ -2,6 +2,359 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#ifdef GGML_CUDA_NVTX
+#include <nvtx3/nvToolsExt.h>
+#include <cstdio>
+
+struct ggml_nvtx_scope {
+    ggml_nvtx_scope(const ggml_tensor * node) {
+        char label[256];
+        snprintf(label, sizeof(label), "%s [%lldx%lldx%lldx%lld] %s",
+                 node->name,
+                 (long long)node->ne[0], (long long)node->ne[1],
+                 (long long)node->ne[2], (long long)node->ne[3],
+                 ggml_op_name(node->op));
+        nvtxRangePushA(label);
+    }
+    ~ggml_nvtx_scope() { nvtxRangePop(); }
+};
+#endif
+
+#ifdef GGML_CUDA_PERF
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <cstring>
+
+static std::string ggml_cuda_perf_strip_layer(const char * name) {
+    std::string s(name);
+
+    // "ffn_gate-30" -> "ffn_gate", "Qcur-5" -> "Qcur"
+    size_t dash = s.rfind('-');
+    if (dash != std::string::npos && dash + 1 < s.size()) {
+        bool all_digits = true;
+        for (size_t i = dash + 1; i < s.size(); i++) {
+            if (s[i] < '0' || s[i] > '9') { all_digits = false; break; }
+        }
+        if (all_digits) return s.substr(0, dash);
+    }
+
+    // "cache_k_l12 (view)" / "cache_v_l0 (view)" -> "cache_k" / "cache_v"
+    if (s.rfind("cache_k", 0) == 0) return "cache_k";
+    if (s.rfind("cache_v", 0) == 0) return "cache_v";
+
+    // "node_1234" -> "node_*"
+    if (s.rfind("node_", 0) == 0) return "node_*";
+
+    return s;
+}
+
+struct ggml_cuda_perf_context {
+    std::vector<cudaEvent_t> ev_start;
+    std::vector<cudaEvent_t> ev_stop;
+    std::vector<std::string> op_names;
+    int n_recorded = 0;
+    int call_count = 0;
+
+    cudaEvent_t ev_loop_start = nullptr;
+    cudaEvent_t ev_loop_stop  = nullptr;
+
+    void ensure_events(int n) {
+        while ((int)ev_start.size() < n) {
+            cudaEvent_t e1, e2;
+            cudaEventCreate(&e1);
+            cudaEventCreate(&e2);
+            ev_start.push_back(e1);
+            ev_stop.push_back(e2);
+            op_names.push_back("");
+        }
+        if (!ev_loop_start) {
+            cudaEventCreate(&ev_loop_start);
+            cudaEventCreate(&ev_loop_stop);
+        }
+    }
+
+    int n_tokens_per_step = 0;
+
+    void begin(int max_nodes, cudaStream_t s) {
+        ensure_events(max_nodes);
+        n_recorded = 0;
+        cudaEventRecord(ev_loop_start, s);
+    }
+
+    void set_n_tokens(int n) {
+        n_tokens_per_step = n;
+    }
+
+    void end_loop(cudaStream_t s) {
+        cudaEventRecord(ev_loop_stop, s);
+    }
+
+    void record_start(const ggml_tensor * node, cudaStream_t s) {
+        int idx = n_recorded;
+        op_names[idx] = ggml_cuda_perf_strip_layer(node->name)
+                      + ":" + ggml_op_name(node->op);
+        cudaEventRecord(ev_start[idx], s);
+    }
+
+    void record_stop(cudaStream_t s) {
+        cudaEventRecord(ev_stop[n_recorded], s);
+        n_recorded++;
+    }
+
+    struct OpTiming {
+        double total_ms = 0.0;
+        int    count    = 0;
+    };
+
+    // Stable print order (transformer decode structure) for vimdiff across runs — not by duration.
+    static std::pair<int, std::string> sort_key_for_op(const std::string & key) {
+        const size_t colon = key.find(':');
+        const std::string name = colon == std::string::npos ? key : key.substr(0, colon);
+        const std::string ty   = colon == std::string::npos ? "" : key.substr(colon + 1);
+        auto starts = [&](const char * pfx) { return name.rfind(pfx, 0) == 0; };
+
+        int tier = 1000;
+        if (name.find("norm") != std::string::npos &&
+            (ty == "RMS_NORM" || ty == "NORM")) {
+            tier = 10;
+        } else if (name == "Qcur" && ty == "MUL_MAT") {
+            tier = 20;
+        } else if (name == "Kcur" && ty == "MUL_MAT") {
+            tier = 21;
+        } else if (name == "Vcur" && ty == "MUL_MAT") {
+            tier = 22;
+        } else if (name == "Qcur" && ty == "ROPE") {
+            tier = 30;
+        } else if (name == "Kcur" && ty == "ROPE") {
+            tier = 31;
+        } else if (starts("cache_k")) {
+            tier = 40;
+        } else if (starts("cache_v")) {
+            tier = 41;
+        } else if (name.find("fattn") != std::string::npos || name == "__fattn__") {
+            tier = 50;
+        } else if (name.find("result_output") != std::string::npos ||
+                   name.find("attn_output") != std::string::npos) {
+            tier = 60;
+        } else if (name == "l_out") {
+            tier = 70;
+        } else if (name.find("ffn_inp") != std::string::npos) {
+            tier = 71;
+        } else if (name.find("ffn_gate") != std::string::npos) {
+            tier = 80;
+        } else if (name.find("ffn_up") != std::string::npos) {
+            tier = 81;
+        } else if (name.find("ffn_swiglu") != std::string::npos) {
+            tier = 82;
+        } else if (name.find("ffn_out") != std::string::npos ||
+                   name.find("ffn_down") != std::string::npos) {
+            tier = 83;
+        } else if (name.rfind("node_", 0) == 0) {
+            tier = 200;
+        } else if (key.find("copy") != std::string::npos) {
+            tier = 300;
+        }
+        return {tier, key};
+    }
+
+    struct PhaseAccum {
+        std::map<std::string, OpTiming> ops;
+        double total_kernel_ms = 0.0;
+        double total_wall_ms   = 0.0;
+        int    calls           = 0;
+        int    n_ops           = 0;
+        int    n_tokens        = 0;
+    };
+
+    // group by graph shape (n_ops) — only keep the shape with most calls (decode)
+    std::map<int, PhaseAccum> phases;
+
+    void report(cudaStream_t s) {
+        call_count++;
+        if (call_count <= 2 || n_recorded == 0) {
+            return;  // skip warmup
+        }
+
+        cudaStreamSynchronize(s);
+
+        float wall_ms = 0.0f;
+        cudaEventElapsedTime(&wall_ms, ev_loop_start, ev_loop_stop);
+
+        auto & phase = phases[n_recorded];
+        phase.n_ops = n_recorded;
+        phase.n_tokens = n_tokens_per_step;
+        phase.total_wall_ms += wall_ms;
+
+        double step_total = 0.0;
+        for (int i = 0; i < n_recorded; i++) {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, ev_start[i], ev_stop[i]);
+            phase.ops[op_names[i]].total_ms += ms;
+            phase.ops[op_names[i]].count++;
+            step_total += ms;
+        }
+        phase.total_kernel_ms += step_total;
+        phase.calls++;
+    }
+
+    static void print_phase(const char * label, const PhaseAccum & phase) {
+        double grand_total = phase.total_kernel_ms;
+        double avg_ms = grand_total / phase.calls;
+        double avg_wall = phase.total_wall_ms / phase.calls;
+
+        std::vector<std::pair<std::string, OpTiming>> sorted(phase.ops.begin(), phase.ops.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto & a, const auto & b) {
+                      const auto ka = sort_key_for_op(a.first);
+                      const auto kb = sort_key_for_op(b.first);
+                      if (ka.first != kb.first) {
+                          return ka.first < kb.first;
+                      }
+                      return ka.second < kb.second;
+                  });
+
+        fprintf(stderr, "\n=== CUDA PERF %s [%d calls averaged, %d ops/call, %.2f ms kernel, %.2f ms wall] ===\n",
+                label, phase.calls, phase.n_ops, avg_ms, avg_wall);
+        fprintf(stderr, "  %-36s %10s %8s %8s\n", "op", "avg_ms", "pct", "count");
+        fprintf(stderr, "  %-36s %10s %8s %8s\n", "------------------------------------",
+                "----------", "--------", "--------");
+
+        double attn_ms = 0, proj_ms = 0, rope_ms = 0, ffn_ms = 0, norm_ms = 0, other_ms = 0;
+        for (const auto & [key, t] : sorted) {
+            double avg = t.total_ms / phase.calls;
+            double pct = grand_total > 0 ? 100.0 * t.total_ms / grand_total : 0.0;
+            fprintf(stderr, "  %-36s %10.3f %7.1f%% %8d\n",
+                    key.c_str(), avg, pct, t.count / phase.calls);
+
+            std::string name = key;
+            auto colon = key.find(':');
+            if (colon != std::string::npos) {
+                name = key.substr(0, colon);
+            }
+            std::string op_type;
+            if (colon != std::string::npos) {
+                op_type = key.substr(colon + 1);
+            }
+
+            if (name.find("norm") != std::string::npos ||
+                op_type == "RMS_NORM" || op_type == "NORM") {
+                norm_ms += t.total_ms;
+            } else if (name.find("fattn") != std::string::npos ||
+                name.find("flash_attn") != std::string::npos ||
+                name.find("KQ_") != std::string::npos ||
+                name == "kq" || name == "kqv" || name == "kqv_mla" ||
+                name == "kqv_out" || name == "__fattn__" ||
+                name.find("cache_k") != std::string::npos ||
+                name.find("cache_v") != std::string::npos) {
+                attn_ms += t.total_ms;
+            } else if (op_type == "ROPE") {
+                rope_ms += t.total_ms;
+            } else if (name.find("Qcur") != std::string::npos ||
+                       name.find("Kcur") != std::string::npos ||
+                       name.find("Vcur") != std::string::npos ||
+                       name.find("q_cur") != std::string::npos ||
+                       name.find("k_cur") != std::string::npos ||
+                       name.find("v_cur") != std::string::npos ||
+                       name == "Q" || name == "K" || name == "V" || name == "O" ||
+                       name.find("qkv") != std::string::npos ||
+                       name.find("o_proj") != std::string::npos ||
+                       name.find("attn_output") != std::string::npos) {
+                proj_ms += t.total_ms;
+            } else if (name.find("ffn") != std::string::npos &&
+                       name != "ffn_inp") {
+                ffn_ms += t.total_ms;
+            } else {
+                other_ms += t.total_ms;
+            }
+        }
+
+        fprintf(stderr, "  %-36s %10s %8s %8s\n", "------------------------------------",
+                "----------", "--------", "--------");
+        auto pct_of = [&](double v) { return grand_total > 0 ? 100.0 * v / grand_total : 0.0; };
+        auto avg_of = [&](double v) { return v / phase.calls; };
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[SUMMARY] QKV+O proj", avg_of(proj_ms), pct_of(proj_ms));
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[SUMMARY] RoPE",       avg_of(rope_ms), pct_of(rope_ms));
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[SUMMARY] Attention",  avg_of(attn_ms), pct_of(attn_ms));
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[SUMMARY] FFN",        avg_of(ffn_ms),  pct_of(ffn_ms));
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[SUMMARY] Norm",       avg_of(norm_ms), pct_of(norm_ms));
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[SUMMARY] Other",      avg_of(other_ms), pct_of(other_ms));
+        fprintf(stderr, "  %-36s %10s %8s\n", "------------------------------------", "----------", "--------");
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[Kernel sum]", avg_ms, 100.0);
+        fprintf(stderr, "  %-36s %10.3f\n", "[GPU wall]", avg_wall);
+        fprintf(stderr, "  %-36s %10.3f %7.1f%%\n", "[Launch/sync overhead]",
+                avg_wall - avg_ms, grand_total > 0 ? 100.0 * (phase.total_wall_ms - grand_total) / phase.total_wall_ms : 0.0);
+        double steps_per_s = avg_wall > 0 ? 1000.0 / avg_wall : 0.0;
+        fprintf(stderr, "  %-36s %10.3f\n", "[tok/s (per seq)]", steps_per_s);
+        if (phase.n_tokens > 1) {
+            fprintf(stderr, "  %-36s %10.3f\n", "[tok/s (total)]", steps_per_s * phase.n_tokens);
+        }
+        fprintf(stderr, "======================================================\n\n");
+    }
+
+    void flush_all() {
+        if (phases.empty()) return;
+
+        // find the decode phase: smallest n_tokens per step
+        int min_tokens = INT_MAX;
+        for (const auto & [n_ops, phase] : phases) {
+            if (phase.n_tokens > 0 && phase.n_tokens < min_tokens) {
+                min_tokens = phase.n_tokens;
+            }
+        }
+
+        // merge all phases with the decode token count into one report
+        PhaseAccum decode_merged;
+        decode_merged.n_tokens = min_tokens;
+        int decode_total_calls = 0;
+
+        for (const auto & [n_ops, phase] : phases) {
+            if (phase.n_tokens == min_tokens) {
+                for (const auto & [key, t] : phase.ops) {
+                    decode_merged.ops[key].total_ms += t.total_ms;
+                    decode_merged.ops[key].count    += t.count;
+                }
+                decode_merged.total_kernel_ms += phase.total_kernel_ms;
+                decode_merged.total_wall_ms   += phase.total_wall_ms;
+                decode_merged.calls           += phase.calls;
+                decode_merged.n_ops            = phase.n_ops;
+                decode_total_calls++;
+            }
+        }
+
+        if (decode_merged.calls > 0) {
+            char label[64];
+            snprintf(label, sizeof(label), "DECODE (%d tok/step, %d calls)",
+                     decode_merged.n_tokens, decode_merged.calls);
+            print_phase(label, decode_merged);
+        }
+
+        phases.clear();
+    }
+
+    ~ggml_cuda_perf_context() {
+        flush_all();
+        for (auto & e : ev_start) { cudaEventDestroy(e); }
+        for (auto & e : ev_stop)  { cudaEventDestroy(e); }
+        if (ev_loop_start) { cudaEventDestroy(ev_loop_start); }
+        if (ev_loop_stop)  { cudaEventDestroy(ev_loop_stop); }
+    }
+};
+
+static thread_local ggml_cuda_perf_context g_cuda_perf;
+
+struct ggml_cuda_perf_scope {
+    cudaStream_t stream;
+    ggml_cuda_perf_scope(const ggml_tensor * node, cudaStream_t s) : stream(s) {
+        g_cuda_perf.record_start(node, s);
+    }
+    ~ggml_cuda_perf_scope() {
+        g_cuda_perf.record_stop(stream);
+    }
+};
+#endif
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -3557,6 +3910,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
+#ifdef GGML_CUDA_PERF
+            g_cuda_perf.begin(cgraph->n_nodes, cuda_ctx->stream());
+            {
+                // infer tokens per step from first MUL_MAT node's ne[1]
+                // (result_output ne[1] only counts logit outputs, not total batch tokens)
+                int n_tok = 1;
+                for (int j = 0; j < cgraph->n_nodes; j++) {
+                    if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT) {
+                        n_tok = (int)cgraph->nodes[j]->ne[1];
+                        break;
+                    }
+                }
+                g_cuda_perf.set_n_tokens(n_tok);
+            }
+#endif
+
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
@@ -3666,6 +4035,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
                 }
+
+#ifdef GGML_CUDA_NVTX
+                ggml_nvtx_scope nvtx_scope(node);
+#endif
+#ifdef GGML_CUDA_PERF
+                ggml_cuda_perf_scope perf_scope(node, cuda_ctx->stream());
+#endif
 
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
@@ -4030,6 +4406,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+#ifdef GGML_CUDA_PERF
+            g_cuda_perf.end_loop(cuda_ctx->stream());
+            g_cuda_perf.report(cuda_ctx->stream());
+#endif
         }
 
 #ifdef USE_CUDA_GRAPH

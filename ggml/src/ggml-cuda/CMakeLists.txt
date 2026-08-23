@@ -155,6 +155,21 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
 
+    if (GGML_CUDA_NVTX)
+        add_compile_definitions(GGML_CUDA_NVTX)
+        if (TARGET CUDA::nvtx3)
+            target_link_libraries(ggml-cuda PRIVATE CUDA::nvtx3)
+        elseif (TARGET CUDA::nvToolsExt)
+            target_link_libraries(ggml-cuda PRIVATE CUDA::nvToolsExt)
+        else()
+            message(WARNING "GGML_CUDA_NVTX requested but no NVTX target found")
+        endif()
+    endif()
+
+    if (GGML_CUDA_PERF)
+        add_compile_definitions(GGML_CUDA_PERF)
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
