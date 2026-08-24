@@ -67,6 +67,43 @@ cmake --build build_release --config Release -j $(nproc)
 GPU is H100 (sm_90) — `CMAKE_CUDA_ARCHITECTURES="90"` is required.
 `LLAMA_BUILD_SERVER=OFF` avoids OpenSSL version conflict on MN5.
 
+### Step 3b: MN5 profiling tree (`build_nvtx`)
+
+The two MN5 trees as actually configured on 2026-05-04, recovered from their
+CMakeCache files:
+
+```bash
+# build_release -- CUDA 12.3 from the module tree (/apps/ACC/CUDA/12.3/bin/nvcc).
+# NOTE: NVTX is ON here too, so this tree is already nsys-traceable; that is why
+# profile.sh points nsys at build_release rather than build_nvtx.
+module load CUDA/12.3
+CC=gcc CXX=g++ cmake -B build_release \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+    -DGGML_CUDA=ON -DGGML_CUDA_NVTX=ON \
+    -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES="90"
+cmake --build build_release --config Release -j $(nproc)
+
+# build_nvtx -- adds per-op timing and disables graphs. Picked up nvcc from
+# /usr/local/cuda-12.2 because the accel-sim exports (CUDA_INSTALL_PATH,
+# PATH) from ~/.Command.md were active in that shell. Harmless, but pass
+# -DCMAKE_CUDA_COMPILER explicitly if you want it pinned to the module.
+cmake -B build_nvtx \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+    -DGGML_CUDA=ON \
+    -DGGML_CUDA_NVTX=ON -DGGML_CUDA_PERF=ON \
+    -DGGML_CUDA_GRAPHS=OFF \
+    -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES="90"
+cmake --build build_nvtx --config Release -j $(nproc)
+```
+
+Both trees are sm_90 with `GGML_NATIVE=OFF` so the binaries stay runnable on a
+login node whose CPU differs from the compute nodes.
+
+Contradiction with Step 3 above: the real `build_release` has
+`LLAMA_BUILD_SERVER=ON` and `LLAMA_OPENSSL=ON`, not the `-DLLAMA_BUILD_SERVER=OFF`
+that Step 3 recommends. The OpenSSL conflict that motivated that flag no longer
+bites -- leave the server on unless a configure error says otherwise.
+
 ### Step 4: Download models (login node, wget — no internet on compute nodes)
 ```bash
 # Qwen3-8B
@@ -134,43 +171,39 @@ cmake --build build_release --config Release -j $(nproc)
 # Result: build_release/bin/libllama.so
 ```
 
-### 1b. Profiling builds (`build_nvtx` / `build_perf`)
+### 1b. Profiling builds (`build_nvtx`)
 
-Separate build trees, because both options add per-op overhead that must not
-contaminate the timing runs done with `build_release`. Same source, different
-flags — keep all three trees side by side.
+Reconstructed from the CMakeCache of the MN5 trees (configured 2026-05-04); no
+cmake line survives in shell history, so these are recovered from the cache
+entries that differ from upstream defaults plus the `:UNINITIALIZED=` marker,
+which is set only for `-D` values passed on the command line.
 
 ```bash
-# NVTX ranges: one range per graph node, named "<tensor> [ne0xne1xne2xne3] <op>".
-# Needed for nsys traces where kernels must be attributed back to layers/ops.
-CC=gcc CXX=g++ cmake -B build_nvtx \
+# Local box (RTX, sm_86). Profiling tree: NVTX ranges + per-op cudaEvent timing,
+# CUDA graphs OFF so every node keeps its own range and event pair.
+cmake -B build_nvtx \
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-    -DGGML_CUDA=ON -DGGML_CUDA_NVTX=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="86" -DGGML_NATIVE=OFF
+    -DGGML_CUDA=ON \
+    -DGGML_CUDA_NVTX=ON -DGGML_CUDA_PERF=ON \
+    -DGGML_CUDA_GRAPHS=OFF \
+    -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES="86"
 cmake --build build_nvtx --config Release -j $(nproc)
-
-# Per-op cudaEvent timing: prints [SUMMARY] / [Kernel sum] / [GPU wall] /
-# [Launch/sync overhead] / [tok/s] per phase at context teardown.
-# This is what separates kernel time from the ~2.2 ms/step pipeline bubble.
-CC=gcc CXX=g++ cmake -B build_perf \
-    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-    -DGGML_CUDA=ON -DGGML_CUDA_PERF=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="86" -DGGML_NATIVE=OFF
-cmake --build build_perf --config Release -j $(nproc)
 ```
 
-`CMAKE_CUDA_ARCHITECTURES`: **86** on the local RTX box, **90** on MN5 (H100).
-`GGML_NATIVE=OFF` keeps the binary runnable on a login node with a different CPU.
+`GGML_CUDA_GRAPHS=OFF` at configure time is what makes this tree usable: graph
+replay collapses every per-node range and event into one opaque launch. Setting
+`GGML_CUDA_DISABLE_GRAPHS=1` in the environment does the same thing at runtime
+and is what `profile.sh` uses against a graphs-enabled tree.
 
-Consumers of these trees (defaults already point at them):
+The local `build_perf` tree (PERF on, NVTX off) is a split of the same idea and
+is not mirrored on MN5 — MN5 puts both options in `build_nvtx`.
 
-| Build | Used by | Notes |
-|-------|---------|-------|
-| `build_nvtx` | `profile.sh`, `sweep_batched_bench.py --bin`, `profile_ops_sweep.py --bin` | pair with `nsys profile --trace=cuda,nvtx,osrt` |
-| `build_perf` | direct runs of `llama-batched-bench` / `llama-cli` | timing prints go to stderr on teardown |
+Consumers (defaults already point at these paths):
 
-Add `GGML_CUDA_DISABLE_GRAPHS=1` to the environment when tracing decode — CUDA
-graph replay collapses the per-node ranges/events into one opaque launch.
+| Build | Used by |
+|-------|---------|
+| `build_nvtx` | `profile.sh`, `sweep_batched_bench.py --bin`, `profile_ops_sweep.py --bin` |
+| `build_perf` (local only) | direct `llama-batched-bench` / `llama-cli` runs; timing prints to stderr on teardown |
 
 ### 2. Python dependencies
 ```bash
