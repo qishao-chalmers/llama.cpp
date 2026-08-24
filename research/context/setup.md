@@ -134,6 +134,44 @@ cmake --build build_release --config Release -j $(nproc)
 # Result: build_release/bin/libllama.so
 ```
 
+### 1b. Profiling builds (`build_nvtx` / `build_perf`)
+
+Separate build trees, because both options add per-op overhead that must not
+contaminate the timing runs done with `build_release`. Same source, different
+flags — keep all three trees side by side.
+
+```bash
+# NVTX ranges: one range per graph node, named "<tensor> [ne0xne1xne2xne3] <op>".
+# Needed for nsys traces where kernels must be attributed back to layers/ops.
+CC=gcc CXX=g++ cmake -B build_nvtx \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+    -DGGML_CUDA=ON -DGGML_CUDA_NVTX=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="86" -DGGML_NATIVE=OFF
+cmake --build build_nvtx --config Release -j $(nproc)
+
+# Per-op cudaEvent timing: prints [SUMMARY] / [Kernel sum] / [GPU wall] /
+# [Launch/sync overhead] / [tok/s] per phase at context teardown.
+# This is what separates kernel time from the ~2.2 ms/step pipeline bubble.
+CC=gcc CXX=g++ cmake -B build_perf \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+    -DGGML_CUDA=ON -DGGML_CUDA_PERF=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="86" -DGGML_NATIVE=OFF
+cmake --build build_perf --config Release -j $(nproc)
+```
+
+`CMAKE_CUDA_ARCHITECTURES`: **86** on the local RTX box, **90** on MN5 (H100).
+`GGML_NATIVE=OFF` keeps the binary runnable on a login node with a different CPU.
+
+Consumers of these trees (defaults already point at them):
+
+| Build | Used by | Notes |
+|-------|---------|-------|
+| `build_nvtx` | `profile.sh`, `sweep_batched_bench.py --bin`, `profile_ops_sweep.py --bin` | pair with `nsys profile --trace=cuda,nvtx,osrt` |
+| `build_perf` | direct runs of `llama-batched-bench` / `llama-cli` | timing prints go to stderr on teardown |
+
+Add `GGML_CUDA_DISABLE_GRAPHS=1` to the environment when tracing decode — CUDA
+graph replay collapses the per-node ranges/events into one opaque launch.
+
 ### 2. Python dependencies
 ```bash
 pip install numpy matplotlib ml_dtypes
