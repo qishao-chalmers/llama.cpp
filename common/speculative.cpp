@@ -9,6 +9,8 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-ext.h" // staging API: llama_set_embeddings_layer_inp / llama_get_embeddings_nextn / llama_model_target_layer_ids
+
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
@@ -437,27 +439,458 @@ struct common_speculative_state_draft : public common_speculative_state {
     }
 };
 
+// EAGLE3 speculative decoding state
+//
+// Decoder input convention: pairs (token[P+1], g_embd[P]) at memory pos P, where g_embd[P] is the
+// draft's fused projection ("fc") of the target's captured hidden states (at target_layer_ids) for
+// the token at position P. This matches the training convention used by real EAGLE3 checkpoints.
+//
+// Simplification vs. a fully-integrated implementation: instead of a process()-style hook that
+// captures the target's layer features for every row of every ctx_tgt decode (prefill and verify
+// batches alike), this state captures them lazily - each draft() call reads whatever the target's
+// most recent decode captured (llama_get_embeddings_layer_inp only ever reflects that one call, see
+// prev_prompt_len below), and begin() does one extra re-decode of the prompt to backfill the prefill
+// features it otherwise couldn't have captured (its constructor runs after the caller's own prefill
+// decode - see the priming comment below). This costs a handful of extra small forward passes
+// through the draft's encoder, negligible next to the draft's own decode cost.
+//
+// Root cause of a long-standing near-zero-signal bug (fixed alongside this state's own logic, in
+// llama_context::encode() in src/llama-context.cpp): llama_encode() never populated embd_nextn at
+// all - only decode() did - so every llama_get_embeddings_nextn() call made right after an encode()
+// call in this file (the seed/refresh/priming steps below) was silently reading stale leftover data
+// from whatever decode() call last ran on ctx_dft, not the actual encoder output just computed.
 struct common_speculative_state_eagle3 : public common_speculative_state {
-    common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
+    llama_context * ctx_tgt;
+    llama_context * ctx_dft;
+
+    common_sampler * smpl;
+
+    llama_batch batch;
+
+    int32_t n_embd_tgt = 0; // target model hidden size
+    int32_t n_embd_dec = 0; // draft model hidden size
+    int32_t n_embd_enc = 0; // target_layer_ids_n * n_embd_tgt
+
+    const int32_t * target_layer_ids   = nullptr;
+    uint32_t        target_layer_ids_n = 0;
+
+    std::vector<float> feat_buf; // scratch: concatenated target features for the seed token
+    std::vector<float> g;        // current g_embd (fused feature state), chained across draft steps
+
+    // size of prompt_tgt as observed at the end of the previous draft() call. llama_get_embeddings_layer_inp
+    // only ever reflects the target's *most recent* llama_decode() call (the verify batch
+    // [id_last_prev, draft_prev...]), never a persistent history. Since the caller (e.g.
+    // speculative-simple.cpp) pushes exactly one token per row of that batch it keeps onto
+    // prompt_tgt before calling draft() again, prompt_tgt's growth since last call equals that
+    // batch's row count, and the row we need (the last accepted row, whose features seed the
+    // next draft) is (growth - 1). This is a pure position computation - deliberately not a
+    // search for a matching token value, which breaks on repeated tokens (common in real text)
+    // and desyncs silently if the caller ever discards/truncates what draft() returned (e.g. the
+    // n_min check in speculative-simple.cpp).
+    // < 0 means "no verify batch captured yet for this state to use" (first call after begin()).
+    int64_t prev_prompt_len = -1;
+
+    // ctx_dft's KV cache is NOT reset between rounds - it must stay continuous, mirroring how
+    // ctx_tgt's own cache grows across the whole generation, because the (single-layer) decoder's
+    // self-attention relies on that accumulated history for context; without it, the decoder only
+    // ever sees the handful of tokens drafted in the current round and predicts far worse (verified
+    // empirically: ~4% acceptance with a per-round reset vs 56% with a continuous cache, on the
+    // same GGUF files and prompt, cross-checked against the upstream reference implementation).
+    // dft_seed_pos is the absolute position where this round's seed step (id_last, g) belongs -
+    // i.e. the position that held the last *accepted* draft step from the previous round's chain
+    // (or 0 before any round has run). Everything at or beyond it is this state's own leftover
+    // speculation from last round and gets trimmed before writing the new seed, rather than wiping
+    // the whole cache.
+    llama_pos dft_seed_pos = 0;
+
+    // Deferred boundary primed by begin() from the prompt: the caller's own prompt prefill runs
+    // before this state's constructor turns on target feature capture, so those features are
+    // lost by the time we could read them - begin() recovers them by re-decoding the prompt
+    // through ctx_tgt (now with capture on) and priming ctx_dft's KV cache from it, exactly like
+    // the reference's process()-hook does on every ctx_tgt decode including the prefill. This
+    // gives the very first draft() call real accumulated context to attend to instead of a
+    // completely empty cache (which measurably starves the first several rounds - see docs).
+    // pending_g/pending_pos hold the one deferred (g, pos) pair priming couldn't complete (its
+    // token isn't known until the caller's first draft() call supplies id_last); pending_pos < 0
+    // means "no primed boundary to use" (priming skipped/failed, or already consumed).
+    std::vector<float> pending_g;
+    llama_pos           pending_pos = -1;
+
+    common_speculative_state_eagle3(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft(ctx_dft)
+    {
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        const llama_model * model_dft = llama_get_model(ctx_dft);
+
+        target_layer_ids   = llama_model_target_layer_ids  (model_dft);
+        target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
+
+        if (target_layer_ids_n != 3) {
+            throw std::runtime_error("eagle3: draft model must declare exactly 3 target_layer_ids, got " +
+                    std::to_string(target_layer_ids_n));
+        }
+
+        n_embd_tgt = llama_model_n_embd(model_tgt);
+        n_embd_dec = llama_model_n_embd(model_dft);
+        n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
+
+        // llama_batch_init allocates only one of token/embd; the decoder step needs both.
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        batch = llama_batch_init(/* n_tokens_alloc = */ n_b, /* embd = */ n_embd_dec, /* n_seq_max = */ 1);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
+        common_params_sampling sparams;
+        sparams.no_perf  = false;
+        sparams.top_k    = 10;
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+
+        smpl = common_sampler_init(model_dft, sparams);
+
+        const int32_t n_layer_tgt = llama_model_n_layer(model_tgt);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            if (target_layer_ids[k] >= n_layer_tgt) {
+                throw std::runtime_error("eagle3: target_layer_ids[" + std::to_string(k) + "] = " +
+                        std::to_string(target_layer_ids[k]) + " exceeds target n_layer = " + std::to_string(n_layer_tgt));
+            }
+            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+        }
+
+        llama_set_embeddings_nextn(ctx_dft, true, /* masked = */ true);
+    }
+
+    ~common_speculative_state_eagle3() override {
+        llama_perf_context_print(ctx_dft);
+
+        llama_free(ctx_dft);
+
+        common_sampler_free(smpl);
+
+        if (batch.token != nullptr) {
+            free(batch.token);
+            batch.token = nullptr;
+        }
+        llama_batch_free(batch);
+    }
 
     void begin(const llama_tokens & prompt) override {
-        GGML_UNUSED(prompt);
+        // new session: nothing accepted yet, ctx_dft's cache (if any, from a previous session
+        // reusing this state) is stale in full.
+        prev_prompt_len = -1;
+        dft_seed_pos    = 0;
+        pending_g.clear();
+        pending_pos = -1;
+        llama_memory_clear(llama_get_memory(ctx_dft), true);
+
+        const int32_t N = (int32_t) prompt.size();
+        if (N < 2) {
+            return; // nothing to prime - need at least one (t[k+1], g[k]) pair
+        }
+
+        // Re-decode the prompt through ctx_tgt (capture is already on - the constructor enabled
+        // it before this call) to recover target features for it. llama_decode requires new
+        // positions to start exactly at (existing seq max + 1) - it has no in-place-overwrite
+        // path - so the caller's own prefill entries at these same positions must be removed
+        // first; the re-decode then deterministically reconstructs identical KV content at
+        // positions 0..N-1, so this is a pure re-computation for the side-channel feature output,
+        // not a lasting mutation of ctx_tgt's real cache content or the caller's own n_past
+        // bookkeeping.
+        {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, N);
+
+            llama_batch prime_batch = llama_batch_init(N, 0, 1);
+            for (int32_t i = 0; i < N; ++i) {
+                common_batch_add(prime_batch, prompt[i], i, { 0 }, false);
+            }
+            const int rc = llama_decode(ctx_tgt, prime_batch);
+            llama_batch_free(prime_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: eagle3 prompt re-decode for priming failed (rc=%d)\n", __func__, rc);
+                return;
+            }
+        }
+
+        std::vector<float> feat_all((size_t) N * n_embd_enc);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!layer) {
+                LOG_ERR("%s: eagle3 target layer %d input not extracted during priming\n", __func__, target_layer_ids[k]);
+                return;
+            }
+            for (int32_t i = 0; i < N; ++i) {
+                std::memcpy(feat_all.data() + (size_t) i * n_embd_enc + (size_t) k * n_embd_tgt,
+                        layer + (size_t) i * n_embd_tgt,
+                        (size_t) n_embd_tgt * sizeof(float));
+            }
+        }
+
+        std::vector<float> g_all((size_t) N * n_embd_dec);
+        const int32_t n_ubatch_dft = (int32_t) llama_n_ubatch(ctx_dft);
+        for (int32_t i = 0; i < N; i += n_ubatch_dft) {
+            const int32_t n_chunk = std::min(n_ubatch_dft, N - i);
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ feat_all.data() + (size_t) i * n_embd_enc,
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+            if (llama_encode(ctx_dft, enc_batch) != 0) {
+                LOG_ERR("%s: eagle3 priming encode failed\n", __func__);
+                return;
+            }
+            const float * g_chunk = llama_get_embeddings_nextn(ctx_dft);
+            if (!g_chunk) {
+                LOG_ERR("%s: eagle3 priming encoder produced no output\n", __func__);
+                return;
+            }
+            std::memcpy(g_all.data() + (size_t) i * n_embd_dec, g_chunk, (size_t) n_chunk * n_embd_dec * sizeof(float));
+        }
+
+        // Write decoder KV for rows 0..N-2: (token=prompt[k+1], g=g_all[k]) at position k - the
+        // same (t[P+1], g_P) convention draft()'s seed/refresh steps use. Row N-1's pair is
+        // deferred: its token (whatever follows the prompt) isn't known here, only once the
+        // caller's first draft() call supplies id_last.
+        if (N > 1) {
+            batch.n_tokens = N - 1;
+            for (int32_t k = 0; k < N - 1; ++k) {
+                batch.token[k]     = prompt[k + 1];
+                batch.pos[k]       = k;
+                batch.n_seq_id[k]  = 1;
+                batch.seq_id[k][0] = 0;
+                batch.logits[k]    = false;
+                std::memcpy(batch.embd + (size_t) k * n_embd_dec,
+                        g_all.data() + (size_t) k * n_embd_dec,
+                        (size_t) n_embd_dec * sizeof(float));
+            }
+            if (llama_decode(ctx_dft, batch) != 0) {
+                LOG_ERR("%s: eagle3 priming decode failed\n", __func__);
+                return;
+            }
+        }
+
+        pending_g.assign(g_all.end() - n_embd_dec, g_all.end());
+        pending_pos = N - 1;
     }
 
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & draft_tokens) override {
-        // TODO: implement
-        GGML_UNUSED(params);
-        GGML_UNUSED(prompt_tgt);
-        GGML_UNUSED(id_last);
-        GGML_UNUSED(draft_tokens);
+            llama_tokens & result) override {
+        result.clear();
+
+        if (prompt_tgt.empty()) {
+            prev_prompt_len = -1;
+            dft_seed_pos    = 0;
+            pending_pos     = -1;
+            llama_memory_clear(llama_get_memory(ctx_dft), true);
+            return;
+        }
+
+        if (pending_pos >= 0) {
+            // First call after begin(): use the deferred boundary primed by begin()'s prompt
+            // re-decode instead of the normal growth-based row lookup. id_last (the caller's
+            // param here) is exactly the token begin() didn't know yet; pending_g is already the
+            // encoder's output (begin() ran the encoder itself while priming), so we skip
+            // feat_buf/llama_encode entirely and use it directly as g.
+            dft_seed_pos = pending_pos;
+            g = pending_g;
+            pending_pos = -1;
+            prev_prompt_len = (int64_t) prompt_tgt.size();
+        } else {
+            if (prev_prompt_len < 0) {
+                // Priming didn't run or failed (e.g. N < 2): id_last hasn't been fed to ctx_tgt
+                // yet, so its features don't exist yet. Just record where we are so next call can
+                // measure growth from here.
+                prev_prompt_len = (int64_t) prompt_tgt.size();
+                return;
+            }
+
+            const int64_t growth = (int64_t) prompt_tgt.size() - prev_prompt_len;
+            prev_prompt_len = (int64_t) prompt_tgt.size();
+
+            if (growth <= 0) {
+                // Should not happen (prompt_tgt only grows), but nothing sane to seed from.
+                return;
+            }
+
+            // row, within the target's most recent verify batch [id_last_prev, draft_prev...], of
+            // the last accepted token - equivalently, how many of last round's drafted tokens got
+            // accepted.
+            const int32_t   row            = (int32_t) (growth - 1);
+            const int32_t   n_accepted     = row;
+            const int64_t   prompt_len_old = prev_prompt_len - growth; // == prev_prompt_len before the update above
+            const llama_pos pos_base       = dft_seed_pos; // position of target-batch row 0 (id_last) this round
+
+            feat_buf.resize(n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    LOG_ERR("%s: eagle3 target layer %d input not extracted\n", __func__, target_layer_ids[k]);
+                    return;
+                }
+                std::memcpy(feat_buf.data() + (size_t) k * n_embd_tgt,
+                        layer + (size_t) row * n_embd_tgt,
+                        (size_t) n_embd_tgt * sizeof(float));
+            }
+
+            // Trim everything this call is about to (re)write, *before* writing any of it. Last
+            // round's own draft() call speculatively wrote its own guesses at pos_base+1..
+            // pos_base+n_max (chained via the decoder's own output) - llama_decode requires a
+            // batch's positions to start exactly at (existing max + 1), with no in-place-overwrite
+            // path, so both the refresh below (rewrites pos_base+1..pos_base+n_accepted-1 with
+            // real target-grounded features) and the seed step further below (rewrites
+            // pos_base+n_accepted, the new dft_seed_pos) would otherwise collide with that
+            // leftover speculative content and fail.
+            //
+            // When n_accepted == 0, the new seed position (pos_base+n_accepted) collapses onto
+            // pos_base itself: nothing from last round's draft was accepted, so this round's seed
+            // writes a *different* (id_last, g) pair to the exact same slot last round's own seed
+            // step used - that slot must be trimmed too, not preserved. The "row 0 already holds a
+            // valid entry" reasoning below only holds for the refresh loop's row range
+            // (1..n_accepted-1), which is empty whenever n_accepted <= 1 anyway.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos_base + (n_accepted > 0 ? 1 : 0), -1);
+
+            // Refresh KV entries for target-batch rows 1..n_accepted-1 (n_accepted-1 of them; a
+            // no-op for n_accepted <= 1) with real target-grounded features, using known tokens
+            // from prompt_tgt - no sampling needed, we already know these were accepted.
+            //
+            // Row 0 of the target's verify batch (= id_last, the token this state was seeded with
+            // last round) is deliberately EXCLUDED: dft_seed_pos already holds the correct entry
+            // for it, written by last round's own seed step - (token=id_last, g=features of the
+            // token *before* id_last). Refreshing row 0 too means overwriting that entry with a
+            // DIFFERENT, mismatched one, which silently corrupts self-attention for everything
+            // that attends back to this position afterwards.
+            if (n_accepted > 1) {
+                const int32_t n_refresh = n_accepted - 1;
+                std::vector<float> feat_refresh((size_t) n_refresh * n_embd_enc);
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    for (int32_t r = 0; r < n_refresh; ++r) {
+                        // target-batch row (r+1): rows 1..n_accepted-1
+                        std::memcpy(feat_refresh.data() + (size_t) r * n_embd_enc + (size_t) k * n_embd_tgt,
+                                layer + (size_t) (r + 1) * n_embd_tgt,
+                                (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+                llama_batch enc_refresh = {
+                    /*.n_tokens =*/ n_refresh,
+                    /*.token    =*/ nullptr,
+                    /*.embd     =*/ feat_refresh.data(),
+                    /*.pos      =*/ nullptr,
+                    /*.n_seq_id =*/ nullptr,
+                    /*.seq_id   =*/ nullptr,
+                    /*.logits   =*/ nullptr,
+                };
+                if (llama_encode(ctx_dft, enc_refresh) != 0) {
+                    LOG_ERR("%s: eagle3 refresh encode failed\n", __func__);
+                    return;
+                }
+                const float * g_refresh = llama_get_embeddings_nextn(ctx_dft);
+                if (!g_refresh) {
+                    LOG_ERR("%s: eagle3 refresh encoder produced no output\n", __func__);
+                    return;
+                }
+                batch.n_tokens = n_refresh;
+                for (int32_t r = 0; r < n_refresh; ++r) {
+                    // position pos_base + (r+1): pairs with target-batch row (r+1)'s features,
+                    // predicting target-batch row (r+2)'s token - i.e. prompt_tgt[prompt_len_old+r+2].
+                    batch.token[r]     = prompt_tgt[(size_t) (prompt_len_old + r + 2)];
+                    batch.pos[r]       = pos_base + r + 1;
+                    batch.n_seq_id[r]  = 1;
+                    batch.seq_id[r][0] = 0;
+                    batch.logits[r]    = false;
+                    std::memcpy(batch.embd + (size_t) r * n_embd_dec,
+                            g_refresh + (size_t) r * n_embd_dec,
+                            (size_t) n_embd_dec * sizeof(float));
+                }
+                if (llama_decode(ctx_dft, batch) != 0) {
+                    LOG_ERR("%s: eagle3 refresh decode failed\n", __func__);
+                    return;
+                }
+            }
+
+            // The new seed position is pos_base advanced by however many of last round's drafted
+            // steps were actually accepted (0 if none). Everything beyond it was already trimmed
+            // above (along with the refresh range) in the same pos_base+1 cut.
+            dft_seed_pos = pos_base + n_accepted;
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ 1,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ feat_buf.data(),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            if (llama_encode(ctx_dft, enc_batch) != 0) {
+                LOG_ERR("%s: eagle3 llama_encode(ctx_dft) failed\n", __func__);
+                return;
+            }
+
+            const float * g0 = llama_get_embeddings_nextn(ctx_dft);
+            if (!g0) {
+                LOG_ERR("%s: eagle3 encoder produced no output\n", __func__);
+                return;
+            }
+            g.assign(g0, g0 + n_embd_dec);
+        }
+
+        common_sampler_reset(smpl);
+
+        llama_token cur_token = id_last;
+
+        for (int i = 0; i < params.n_max; ++i) {
+            batch.n_tokens      = 1;
+            batch.token[0]      = cur_token;
+            batch.pos[0]        = dft_seed_pos + i;
+            batch.n_seq_id[0]   = 1;
+            batch.seq_id[0][0]  = 0;
+            batch.logits[0]     = true;
+            std::memcpy(batch.embd, g.data(), (size_t) n_embd_dec * sizeof(float));
+
+            if (llama_decode(ctx_dft, batch) != 0) {
+                LOG_ERR("%s: eagle3 llama_decode(ctx_dft) failed\n", __func__);
+                break;
+            }
+
+            common_sampler_sample(smpl, ctx_dft, 0, true);
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+            const llama_token id = cur_p->data[0].id;
+
+            common_sampler_accept(smpl, id, true);
+
+            result.push_back(id);
+
+            if (params.n_max <= (int) result.size()) {
+                break;
+            }
+            if (cur_p->data[0].p < params.p_min) {
+                break;
+            }
+
+            const float * g_next = llama_get_embeddings_nextn_ith(ctx_dft, 0);
+            if (!g_next) {
+                break;
+            }
+            std::copy(g_next, g_next + n_embd_dec, g.begin());
+
+            cur_token = id;
+        }
     }
 
     void accept(uint16_t n_accepted) override {
-        // noop
+        // noop: draft() re-derives everything it needs from (prompt_tgt, id_last) each round
         GGML_UNUSED(n_accepted);
     }
 };
@@ -851,8 +1284,8 @@ common_speculative * common_speculative_init(
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.mparams_dft.path.empty();
-        bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+        bool has_draft_eagle3 = ctx_dft != nullptr && llama_model_target_layer_ids_n(llama_get_model(ctx_dft)) == 3;
+        bool has_draft        = !params.mparams_dft.path.empty() && !has_draft_eagle3;
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -916,7 +1349,10 @@ common_speculative * common_speculative_init(
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
-                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type,
+                    /* .ctx_tgt = */ ctx_tgt,
+                    /* .ctx_dft = */ ctx_dft
+                ));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

@@ -1301,8 +1301,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
-    auto * t_logits = res->get_logits();
-    auto * t_embd = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
+    auto * t_logits  = res->get_logits();
+    auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
+    auto * t_h_nextn = cparams.embeddings_nextn ? res->t_h_nextn : nullptr;
 
     // extract logits
     if (logits.data && t_logits) {
@@ -1363,6 +1364,19 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ABORT("unknown pooling type");
                 }
         }
+    }
+
+    // extract nextn embeddings (hidden state before the final output norm) - eagle3/DFlash
+    // encoder calls (fc-fusion of target features -> g_embd) need this; without it,
+    // llama_get_embeddings_nextn() after llama_encode() silently returns whatever a *previous*
+    // decode() call last wrote into embd_nextn, since encode() never populated it itself.
+    if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+        GGML_ASSERT(backend_h != nullptr);
+
+        const uint32_t n_embd_h = hparams.n_embd_out();
+        GGML_ASSERT(n_tokens*n_embd_h <= (int64_t) embd_nextn.size);
+        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd_h*sizeof(float));
     }
 
     // TODO: hacky solution
