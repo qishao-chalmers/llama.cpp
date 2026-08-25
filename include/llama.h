@@ -166,6 +166,11 @@ extern "C" {
         LLAMA_ROPE_SCALING_TYPE_MAX_VALUE   = LLAMA_ROPE_SCALING_TYPE_LONGROPE,
     };
 
+    enum llama_context_type {
+        LLAMA_CONTEXT_TYPE_DEFAULT = 0,
+        LLAMA_CONTEXT_TYPE_MTP     = 1, // also used for eagle3 draft contexts
+    };
+
     enum llama_pooling_type {
         LLAMA_POOLING_TYPE_UNSPECIFIED = -1,
         LLAMA_POOLING_TYPE_NONE = 0,
@@ -333,6 +338,8 @@ extern "C" {
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
+        enum llama_context_type      ctx_type;          // set the context type (e.g. eagle3/MTP draft)
+        struct llama_context *       ctx_other;         // related context to borrow tok_embd/output from (e.g. target model)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
@@ -1061,6 +1068,21 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Set whether the context outputs nextn/eagle3 hidden states (together with logits)
+    LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+    // Set whether the context extracts a given layer's input embeddings (eagle3 low/mid/high fusion)
+    LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+    // Get all output nextn/eagle3 hidden states, analogous to llama_get_embeddings()
+    LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
+    // Get the nextn/eagle3 hidden state for the ith token, analogous to llama_get_embeddings_ith()
+    LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+    // Get the extracted input embeddings for layer `lid` (eagle3 low/mid/high fusion source)
+    LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
     //
     // backend sampling API [EXPERIMENTAL]

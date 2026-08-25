@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -27,6 +28,8 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    bool embeddings_nextn;         // eagle3/nextn: populate t_h_nextn output
+    bool embeddings_nextn_masked;  // eagle3/nextn: also mask/gather via inp_out_ids (last-token draft use)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -39,7 +42,14 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+
+    enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
+
+    // eagle3/Gemma4Assistant: pointer to a related context (e.g. the target model's
+    // context) to borrow tok_embd/output from when this model doesn't have its own
+    struct llama_context * ctx_other;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

@@ -369,6 +369,9 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (arch == LLM_ARCH_CLIP || arch == LLM_ARCH_GPTJ || arch == LLM_ARCH_UNKNOWN) {
             continue; // These models don't have usable implementations.
         }
+        if (arch == LLM_ARCH_EAGLE3) {
+            continue;
+        }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
@@ -433,6 +436,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
         if (arch == LLM_ARCH_PLM) {
             continue; // TODO tensor shapes
+        }
+        if (arch == LLM_ARCH_EAGLE3) {
+            continue;
         }
 
         // FIXME some models are segfaulting with WebGPU:

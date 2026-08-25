@@ -2476,6 +2476,35 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_EAGLE3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
+                    throw std::runtime_error("EAGLE3 model requires 'target_layers' in GGUF metadata");
+                }
+                if (target_layer_ids.size() != 3) {
+                    throw std::runtime_error("EAGLE3 requires exactly 3 entries in 'target_layers'");
+                }
+                LLAMA_LOG_INFO("%s: EAGLE3 target_layers = [%d, %d, %d]\n", __func__,
+                        target_layer_ids[0],
+                        target_layer_ids[1],
+                        target_layer_ids[2]);
+
+                uint32_t n_embd_tgt = 0;
+                ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, n_embd_tgt);
+                LLAMA_LOG_INFO("%s: EAGLE3 n_embd_tgt = %u (draft n_embd = %u)\n", __func__, n_embd_tgt, hparams.n_embd);
+
+                hparams.n_embd_inp_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
+
+                // norm_before_residual (optional, default false) - compatible with RedHatAI eagle3 speculators
+                ml.get_key(LLM_KV_NORM_BEFORE_RESIDUAL, hparams.norm_before_residual, false);
+                if (hparams.norm_before_residual) {
+                    LLAMA_LOG_INFO("%s: EAGLE3 norm_before_residual = true\n", __func__);
+                }
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_MIMO2:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -7302,6 +7331,63 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                     }
                 } break;
+            case LLM_ARCH_EAGLE3:
+                {
+                    const int64_t n_embd_inp        = hparams.n_embd_inp();
+                    const int64_t n_embd_attn_input = 2 * n_embd;
+
+                    // draft vocab size comes from the d2t tensor if present, else same as target vocab
+                    int64_t n_draft_vocab = n_vocab;
+                    const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+                    if (d2t_meta) {
+                        n_draft_vocab = d2t_meta->ne[0];
+                        d2t = create_tensor(tn(LLM_TENSOR_D2T), {n_draft_vocab}, 0);
+                        LLAMA_LOG_INFO("%s: EAGLE3 using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_draft_vocab);
+                    } else {
+                        d2t = nullptr;
+                        LLAMA_LOG_INFO("%s: EAGLE3 without d2t - sharing vocab_size with target (vocab_size = %lld)\n", __func__, (long long) n_draft_vocab);
+                    }
+
+                    // feature fusion layer: projects the 3 concatenated target layers to draft hidden size
+                    fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
+
+                    // output (uses draft vocab size, optional - inherited from target model if absent)
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_draft_vocab}, TENSOR_NOT_REQUIRED);
+
+                    // token embeddings (optional - some checkpoints carry their own, e.g. Llama-3.3-70B eagle3)
+                    const struct ggml_tensor * tok_embd_meta = ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
+                    if (tok_embd_meta) {
+                        const int64_t n_target_vocab = tok_embd_meta->ne[1];
+                        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_target_vocab}, 0);
+                        LLAMA_LOG_INFO("%s: EAGLE3 using its own token_embd (vocab = %lld)\n", __func__, (long long) n_target_vocab);
+                    }
+
+                    // single decoder layer
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        // input_layernorm: applied to the token embeddings branch
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        // hidden_norm: applied to the fused target-feature branch
+                        layer.attn_norm_2 = create_tensor(tn(LLM_TENSOR_ATTN_NORM_2, "weight", i), {n_embd}, 0);
+
+                        // attention takes the concatenated [embd_norm, g_norm] as input
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd_attn_input, n_embd_head_k * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd_attn_input, n_embd_k_gqa}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd_attn_input, n_embd_v_gqa}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+
+                        // rope_freqs for llama3-style rope scaling (optional)
+                        layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED);
+                    }
+                } break;
             case LLM_ARCH_MIMO2:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -8417,6 +8503,20 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
                 llm = std::make_unique<llm_build_t5_enc>(*this, params);
             }
             break;
+        case LLM_ARCH_EAGLE3:
+            {
+                switch (params.gtype) {
+                    case LLM_GRAPH_TYPE_ENCODER:
+                        llm = std::make_unique<llm_build_eagle3_enc>(*this, params);
+                        break;
+                    case LLM_GRAPH_TYPE_DEFAULT:
+                    case LLM_GRAPH_TYPE_DECODER:
+                        llm = std::make_unique<llm_build_eagle3_dec>(*this, params);
+                        break;
+                    default:
+                        GGML_ABORT("invalid graph type");
+                };
+            } break;
         case LLM_ARCH_JAIS:
             {
                 llm = std::make_unique<llm_build_jais>(*this, params);
@@ -8625,7 +8725,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
-    llm->res->set_outputs();
+    llm->res->set_outputs(params);
 
     return llm->res->get_gf();
 }
@@ -8797,6 +8897,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
+        case LLM_ARCH_EAGLE3:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
@@ -8983,8 +9084,9 @@ uint64_t llama_model_n_params(const llama_model * model) {
 
 bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
-        case LLM_ARCH_T5:        return true;
-        case LLM_ARCH_T5ENCODER: return true;
+        case LLM_ARCH_T5:
+        case LLM_ARCH_T5ENCODER:
+        case LLM_ARCH_EAGLE3:    return true;
         default:                 return false;
     }
 }
@@ -9014,4 +9116,27 @@ bool llama_model_is_diffusion(const llama_model * model) {
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
+}
+int32_t llama_model_n_expert(const struct llama_model * model) {
+    return model->hparams.n_expert;
+}
+
+int32_t llama_model_n_devices(const struct llama_model * model) {
+    return (int32_t)model->devices.size();
+}
+
+ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
+    if (i < 0 || i >= (int)model->devices.size()) {
+        return nullptr;
+    }
+    return model->devices[i];
+}
+
+const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
+    const auto & v = model->target_layer_ids;
+    return v.empty() ? nullptr : v.data();
+}
+
+uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+    return (uint32_t) model->target_layer_ids.size();
 }
